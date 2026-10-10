@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+target/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.agents/
+.vscode/
+*.log
+data/
+northstar_data/
+configuration.snapshot
+configuration.lock
+backend/migrations/

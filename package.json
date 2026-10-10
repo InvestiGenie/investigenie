@@ -1,0 +1,12 @@
+{
+  "name": "discover-platform",
+  "private": true,
+  "workspaces": [
+    "frontend"
+  ],
+  "scripts": {
+    "dev:web": "npm --workspace frontend run dev",
+    "build:web": "npm --workspace frontend run build",
+    "test:web": "npm --workspace frontend run test"
+  }
+}
