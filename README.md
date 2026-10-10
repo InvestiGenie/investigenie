@@ -2,10 +2,6 @@
 
 A multi-source document explorer with a React/TypeScript browser UI and a Rust/Axum API. Datasource endpoints and credentials are configured in the UI and remain on the server.
 
-## Rename Compatibility
-
-The product and repository were renamed from Northstar to InvestiGenie. Existing encrypted configuration identifiers, browser preference keys, and the `northstar_data` directory setting are intentionally preserved so existing installations keep their saved connections, AI profiles, and preferences. They are storage compatibility details, not the product name. Keep the existing encryption key and configured filesystem path when upgrading. New installations may set `FILESYSTEM_PATH=./investigenie_data` instead.
-
 ## Repository layout
 
 The publishable application lives in `investigenie/`. Run the commands below from that directory. If you opened the parent workspace, first run `cd investigenie`.

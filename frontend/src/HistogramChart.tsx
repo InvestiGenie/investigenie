@@ -40,7 +40,7 @@ export default function HistogramChart({ data, timeZone = 'UTC', timeRange }: Hi
         <XAxis dataKey="timestamp" type="number" scale="time" domain={timeDomain} ticks={ticks} allowDataOverflow={hasTimeRange} interval="preserveStartEnd" padding={hasTimeRange ? { left: 0, right: 0 } : { left: 36, right: 36 }} tickFormatter={formatTick} minTickGap={24} tickLine={false} axisLine={{ stroke: 'var(--line)' }} tick={{ fill: 'var(--muted)', fontSize: 10 }} />
         <YAxis allowDecimals={false} width={42} axisLine={false} tickLine={false} tick={{ fill: 'var(--muted)', fontSize: 10 }} />
         <Tooltip labelFormatter={(value) => new Intl.DateTimeFormat(undefined, { timeZone, dateStyle: 'medium', timeStyle: 'long' }).format(Number(value))} formatter={(value) => [value, 'Documents']} cursor={{ fill: 'var(--green-soft)' }} contentStyle={{ background: 'var(--paper)', borderColor: 'var(--line)', color: 'var(--ink)' }} />
-        <Bar dataKey="count" name="Documents" fill="#51b79a" radius={[2, 2, 0, 0]} maxBarSize={24} isAnimationActive={false} />
+        <Bar dataKey="count" name="Documents" fill="var(--brand-cyan)" radius={[2, 2, 0, 0]} maxBarSize={24} isAnimationActive={false} />
       </BarChart>
     </ResponsiveContainer>
   </div>;

@@ -47,8 +47,17 @@ pub fn validate_encryption_key(key: &str, key_id: &str) -> Result<(), StorageErr
 }
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-const VERIFIER_ID: &str = "northstar-encryption-verifier";
-const VERIFIER: &[u8] = b"northstar configuration encryption v1";
+const VERIFIER_ID: &str = "investigenie-encryption-verifier";
+const VERIFIER: &[u8] = b"investigenie configuration encryption v1";
+const SNAPSHOT_ID: &str = "investigenie-filesystem-snapshot";
+const LEGACY_NAMESPACE_B64: &str = "bm9ydGhzdGFyLWNvbmZpZw==";
+const LEGACY_VERIFIER_ID_B64: &str = "bm9ydGhzdGFyLWVuY3J5cHRpb24tdmVyaWZpZXI=";
+const LEGACY_VERIFIER_B64: &str = "bm9ydGhzdGFyIGNvbmZpZ3VyYXRpb24gZW5jcnlwdGlvbiB2MQ==";
+const LEGACY_SNAPSHOT_ID_B64: &str = "bm9ydGhzdGFyLWZpbGVzeXN0ZW0tc25hcHNob3Q=";
+
+fn legacy_verifier() -> Vec<u8> {
+    STANDARD.decode(LEGACY_VERIFIER_B64).expect("valid legacy verifier encoding")
+}
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -128,7 +137,26 @@ impl Encryption {
         })
     }
     fn aad(&self, integration_id: &str) -> Vec<u8> {
-        serde_json::to_vec(&json!(["northstar-config", 1, self.key_id, integration_id])).unwrap()
+        serde_json::to_vec(&json!(["investigenie-config", 1, self.key_id, integration_id]))
+            .unwrap()
+    }
+    fn legacy_aad(&self, integration_id: &str) -> Vec<u8> {
+        let namespace = String::from_utf8(
+            STANDARD.decode(LEGACY_NAMESPACE_B64).expect("valid legacy namespace encoding"),
+        )
+        .expect("legacy namespace is UTF-8");
+        let legacy_id = match integration_id {
+            VERIFIER_ID => String::from_utf8(
+                STANDARD.decode(LEGACY_VERIFIER_ID_B64).expect("valid legacy verifier ID encoding"),
+            )
+            .expect("legacy verifier ID is UTF-8"),
+            SNAPSHOT_ID => String::from_utf8(
+                STANDARD.decode(LEGACY_SNAPSHOT_ID_B64).expect("valid legacy snapshot ID encoding"),
+            )
+            .expect("legacy snapshot ID is UTF-8"),
+            _ => integration_id.to_owned(),
+        };
+        serde_json::to_vec(&json!([namespace, 1, self.key_id, legacy_id])).unwrap()
     }
     fn encrypt(&self, integration_id: &str, plaintext: &[u8]) -> Result<Vec<u8>, StorageError> {
         let mut nonce = [0u8; 12];
@@ -157,15 +185,50 @@ impl Encryption {
         if envelope.version != 1 || envelope.key_id != self.key_id || envelope.nonce.len() != 12 {
             return Err(StorageError::Encryption);
         }
+        let nonce = Nonce::from_slice(&envelope.nonce);
         self.cipher
             .decrypt(
-                Nonce::from_slice(&envelope.nonce),
+                nonce,
                 Payload {
                     msg: &envelope.ciphertext,
                     aad: &self.aad(integration_id),
                 },
             )
+            .or_else(|_| {
+                self.cipher.decrypt(
+                    nonce,
+                    Payload {
+                        msg: &envelope.ciphertext,
+                        aad: &self.legacy_aad(integration_id),
+                    },
+                )
+            })
             .map_err(|_| StorageError::Encryption)
+    }
+    #[cfg(test)]
+    pub(super) fn encrypt_legacy_fixture(
+        &self,
+        integration_id: &str,
+        plaintext: &[u8],
+    ) -> Vec<u8> {
+        let nonce = [42u8; 12];
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &self.legacy_aad(integration_id),
+                },
+            )
+            .unwrap();
+        serde_json::to_vec(&Envelope {
+            version: 1,
+            key_id: self.key_id.clone(),
+            nonce: nonce.to_vec(),
+            ciphertext,
+        })
+        .unwrap()
     }
 }
 
@@ -472,7 +535,16 @@ impl Storage {
             .fetch_one(&mut *transaction)
             .await?;
             if let Some(verifier) = verifier {
-                if storage.encryption.decrypt(VERIFIER_ID, &verifier)? != VERIFIER {
+                let plaintext = storage.encryption.decrypt(VERIFIER_ID, &verifier)?;
+                if plaintext == legacy_verifier() {
+                    let migrated = storage.encryption.encrypt(VERIFIER_ID, VERIFIER)?;
+                    sqlx::query(
+                        "UPDATE app_settings SET encryption_verifier = $1 WHERE singleton = true",
+                    )
+                    .bind(migrated)
+                    .execute(&mut *transaction)
+                    .await?;
+                } else if plaintext.as_slice() != VERIFIER {
                     return Err(StorageError::Encryption);
                 }
             } else {

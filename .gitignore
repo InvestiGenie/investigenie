@@ -10,7 +10,7 @@ target/
 .vscode/
 *.log
 data/
-northstar_data/
+*_data/
 investigenie_data/
 configuration.snapshot
 configuration.lock

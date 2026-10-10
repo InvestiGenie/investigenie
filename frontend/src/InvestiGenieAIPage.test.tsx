@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import InvestiGenieAIPage from './InvestiGenieAIPage';
 import { api, type InvestigationResult } from './api';
+import { clearPreference } from './preferences';
 
 const dataViews = [
   { id: 'service-one', revision: 'r1', name: 'Service 1', connection_id: 'source', index: 'service-one-*', time_field: '@timestamp' },
@@ -31,7 +32,7 @@ function openDataViewPicker() {
 
 describe('InvestiGenieAIPage', () => {
   beforeEach(() => {
-    window.localStorage.removeItem('northstar-ai-model');
+    clearPreference('ai-model');
     vi.spyOn(api, 'aiModels').mockResolvedValue([{
       id: 'model-primary', revision: 'rev-1', name: 'Primary', api_url: 'https://provider.example/v1', model: 'model-x', has_api_key: true,
     }]);

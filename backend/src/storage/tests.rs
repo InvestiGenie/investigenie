@@ -82,6 +82,19 @@ fn encryption_authenticates_nonce_key_id_integration_and_ciphertext() {
         encryption.decrypt("clickhouse", &first).unwrap(),
         b"private-secret"
     );
+    let legacy = encryption.encrypt_legacy_fixture("clickhouse", b"legacy-private-secret");
+    assert_eq!(
+        encryption.decrypt("clickhouse", &legacy).unwrap(),
+        b"legacy-private-secret"
+    );
+    let legacy_verifier_ciphertext =
+        encryption.encrypt_legacy_fixture(VERIFIER_ID, &legacy_verifier());
+    assert_eq!(
+        encryption
+            .decrypt(VERIFIER_ID, &legacy_verifier_ciphertext)
+            .unwrap(),
+        legacy_verifier()
+    );
     assert!(encryption.decrypt("elasticsearch", &first).is_err());
     assert!(Encryption::new(&STANDARD.encode([8u8; 32]), "v1")
         .unwrap()

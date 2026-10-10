@@ -1,4 +1,5 @@
 import { Temporal } from '@js-temporal/polyfill';
+import { getPreference } from './preferences';
 
 export function validTimeZone(zone: string): boolean {
   try {
@@ -9,7 +10,7 @@ export function validTimeZone(zone: string): boolean {
 
 export function initialTimeZone(): string {
   try {
-    const saved = window.localStorage.getItem('northstar-timezone');
+    const saved = getPreference('timezone');
     if (saved && validTimeZone(saved)) return saved;
   } catch {}
   return 'UTC';

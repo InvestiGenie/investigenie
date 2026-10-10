@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 import { api } from './api';
+import { clearPreference } from './preferences';
 import { clickhouseIntegration, connectionFixture, elasticsearchIntegration, thirdIntegration } from './test-fixtures';
 
 function jsonResponse(body: unknown): Response {
@@ -27,9 +28,9 @@ function renderExplore() {
 describe('Discover', () => {
   beforeEach(() => {
     vi.unstubAllGlobals();
-    window.localStorage.removeItem('northstar-theme');
-    window.localStorage.removeItem('northstar-nav-expanded');
-    window.localStorage.removeItem('northstar-timezone');
+    clearPreference('theme');
+    clearPreference('nav-expanded');
+    clearPreference('timezone');
     document.documentElement.dataset.theme = 'light';
     vi.spyOn(api, 'aiModels').mockResolvedValue([]);
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
@@ -609,7 +610,7 @@ describe('Discover', () => {
     expect(document.querySelector('.selected-field-cell')).toHaveTextContent('2026-10-06 11:18:00');
     expect(document.querySelector('.source-fields')).toHaveTextContent('2026-10-06 10:18:00');
     expect(document.querySelector('.histogram-interval')).toHaveTextContent('Europe/Berlin');
-    expect(window.localStorage.getItem('northstar-timezone')).toBe('Europe/Berlin');
+    expect(window.localStorage.getItem('investigenie-timezone')).toBe('Europe/Berlin');
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
     fireEvent.click(screen.getByRole('button', { name: 'Open full document' }));
     const dialog = await screen.findByRole('dialog');
@@ -632,7 +633,7 @@ describe('Discover', () => {
     fireEvent.click(darkModeButton);
 
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe('dark'));
-    expect(window.localStorage.getItem('northstar-theme')).toBe('dark');
+    expect(window.localStorage.getItem('investigenie-theme')).toBe('dark');
     expect(screen.getByRole('button', { name: 'Switch to light mode' })).toHaveAttribute('aria-pressed', 'true');
 
     firstRender.unmount();
@@ -673,6 +674,6 @@ describe('Discover', () => {
     fireEvent.click(within(management).getByRole('button', { name: 'Data Views' }));
     expect(screen.getByRole('heading', { name: 'Data Views', level: 1 })).toBeInTheDocument();
     expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
-    await waitFor(() => expect(window.localStorage.getItem('northstar-nav-expanded')).toBe('true'));
+    await waitFor(() => expect(window.localStorage.getItem('investigenie-nav-expanded')).toBe('true'));
   });
 });

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 
 import { ArrowUp, BrainCircuit, Check, CircleAlert, Database, Search, X } from 'lucide-react';
 import { api, type AIModelSummary, type DataViewSummary, type InvestigationResult } from './api';
 import TimeRangePicker from './TimeRangePicker';
+import { getPreference, setPreference } from './preferences';
 
 type InvestiGenieAIPageProps = {
   dataViews: DataViewSummary[];
@@ -40,7 +41,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
         setModels(available);
         setModelStatus(available.length ? 'ready' : 'empty');
         try {
-          const remembered = window.localStorage.getItem('northstar-ai-model');
+          const remembered = getPreference('ai-model');
           setSelectedModelId(available.some((model) => model.id === remembered) ? remembered! : available[0]?.id ?? '');
         } catch {
           setSelectedModelId(available[0]?.id ?? '');
@@ -66,7 +67,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
 
   function selectModel(id: string) {
     setSelectedModelId(id);
-    try { window.localStorage.setItem('northstar-ai-model', id); } catch {}
+    setPreference('ai-model', id);
   }
 
   function toggleDataView(id: string) {

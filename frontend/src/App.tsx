@@ -4,6 +4,7 @@ import { api, makeSearchRequest, type ConnectionSummary, type DataViewSummary, t
 import ConnectionsPage from './ConnectionsPage';
 import DataViewsPage from './DataViewsPage';
 import TimeRangePicker from './TimeRangePicker';
+import { getPreference, setPreference } from './preferences';
 import { formatTimestamp, initialTimeZone, isDateField } from './time';
 import { applyQueryTemplate, resolveSearchQuery } from './query';
 
@@ -15,7 +16,7 @@ type Theme = 'light' | 'dark';
 
 function initialTheme(): Theme {
   try {
-    return window.localStorage.getItem('northstar-theme') === 'dark' ? 'dark' : 'light';
+    return getPreference('theme') === 'dark' ? 'dark' : 'light';
   } catch {
     return 'light';
   }
@@ -60,7 +61,7 @@ export default function App() {
   const [timeZone, setTimeZone] = useState(initialTimeZone);
   const [navExpanded, setNavExpanded] = useState(() => {
     try {
-      return window.localStorage.getItem('northstar-nav-expanded') === 'true';
+      return getPreference('nav-expanded') === 'true';
     } catch {
       return false;
     }
@@ -104,19 +105,19 @@ export default function App() {
   }
 
   useEffect(() => {
-    try { window.localStorage.setItem('northstar-timezone', timeZone); } catch {}
+    setPreference('timezone', timeZone);
   }, [timeZone]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     try {
-      window.localStorage.setItem('northstar-theme', theme);
+      setPreference('theme', theme);
     } catch {}
   }, [theme]);
 
   useEffect(() => {
     try {
-      window.localStorage.setItem('northstar-nav-expanded', String(navExpanded));
+      setPreference('nav-expanded', String(navExpanded));
     } catch {}
   }, [navExpanded]);
 

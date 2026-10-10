@@ -8,7 +8,6 @@ use std::{
     sync::Mutex,
 };
 
-const SNAPSHOT_ID: &str = "northstar-filesystem-snapshot";
 const SNAPSHOT_NAME: &str = "configuration.snapshot";
 const LOCK_NAME: &str = "configuration.lock";
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
@@ -44,7 +43,7 @@ impl Snapshot {
         if self.version != 1 {
             return Err(StorageError::Schema);
         }
-        if self.verifier.as_bytes() != VERIFIER {
+        if self.verifier.as_bytes() != VERIFIER && self.verifier.as_bytes() != legacy_verifier() {
             return Err(StorageError::Encryption);
         }
         for (id, record) in &self.connections {
@@ -181,7 +180,13 @@ impl FileStorage {
             snapshot: Mutex::new(Snapshot::empty()),
         };
         if regular_path(&storage.root.join(SNAPSHOT_NAME), false)? {
-            let snapshot = storage.load()?;
+            let mut snapshot = storage.load()?;
+            if snapshot.verifier.as_bytes() != VERIFIER {
+                snapshot.verifier = String::from_utf8(VERIFIER.to_vec()).unwrap();
+                if let Some(error) = storage.commit(&snapshot)? {
+                    return Err(error);
+                }
+            }
             *storage
                 .snapshot
                 .get_mut()

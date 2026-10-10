@@ -136,6 +136,28 @@ fn version_one_snapshots_without_ai_models_remain_readable() {
 }
 
 #[tokio::test]
+async fn legacy_encrypted_snapshots_are_migrated_to_current_identifiers() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("legacy-store");
+    fs::create_dir_all(&path).unwrap();
+    let encryption = Encryption::new(&STANDARD.encode([7u8; 32]), "v1").unwrap();
+    let mut snapshot = Snapshot::empty();
+    snapshot.verifier = String::from_utf8(legacy_verifier()).unwrap();
+    let bytes = encryption.encrypt_legacy_fixture(
+        SNAPSHOT_ID,
+        &serde_json::to_vec(&snapshot).unwrap(),
+    );
+    fs::write(path.join(SNAPSHOT_NAME), bytes).unwrap();
+
+    let storage = Storage::open(options(&path)).await.unwrap();
+    let migrated_bytes = fs::read(path.join(SNAPSHOT_NAME)).unwrap();
+    let plaintext = encryption.decrypt(SNAPSHOT_ID, &migrated_bytes).unwrap();
+    let migrated: Snapshot = serde_json::from_slice(&plaintext).unwrap();
+    assert_eq!(migrated.verifier.as_bytes(), VERIFIER);
+    assert_eq!(storage.connections().await.unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn locks_survive_close_and_clones_until_last_drop() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::open(options(directory.path())).await.unwrap();
