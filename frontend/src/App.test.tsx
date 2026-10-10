@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
+import { api } from './api';
 import { clickhouseIntegration, connectionFixture, elasticsearchIntegration, thirdIntegration } from './test-fixtures';
 
 function jsonResponse(body: unknown): Response {
@@ -17,6 +18,12 @@ function enterDateTime(label: string, value: string) {
   fireEvent.change(screen.getByLabelText(`${label} time`), { target: { value: time } });
 }
 
+function renderExplore() {
+  const rendered = render(<App />);
+  fireEvent.click(screen.getByRole('button', { name: 'Explore' }));
+  return rendered;
+}
+
 describe('Discover', () => {
   beforeEach(() => {
     vi.unstubAllGlobals();
@@ -24,10 +31,57 @@ describe('Discover', () => {
     window.localStorage.removeItem('northstar-nav-expanded');
     window.localStorage.removeItem('northstar-timezone');
     document.documentElement.dataset.theme = 'light';
+    vi.spyOn(api, 'aiModels').mockResolvedValue([]);
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       if (String(input).endsWith('/status')) return jsonResponse({ status: 'connected' });
       throw new Error(`Unexpected request: ${String(input)}`);
     }));
+  });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it('pages using the applied query, reuses histograms, caches previous pages, and resets on search', async () => {
+    const page = (id: string, cursor: string | null) => ({ took: 2, timed_out: false, total: 101, total_relation: 'eq', hits: [{ index: 'events', id, score: null, source: { message: `${id} message` } }], histogram: [], next_cursor: cursor });
+    vi.spyOn(api, 'connections').mockResolvedValue([connectionFixture(elasticsearchIntegration)]);
+    vi.spyOn(api, 'dataViews').mockResolvedValue([{ id: 'view', revision: 'r1', name: 'Events', connection_id: 'source', index: 'events', time_field: '@timestamp' }]);
+    vi.spyOn(api, 'fields').mockResolvedValue([{ name: '@timestamp', field_type: 'date' }]);
+    const search = vi.spyOn(api, 'search').mockResolvedValueOnce({ ...page('first-page', 'cursor-one'), histogram: [{ timestamp: 1000, label: null, count: 101 }] }).mockResolvedValueOnce(page('second-page', null)).mockResolvedValueOnce(page('fresh-search', null));
+    renderExplore();
+    expect(await screen.findByText('first-page')).toBeInTheDocument();
+    expect(search.mock.calls[0][1]).toMatchObject({ cursor: '', from: 0, size: 50 });
+    fireEvent.change(screen.getByLabelText('Lucene query'), { target: { value: 'unsent edit' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    expect(await screen.findByText('second-page')).toBeInTheDocument();
+    expect(search.mock.calls[1][1]).toMatchObject({ cursor: 'cursor-one', include_histogram: false, query: '' });
+    expect(screen.getByText('Page 2 · 1 documents')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled();
+    expect(await screen.findByRole('img', { name: 'Document counts over time' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Previous page' }));
+    expect(screen.getByText('first-page')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    expect(screen.getByText('second-page')).toBeInTheDocument();
+    expect(search).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+    expect(await screen.findByText('fresh-search')).toBeInTheDocument();
+    expect(search.mock.calls[2][1]).toMatchObject({ cursor: '', query: 'unsent edit' });
+    expect(screen.getByRole('button', { name: 'Previous page' })).toBeDisabled();
+  });
+
+  it('retains the current page when continuation fails and allows retry', async () => {
+    vi.spyOn(api, 'connections').mockResolvedValue([connectionFixture(elasticsearchIntegration)]);
+    vi.spyOn(api, 'dataViews').mockResolvedValue([{ id: 'view', revision: 'r1', name: 'Events', connection_id: 'source', index: 'events', time_field: '@timestamp' }]);
+    vi.spyOn(api, 'fields').mockResolvedValue([]);
+    const result = { took: 1, timed_out: false, total: 2, total_relation: 'eq', hits: [{ index: 'events', id: 'kept-page', score: null, source: { message: 'kept-page message' } }], histogram: [], next_cursor: 'retry-cursor' };
+    const search = vi.spyOn(api, 'search').mockResolvedValueOnce(result).mockRejectedValueOnce(new Error('Snapshot expired; run a new search')).mockResolvedValueOnce({ ...result, hits: [], next_cursor: null });
+    renderExplore();
+    await screen.findByText('kept-page');
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Snapshot expired');
+    expect(screen.getByText('kept-page')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled());
+    expect(search).toHaveBeenCalledTimes(3);
+    expect(screen.getByText('kept-page')).toBeInTheDocument();
   });
 
   it('checks each saved datasource when navigating to Connections without consuming list responses', async () => {
@@ -52,9 +106,44 @@ describe('Discover', () => {
     expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/status'))).toHaveLength(2);
   });
 
+  it('opens Northstar AI as the default home page and shows the empty state when no Data Views exist', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/api/connections')) return jsonResponse({ connections: [] });
+      if (url.endsWith('/api/data-views')) return jsonResponse({ data_views: [] });
+      if (url.endsWith('/api/ai/investigate')) return { ok: false, status: 503, json: async () => ({ error: { code: 'ai_not_configured', message: 'AI investigation is not configured on this server' } }) } as Response;
+      throw new Error(`Unexpected request: ${url} ${init?.method ?? 'GET'}`);
+    });
+    render(<App />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole('heading', { name: 'Northstar AI', level: 1 })).toBeInTheDocument();
+    expect(await screen.findByText('Create a Data View before starting an investigation.')).toBeInTheDocument();
+  });
+
+  it('opens AI model management from the Management nav and the AI empty state', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith('/api/connections')) return jsonResponse({ connections: [] });
+      if (url.endsWith('/api/data-views')) return jsonResponse({ data_views: [] });
+      if (url.endsWith('/api/ai/models')) return jsonResponse({ models: [] });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    renderExplore();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole('button', { name: 'AI Models' }));
+    expect(await screen.findByRole('heading', { name: 'Saved AI models' })).toBeInTheDocument();
+    expect(await screen.findByText('No AI models configured')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Northstar AI' }));
+    expect(await screen.findByText('No saved AI models')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Open AI model management' }));
+    expect(await screen.findByRole('heading', { name: 'Saved AI models' })).toBeInTheDocument();
+  });
+
   it('keeps Discover empty and error-free when startup requests fail without a selected view', async () => {
     vi.mocked(fetch).mockRejectedValue(new TypeError('Failed to fetch'));
-    render(<App />);
+    renderExplore();
     await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2));
     expect(screen.getByLabelText('DATA VIEW')).toHaveValue('');
     expect(screen.getByRole('button', { name: 'Create data view' })).toBeInTheDocument();
@@ -71,7 +160,7 @@ describe('Discover', () => {
     expect(screen.getAllByRole('alert')).toHaveLength(1);
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Discover' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Explore' }));
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Create data view' })).toBeInTheDocument();
   });
@@ -107,7 +196,7 @@ describe('Discover', () => {
         histogram: [{ timestamp: 1791400000000, label: '2026-10-07T20:26:40.000Z', count: 1 }],
       }));
 
-    render(<App />);
+    renderExplore();
     expect(await screen.findByText('service.name')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Add host to selected fields' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Add service to selected fields' })).not.toBeInTheDocument();
@@ -129,8 +218,8 @@ describe('Discover', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Search' }));
 
     expect(await screen.findByText('GET /health')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /Previous|Next/ })).not.toBeInTheDocument();
-    expect(document.querySelector('.pagination')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Previous page' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled();
     expect(screen.queryByRole('heading', { name: 'Documents' })).not.toBeInTheDocument();
     expect(document.querySelector('.results-heading')).toHaveTextContent('Took 4 ms');
     expect(screen.getByRole('region', { name: 'Documents' })).toHaveAttribute('tabindex', '0');
@@ -196,13 +285,13 @@ describe('Discover', () => {
       throw new Error(`Unexpected request: ${url}`);
     });
 
-    render(<App />);
+    renderExplore();
     expect(await screen.findByText('0 matching documents')).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText('DATA VIEW'), { target: { value: 'warehouse-view' } });
 
     expect(await screen.findByRole('textbox', { name: 'SQL query' })).toBeInTheDocument();
     expect(await screen.findByRole('button', { name: 'Expand document row-1' })).toBeInTheDocument();
-    expect(document.querySelector('.pagination')).toBeNull();
+    expect(screen.getByRole('navigation', { name: 'Document pages' })).toBeInTheDocument();
     expect(document.querySelector('.results-heading')).toHaveTextContent('Took 2 ms');
     expect(screen.queryByRole('heading', { name: 'Documents' })).not.toBeInTheDocument();
     expect(screen.getByRole('columnheader', { name: 'Document' })).toBeInTheDocument();
@@ -304,7 +393,7 @@ describe('Discover', () => {
       });
       throw new Error(`Unexpected request: ${url}`);
     });
-    render(<App />);
+    renderExplore();
     await screen.findByRole('button', { name: 'Expand document record-1' });
     const queryInput = screen.getByLabelText('ArchiveQL query');
     expect(queryInput).toHaveAttribute('placeholder', 'READ "audit""events"');
@@ -367,7 +456,7 @@ describe('Discover', () => {
       if (url.endsWith('/search')) return jsonResponse({ took: 1, timed_out: false, total: 1, total_relation: 'eq', hits: [{ index: 'logs', id: 'sort-doc', score: null, source: { created_at: '2026-10-08 00:00:00' } }], histogram: [] });
       throw new Error(`Unexpected request: ${url}`);
     });
-    render(<App />);
+    renderExplore();
     expect(await screen.findByRole('option', { name: 'No data views available' })).toBeInTheDocument();
     expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/indices'))).toBe(false);
     fireEvent.click(screen.getByRole('button', { name: 'Data Views' }));
@@ -379,7 +468,7 @@ describe('Discover', () => {
     await waitFor(() => expect(screen.getByLabelText('Time series time field')).toHaveValue('created_at'));
     fireEvent.click(screen.getByRole('button', { name: 'Create data view' }));
     await screen.findByText('Data view validated and created.');
-    fireEvent.click(screen.getByRole('button', { name: 'Discover' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Explore' }));
     expect(screen.getByLabelText('DATA VIEW')).toHaveValue('saved-logs');
     expect(screen.getAllByRole('option', { name: 'Saved logs' })).toHaveLength(1);
     expect(screen.queryByRole('option', { name: 'logs' })).not.toBeInTheDocument();
@@ -397,7 +486,7 @@ describe('Discover', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Data Views' }));
     fireEvent.click(screen.getByRole('button', { name: 'Remove Saved logs' }));
     await screen.findByText('Saved logs removed.');
-    fireEvent.click(screen.getByRole('button', { name: 'Discover' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Explore' }));
     expect(screen.getByLabelText('DATA VIEW')).toHaveValue('');
     expect(screen.queryByRole('option', { name: 'Saved logs' })).not.toBeInTheDocument();
     expect(screen.queryByText('1 matching documents')).not.toBeInTheDocument();
@@ -415,7 +504,7 @@ describe('Discover', () => {
       });
       throw new Error(`Unexpected request: ${url}`);
     });
-    render(<App />);
+    renderExplore();
     await screen.findByRole('button', { name: 'Expand document doc-12' });
     const viewport = screen.getByRole('region', { name: 'Documents' });
     expect(within(viewport).getAllByRole('button', { name: /^Expand document/ })).toHaveLength(12);
@@ -437,7 +526,7 @@ describe('Discover', () => {
       if (url.endsWith('/search')) return jsonResponse({ took: 1, timed_out: false, total: 1, total_relation: 'eq', histogram: [], columns: ['created_at'], hits: [{ index: 'events', id: 'doc-1', score: null, source: { created_at: '2026-10-08 09:30:00' } }] });
       throw new Error(`Unexpected request: ${url}`);
     });
-    render(<App />);
+    renderExplore();
     await screen.findByRole('button', { name: 'Expand document doc-1' });
     const toolbar = document.querySelector('.query-topline') as HTMLElement;
     expect([...toolbar.children].map((element) => element.tagName)).toEqual(['LABEL', 'SELECT', 'DIV']);
@@ -483,7 +572,7 @@ describe('Discover', () => {
       if (url.endsWith('/search')) return jsonResponse({ took: 1, timed_out: false, total: 1, total_relation: 'eq', columns: ['created_at', 'updated_at'], histogram: [{ timestamp: Date.parse(source.created_at), count: 1, label: null }], hits: [{ index: 'events', id: 'doc-1', score: null, source }] });
       throw new Error(`Unexpected request: ${url}`);
     });
-    const rendered = render(<App />);
+    const rendered = renderExplore();
     await screen.findByRole('button', { name: 'Expand document doc-1' });
     fireEvent.click(screen.getByRole('button', { name: 'Add updated_at to selected fields' }));
     fireEvent.click(screen.getByRole('button', { name: 'Expand document doc-1' }));
@@ -513,7 +602,7 @@ describe('Discover', () => {
     const latest = fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/search')).at(-1);
     expect(JSON.parse(String(latest?.[1]?.body))).toMatchObject({ time_range: { start: Date.parse('2026-10-06T08:00:00Z'), end: Date.parse('2026-10-06T10:00:00Z') } });
     rendered.unmount();
-    render(<App />);
+    renderExplore();
     await screen.findByRole('button', { name: 'Expand document doc-1' });
     expect(document.querySelector('.time-cell')).toHaveTextContent('2026-10-06 10:18:00');
     expect(screen.getByRole('button', { name: 'Edit time window' })).toHaveAttribute('title', 'Search time window in Europe/Berlin');
@@ -529,16 +618,17 @@ describe('Discover', () => {
     expect(screen.getByRole('button', { name: 'Switch to light mode' })).toHaveAttribute('aria-pressed', 'true');
 
     firstRender.unmount();
-    render(<App />);
+    renderExplore();
     expect(await screen.findByRole('button', { name: 'Switch to light mode' })).toHaveAttribute('aria-pressed', 'true');
     expect(document.documentElement.dataset.theme).toBe('dark');
   });
 
-  it('removes the Explore breadcrumb and expands the navigation labels', async () => {
+  it('starts at Northstar AI and orders Explore, Dashboard, and Management navigation', async () => {
     render(<App />);
     expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
-    expect(screen.getByRole('heading', { name: 'Discover', level: 1 })).toHaveClass('workspace-title');
-    expect(screen.queryByText('Explore')).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Northstar AI', level: 1 })).toHaveClass('workspace-title');
+    const primaryButtons = within(screen.getByRole('navigation', { name: 'Main menu' })).getAllByRole('button');
+    expect(primaryButtons.slice(0, 3).map((button) => button.getAttribute('aria-label'))).toEqual(['Northstar AI', 'Explore', 'Dashboard']);
     expect(screen.queryByLabelText('CONNECTION')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Refresh' })).not.toBeInTheDocument();
     expect(document.querySelector('.rail-bottom .status-light')).toBeNull();
@@ -547,18 +637,21 @@ describe('Discover', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Expand menu' }));
 
     expect(document.querySelector('.app-shell')).toHaveClass('nav-expanded');
-    expect(screen.getByText('Discover', { selector: '.nav-label' })).toBeInTheDocument();
-    expect(screen.getByText('Dashboards', { selector: '.nav-label' })).toBeInTheDocument();
+    expect(screen.getByText('Explore', { selector: '.nav-label' })).toBeInTheDocument();
+    expect(screen.getByText('Dashboard', { selector: '.nav-label' })).toBeInTheDocument();
     expect(screen.getByText('Connections', { selector: '.nav-label' })).toBeInTheDocument();
     expect(screen.getByText('Data Views', { selector: '.nav-label' })).toBeInTheDocument();
     const management = screen.getByRole('group', { name: 'Management' });
-    expect(within(management).getAllByRole('button')).toHaveLength(2);
+    expect(within(management).getAllByRole('button').map((button) => button.getAttribute('aria-label'))).toEqual(['AI Models', 'Connections', 'Data Views']);
     expect(within(management).getByRole('button', { name: 'Connections' })).toBeInTheDocument();
     expect(within(management).getByRole('button', { name: 'Data Views' })).toBeInTheDocument();
-    expect(within(management).queryByRole('button', { name: 'Discover' })).not.toBeInTheDocument();
+    expect(within(management).getByRole('button', { name: 'AI Models' })).toBeInTheDocument();
+    expect(within(management).queryByRole('button', { name: 'Explore' })).not.toBeInTheDocument();
     fireEvent.click(within(management).getByRole('button', { name: 'Connections' }));
     expect(screen.getByRole('heading', { name: 'Connections', level: 1 })).toBeInTheDocument();
     expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Explore' }));
+    expect(screen.getByRole('heading', { name: 'Explore', level: 1 })).toBeInTheDocument();
     fireEvent.click(within(management).getByRole('button', { name: 'Data Views' }));
     expect(screen.getByRole('heading', { name: 'Data Views', level: 1 })).toBeInTheDocument();
     expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);

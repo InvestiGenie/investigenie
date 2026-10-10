@@ -1,5 +1,5 @@
 import { Fragment, lazy, Suspense, useEffect, useRef, useState, type FormEvent } from 'react';
-import { ArrowDown, ArrowUp, ArrowUpDown } from 'lucide-react';
+import { ArrowDown, ArrowUp, ArrowUpDown, BrainCircuit, ChevronLeft, ChevronRight } from 'lucide-react';
 import { api, makeSearchRequest, type ConnectionSummary, type DataViewSummary, type DocumentResult, type FieldSummary, type SearchResult } from './api';
 import ConnectionsPage from './ConnectionsPage';
 import DataViewsPage from './DataViewsPage';
@@ -8,6 +8,8 @@ import { formatTimestamp, initialTimeZone, isDateField } from './time';
 import { applyQueryTemplate, resolveSearchQuery } from './query';
 
 const HistogramChart = lazy(() => import('./HistogramChart'));
+const NorthstarAIPage = lazy(() => import('./NorthstarAIPage'));
+const AIModelsPage = lazy(() => import('./AIModelsPage'));
 
 type Theme = 'light' | 'dark';
 
@@ -66,7 +68,7 @@ export default function App() {
   const [connections, setConnections] = useState<ConnectionSummary[]>([]);
   const [dataViews, setDataViews] = useState<DataViewSummary[]>([]);
   const [selectedDataViewId, setSelectedDataViewId] = useState('');
-  const [activePage, setActivePage] = useState<'discover' | 'connections' | 'data-views'>('discover');
+  const [activePage, setActivePage] = useState<'discover' | 'northstar-ai' | 'connections' | 'data-views' | 'ai-models'>('northstar-ai');
   const [fields, setFields] = useState<FieldSummary[]>([]);
   const [fieldFilter, setFieldFilter] = useState('');
   const [selectedFieldsByView, setSelectedFieldsByView] = useState<Record<string, string[]>>({});
@@ -81,6 +83,23 @@ export default function App() {
   const [error, setError] = useState('');
   const [expandedHit, setExpandedHit] = useState<string | null>(null);
   const requestController = useRef<AbortController | null>(null);
+  const [pageNumber, setPageNumber] = useState(1);
+  const [previousPages, setPreviousPages] = useState<Array<{ number: number; result: SearchResult }>>([]);
+  const [forwardPages, setForwardPages] = useState<Array<{ number: number; result: SearchResult }>>([]);
+  const appliedSearch = useRef<ReturnType<typeof makeSearchRequest> | null>(null);
+
+  function firstPageRequest(body: ReturnType<typeof makeSearchRequest>) {
+    return { ...body, cursor: '' };
+  }
+
+  function acceptFirstPage(response: SearchResult, body: ReturnType<typeof makeSearchRequest>) {
+    appliedSearch.current = body;
+    setResults(response);
+    setPageNumber(1);
+    setPreviousPages([]);
+    setForwardPages([]);
+    setExpandedHit(null);
+  }
 
   useEffect(() => {
     try { window.localStorage.setItem('northstar-timezone', timeZone); } catch {}
@@ -159,13 +178,14 @@ export default function App() {
         if (fieldsController.signal.aborted) return;
         setFields(availableFields);
         const searchQuery = resolveSearchQuery(selectedConnection!.integration.query, selectedIndex, query);
+        const body = firstPageRequest(makeSearchRequest(selectedIndex, searchQuery, 0, sortBy, selectedDataView?.time_field, sortOrder, startDate, endDate));
         const response = await api.search(
           selectedConnectionId,
-          makeSearchRequest(selectedIndex, searchQuery, 0, sortBy, selectedDataView?.time_field, sortOrder, startDate, endDate),
+          body,
           searchController.signal,
         );
-        setResults(response);
-        setExpandedHit(null);
+        if (searchController.signal.aborted) return;
+        acceptFirstPage(response, body);
       } catch (reason) {
         if (!fieldsController.signal.aborted && !searchController.signal.aborted) setError(errorMessage(reason));
       } finally {
@@ -195,9 +215,7 @@ export default function App() {
     setLoading(true);
     setError('');
     try {
-      const response = await api.search(
-        selectedConnectionId,
-        makeSearchRequest(
+      const body = firstPageRequest(makeSearchRequest(
           selectedIndex,
           resolveSearchQuery(queryMetadata, selectedIndex, query),
           nextOffset,
@@ -206,11 +224,14 @@ export default function App() {
           overrides.sortOrder ?? sortOrder,
           startDate,
           endDate,
-        ),
+        ));
+      const response = await api.search(
+        selectedConnectionId,
+        body,
         controller.signal,
       );
-      setResults(response);
-      setExpandedHit(null);
+      if (controller.signal.aborted) return;
+      acceptFirstPage(response, body);
     } catch (reason) {
       if (!controller.signal.aborted) setError(errorMessage(reason));
     } finally {
@@ -225,6 +246,54 @@ export default function App() {
     } catch (reason) {
       setError(errorMessage(reason));
     }
+  }
+
+  async function nextPage() {
+    if (!results || !appliedSearch.current || loading) return;
+    const cached = forwardPages.at(-1);
+    if (cached) {
+      setPreviousPages((pages) => [...pages, { number: pageNumber, result: results }].slice(-5));
+      setResults(cached.result);
+      setPageNumber(cached.number);
+      setForwardPages((pages) => pages.slice(0, -1));
+      setExpandedHit(null);
+      return;
+    }
+    if (!results.next_cursor) return;
+    const current = results;
+    const controller = new AbortController();
+    requestController.current?.abort();
+    requestController.current = controller;
+    setLoading(true);
+    setError('');
+    try {
+      const response = await api.search(selectedConnectionId, { ...appliedSearch.current, cursor: current.next_cursor!, include_histogram: false }, controller.signal);
+      if (controller.signal.aborted) return;
+      if (!response.hits.length) {
+        setResults({ ...current, next_cursor: null, ...(current.total_relation === 'gte' ? { total: pageNumber * appliedSearch.current!.size, total_relation: 'eq' } : {}) });
+        return;
+      }
+      setPreviousPages((pages) => [...pages, { number: pageNumber, result: current }].slice(-5));
+      const total = current.total_relation === 'eq' ? current.total : Math.max(current.total, response.total, pageNumber * appliedSearch.current!.size + response.hits.length);
+      const relation = current.total_relation === 'eq' || !response.next_cursor ? 'eq' : 'gte';
+      setResults({ ...response, histogram: current.histogram, total, total_relation: relation, histogram_unavailable_reason: current.histogram_unavailable_reason });
+      setPageNumber((number) => number + 1);
+      setExpandedHit(null);
+    } catch (reason) {
+      if (!controller.signal.aborted) setError(errorMessage(reason));
+    } finally {
+      if (!controller.signal.aborted) setLoading(false);
+    }
+  }
+
+  function previousPage() {
+    const page = previousPages.at(-1);
+    if (!page || loading) return;
+    setResults(page.result);
+    if (results) setForwardPages((pages) => [...pages, { number: pageNumber, result: results }].slice(-5));
+    setPageNumber(page.number);
+    setPreviousPages((pages) => pages.slice(0, -1));
+    setExpandedHit(null);
   }
 
   const histogramField = selectedDataView?.time_field;
@@ -293,10 +362,12 @@ export default function App() {
       <aside className="rail" aria-label="Primary navigation">
         <div className="rail-brand"><div className="brand-mark" aria-label="Northstar">N</div><span className="nav-label">Northstar</span></div>
         <nav className="rail-nav" aria-label="Main menu">
-          <button className={`rail-button${activePage === 'discover' ? ' active' : ''}`} aria-label="Discover" title="Discover" onClick={() => setActivePage('discover')}><span className="rail-icon" aria-hidden="true">⌕</span><span className="nav-label">Discover</span></button>
-          <button className="rail-button" aria-label="Dashboards" title="Dashboards" disabled><span className="rail-icon" aria-hidden="true">▦</span><span className="nav-label">Dashboards</span></button>
+          <button className={`rail-button${activePage === 'northstar-ai' ? ' active' : ''}`} aria-label="Northstar AI" title="Northstar AI" onClick={() => setActivePage('northstar-ai')}><span className="rail-icon" aria-hidden="true"><BrainCircuit size={19} /></span><span className="nav-label">Northstar AI</span></button>
+          <button className={`rail-button${activePage === 'discover' ? ' active' : ''}`} aria-label="Explore" title="Explore" onClick={() => setActivePage('discover')}><span className="rail-icon" aria-hidden="true">⌕</span><span className="nav-label">Explore</span></button>
+          <button className="rail-button" aria-label="Dashboard" title="Dashboard" disabled><span className="rail-icon" aria-hidden="true">▦</span><span className="nav-label">Dashboard</span></button>
           <div className="rail-nav-group" role="group" aria-label="Management">
             <span className="rail-group-label">Management</span>
+            <button className={`rail-button${activePage === 'ai-models' ? ' active' : ''}`} aria-label="AI Models" title="AI Models" onClick={() => setActivePage('ai-models')}><span className="rail-icon" aria-hidden="true"><BrainCircuit size={18} /></span><span className="nav-label">AI Models</span></button>
             <button className={`rail-button${activePage === 'connections' ? ' active' : ''}`} aria-label="Connections" title="Connections" onClick={() => setActivePage('connections')}><span className="rail-icon" aria-hidden="true">⌘</span><span className="nav-label">Connections</span></button>
             <button className={`rail-button${activePage === 'data-views' ? ' active' : ''}`} aria-label="Data Views" title="Data Views" onClick={() => setActivePage('data-views')}><span className="rail-icon" aria-hidden="true">◫</span><span className="nav-label">Data Views</span></button>
           </div>
@@ -306,11 +377,15 @@ export default function App() {
 
       <div className="workspace">
         <header className="topbar">
-          <div className="breadcrumb"><h1 className="workspace-title">{activePage === 'connections' ? 'Connections' : activePage === 'data-views' ? 'Data Views' : 'Discover'}</h1></div>
+          <div className="breadcrumb"><h1 className="workspace-title">{activePage === 'connections' ? 'Connections' : activePage === 'data-views' ? 'Data Views' : activePage === 'ai-models' ? 'AI Models' : activePage === 'northstar-ai' ? 'Northstar AI' : 'Explore'}</h1></div>
           <div className="topbar-right"><button className="theme-toggle" type="button" aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`} aria-pressed={theme === 'dark'} title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`} onClick={() => setTheme((current) => current === 'light' ? 'dark' : 'light')}><span aria-hidden="true">{theme === 'light' ? '☾' : '☀'}</span></button></div>
         </header>
 
-        {activePage === 'connections'
+        {activePage === 'northstar-ai'
+          ? <Suspense fallback={<div className="loading-state"><span className="spinner dark" /> Loading Northstar AI…</div>}><NorthstarAIPage dataViews={dataViews} onManageModels={() => setActivePage('ai-models')} /></Suspense>
+          : activePage === 'ai-models'
+            ? <Suspense fallback={<div className="loading-state"><span className="spinner dark" /> Loading AI models…</div>}><AIModelsPage /></Suspense>
+          : activePage === 'connections'
           ? <ConnectionsPage connections={connections} onConnectionsChange={refreshConnections} />
           : activePage === 'data-views'
             ? <DataViewsPage connections={connections} dataViews={dataViews} onDataViewsChange={refreshDataViews} />
@@ -389,6 +464,11 @@ export default function App() {
                     </tbody>
                   </table>
                 </div>
+                <nav className="pagination" aria-label="Document pages">
+                  <button className="icon-button" aria-label="Previous page" title="Previous page" disabled={loading || !previousPages.length} onClick={previousPage}><ChevronLeft size={16} aria-hidden="true" /></button>
+                  <span>Page {pageNumber} · {results.hits.length} documents</span>
+                  <button className="icon-button" aria-label="Next page" title="Next page" disabled={loading || (!results.next_cursor && !forwardPages.length)} onClick={() => void nextPage()}><ChevronRight size={16} aria-hidden="true" /></button>
+                </nav>
               </>}
             </section>
           </section>

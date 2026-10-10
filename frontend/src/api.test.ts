@@ -135,6 +135,53 @@ describe('API requests', () => {
     }));
     await expect(api.addConnection({ name: 'Source', connection_type: 'clickhouse', url: 'invalid' })).rejects.toThrow('Invalid connection');
   });
+
+  it('lists and mutates persisted AI models without exposing a key in summaries', async () => {
+    const summary = { id: 'model/id', revision: 'opaque-revision', name: 'Primary', api_url: 'https://ai.example/v1', model: 'model-x', has_api_key: true as const };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ models: [summary] }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ model: summary }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ model: summary }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => null });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(api.aiModels()).resolves.toEqual([summary]);
+    await expect(api.addAIModel({ name: 'Primary', api_url: summary.api_url, model: summary.model, api_key: 'secret' })).resolves.toEqual(summary);
+    await expect(api.updateAIModel('model/id', { name: 'Primary', api_url: summary.api_url, model: summary.model }, summary.revision)).resolves.toEqual(summary);
+    await api.removeAIModel('model/id', summary.revision);
+    expect(fetchMock.mock.calls.map(([url, init]) => [String(url), init?.method ?? 'GET'])).toEqual([
+      [expect.stringContaining('/api/ai/models'), 'GET'],
+      [expect.stringContaining('/api/ai/models'), 'POST'],
+      [expect.stringContaining('/api/ai/models/model%2Fid'), 'PUT'],
+      [expect.stringContaining('/api/ai/models/model%2Fid'), 'DELETE'],
+    ]);
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({ name: 'Primary', api_url: summary.api_url, model: summary.model, api_key: 'secret' });
+    expect(JSON.parse(fetchMock.mock.calls[2][1].body)).toEqual({ name: 'Primary', api_url: summary.api_url, model: summary.model });
+    expect(fetchMock.mock.calls[2][1].headers['If-Match']).toBe('"opaque-revision"');
+    expect(fetchMock.mock.calls[3][1].headers['If-Match']).toBe('"opaque-revision"');
+  });
+
+  it('surfaces stale AI model conflicts without retrying', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false, status: 409,
+      json: async () => ({ error: { message: 'AI model changed. Reload before trying again.' } }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(api.removeAIModel('model', 'stale')).rejects.toThrow('AI model changed. Reload before trying again.');
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('posts the selected model with the question and selected Data View IDs', async () => {
+    const response = { summary: 'Evidence summary', findings: [], sources: [], caveats: [], token_usage: [] };
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => response });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(api.investigate('Investigate the outage', ['service-one', 'service-two'], 'model-one', { start: 100, end: 200 })).resolves.toEqual(response);
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/api/ai/investigate'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: 'Investigate the outage', data_view_ids: ['service-one', 'service-two'], ai_model_id: 'model-one', time_range: { start: 100, end: 200 } }),
+      signal: undefined,
+    });
+  });
 });
 
 describe('makeSearchRequest', () => {

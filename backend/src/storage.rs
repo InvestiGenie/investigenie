@@ -66,6 +66,8 @@ pub enum StorageError {
     ConnectionNotFound,
     #[error("Data view does not exist")]
     ViewNotFound,
+    #[error("AI model does not exist")]
+    AiModelNotFound,
     #[error("Configuration changed; reload before editing")]
     Conflict,
     #[error("Record is invalid")]
@@ -198,6 +200,40 @@ pub struct PublicSettings {
     pub settings: Value,
     pub revision: String,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredAiModel {
+    pub id: String,
+    pub revision: String,
+    pub name: String,
+    pub api_url: String,
+    pub model: String,
+    pub api_key: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AiModelSummary {
+    pub id: String,
+    pub revision: String,
+    pub name: String,
+    pub api_url: String,
+    pub model: String,
+    pub has_api_key: bool,
+}
+
+impl From<&StoredAiModel> for AiModelSummary {
+    fn from(model: &StoredAiModel) -> Self {
+        Self {
+            id: model.id.clone(),
+            revision: model.revision.clone(),
+            name: model.name.clone(),
+            api_url: model.api_url.clone(),
+            model: model.model.clone(),
+            has_api_key: true,
+        }
+    }
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SettingsFields {
@@ -269,6 +305,27 @@ fn validate_view(view: &DataView) -> Result<(), StorageError> {
         || view.index.len() > 1024
         || view.time_field.trim().is_empty()
         || view.time_field.len() > 1024
+    {
+        return Err(StorageError::Invalid);
+    }
+    Ok(())
+}
+pub fn validate_ai_model(model: &StoredAiModel) -> Result<(), StorageError> {
+    let parsed = url::Url::parse(&model.api_url).map_err(|_| StorageError::Invalid)?;
+    if Uuid::parse_str(&model.id).is_err()
+        || model.name.trim().is_empty()
+        || model.name.len() > 128
+        || model.model.trim().is_empty()
+        || model.model.len() > 256
+        || model.api_key.trim().is_empty()
+        || model.api_key.len() > 8192
+        || model.api_url.len() > 2048
+        || !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
     {
         return Err(StorageError::Invalid);
     }
@@ -734,6 +791,141 @@ impl Storage {
             .await?;
         transaction.commit().await?;
         Ok(revision)
+    }
+
+    fn decode_ai_model(&self, row: PgRow) -> Result<StoredAiModel, StorageError> {
+        let id: String = row.try_get("id")?;
+        let encrypted: Vec<u8> = row.try_get("api_key_encrypted")?;
+        let api_key = String::from_utf8(
+            self.encryption
+                .decrypt(&format!("ai-model:{id}"), &encrypted)?,
+        )
+        .map_err(|_| StorageError::Encryption)?;
+        Ok(StoredAiModel {
+            id,
+            revision: row.try_get("revision")?,
+            name: row.try_get("name")?,
+            api_url: row.try_get("api_url")?,
+            model: row.try_get("model")?,
+            api_key,
+        })
+    }
+
+    pub async fn ai_models(&self) -> Result<Vec<StoredAiModel>, StorageError> {
+        if let Some(file) = &self.file {
+            return file
+                .read(|snapshot| Ok(snapshot.ai_models.values().cloned().collect()))
+                .await;
+        }
+        sqlx::query("SELECT * FROM ai_models ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| self.decode_ai_model(row))
+            .collect()
+    }
+
+    pub async fn ai_model(&self, id: &str) -> Result<StoredAiModel, StorageError> {
+        if let Some(file) = &self.file {
+            let id = id.to_owned();
+            return file
+                .read(move |snapshot| {
+                    snapshot
+                        .ai_models
+                        .get(&id)
+                        .cloned()
+                        .ok_or(StorageError::AiModelNotFound)
+                })
+                .await;
+        }
+        let row = sqlx::query("SELECT * FROM ai_models WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StorageError::AiModelNotFound)?;
+        self.decode_ai_model(row)
+    }
+
+    pub async fn create_ai_model(
+        &self,
+        mut model: StoredAiModel,
+    ) -> Result<StoredAiModel, StorageError> {
+        model.id = Uuid::new_v4().to_string();
+        model.revision = revision();
+        validate_ai_model(&model)?;
+        if let Some(file) = &self.file {
+            file.create_ai_model(model.clone()).await?;
+            return Ok(model);
+        }
+        let encrypted = self
+            .encryption
+            .encrypt(&format!("ai-model:{}", model.id), model.api_key.as_bytes())?;
+        sqlx::query("INSERT INTO ai_models (id,name,api_url,model,api_key_encrypted,revision) VALUES ($1,$2,$3,$4,$5,$6)")
+            .bind(&model.id).bind(&model.name).bind(&model.api_url).bind(&model.model).bind(encrypted).bind(&model.revision)
+            .execute(&self.pool).await?;
+        Ok(model)
+    }
+
+    pub async fn update_ai_model(
+        &self,
+        id: &str,
+        expected: &str,
+        mut model: StoredAiModel,
+    ) -> Result<StoredAiModel, StorageError> {
+        validate_ai_model(&model)?;
+        if model.id != id {
+            return Err(StorageError::Invalid);
+        }
+        if let Some(file) = &self.file {
+            file.update_ai_model(id.to_owned(), expected.to_owned(), model.clone())
+                .await?;
+            return self.ai_model(id).await;
+        }
+        let encrypted = self
+            .encryption
+            .encrypt(&format!("ai-model:{id}"), model.api_key.as_bytes())?;
+        let mut transaction = self.pool.begin().await?;
+        let actual: Option<String> =
+            sqlx::query_scalar("SELECT revision FROM ai_models WHERE id=$1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+        match actual {
+            None => return Err(StorageError::AiModelNotFound),
+            Some(actual) if actual != expected => return Err(StorageError::Conflict),
+            _ => {}
+        }
+        model.revision = revision();
+        sqlx::query("UPDATE ai_models SET name=$2,api_url=$3,model=$4,api_key_encrypted=$5,revision=$6 WHERE id=$1")
+            .bind(id).bind(&model.name).bind(&model.api_url).bind(&model.model).bind(encrypted).bind(&model.revision)
+            .execute(&mut *transaction).await?;
+        transaction.commit().await?;
+        Ok(model)
+    }
+
+    pub async fn remove_ai_model(&self, id: &str, expected: &str) -> Result<(), StorageError> {
+        if let Some(file) = &self.file {
+            return file
+                .remove_ai_model(id.to_owned(), expected.to_owned())
+                .await;
+        }
+        let mut transaction = self.pool.begin().await?;
+        let actual: Option<String> =
+            sqlx::query_scalar("SELECT revision FROM ai_models WHERE id=$1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+        match actual {
+            None => return Err(StorageError::AiModelNotFound),
+            Some(actual) if actual != expected => return Err(StorageError::Conflict),
+            _ => {}
+        }
+        sqlx::query("DELETE FROM ai_models WHERE id=$1")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 }
 

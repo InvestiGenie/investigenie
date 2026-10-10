@@ -65,6 +65,55 @@ export type DataViewSummary = {
   time_field: string;
 };
 
+export type AIModelSummary = {
+  id: string;
+  revision: string;
+  name: string;
+  api_url: string;
+  model: string;
+  has_api_key: true;
+};
+
+export type AIModelRequest = {
+  name: string;
+  api_url: string;
+  model: string;
+  api_key?: string;
+};
+
+export type InvestigationFinding = {
+  title: string;
+  detail: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
+  confidence: 'high' | 'medium' | 'low';
+  evidence: Array<{
+    data_view_id: string;
+    data_view_name: string;
+    record_ids: string[];
+    count: number;
+  }>;
+};
+
+export type InvestigationResult = {
+  summary: string;
+  findings: InvestigationFinding[];
+  sources: Array<{
+    data_view_id: string;
+    name: string;
+    index: string;
+    records_examined: number;
+    batches_processed?: number;
+    query_summary: string;
+  }>;
+  caveats: string[];
+  token_usage: Array<{
+    stage: string;
+    prompt_tokens: number | null;
+    completion_tokens: number | null;
+    total_tokens: number | null;
+  }>;
+};
+
 export type CreateDataViewRequest = Omit<DataViewSummary, 'id' | 'revision'>;
 
 export type AddConnectionRequest = ConnectionConfiguration & {
@@ -90,6 +139,7 @@ export type SearchHit = {
 };
 
 export type SearchResult = {
+  next_cursor?: string | null;
   took: number | null;
   timed_out: boolean;
   total: number;
@@ -114,6 +164,8 @@ export type DocumentResult = {
 };
 
 export type SearchRequest = {
+  cursor?: string;
+  include_histogram?: boolean;
   index: string;
   query: string;
   from: number;
@@ -170,6 +222,40 @@ export const api = {
   async dataViews(signal?: AbortSignal): Promise<DataViewSummary[]> {
     const response = await request<{ data_views: DataViewSummary[] }>('/api/data-views', { signal });
     return response.data_views;
+  },
+  async aiModels(signal?: AbortSignal): Promise<AIModelSummary[]> {
+    const response = await request<{ models: AIModelSummary[] }>('/api/ai/models', { signal });
+    return response.models;
+  },
+  async addAIModel(body: AIModelRequest): Promise<AIModelSummary> {
+    const response = await request<{ model: AIModelSummary }>('/api/ai/models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return response.model;
+  },
+  async updateAIModel(modelId: string, body: AIModelRequest, revision: string): Promise<AIModelSummary> {
+    const response = await request<{ model: AIModelSummary }>(`/api/ai/models/${encodeURIComponent(modelId)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'If-Match': `"${revision}"` },
+      body: JSON.stringify(body),
+    });
+    return response.model;
+  },
+  async removeAIModel(modelId: string, revision: string): Promise<void> {
+    await request(`/api/ai/models/${encodeURIComponent(modelId)}`, {
+      method: 'DELETE',
+      headers: { 'If-Match': `"${revision}"` },
+    });
+  },
+  async investigate(question: string, dataViewIds: string[], aiModelId: string, timeRange: SearchRequest['time_range'] | null, signal?: AbortSignal): Promise<InvestigationResult> {
+    return request<InvestigationResult>('/api/ai/investigate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question, data_view_ids: dataViewIds, ai_model_id: aiModelId, time_range: timeRange }),
+      signal,
+    });
   },
   async addDataView(body: CreateDataViewRequest): Promise<void> {
     await request('/api/data-views', {

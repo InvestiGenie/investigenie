@@ -94,6 +94,48 @@ async fn lifecycle_reopen_custom_path_settings_and_encrypted_bytes() {
 }
 
 #[tokio::test]
+async fn ai_model_secrets_are_encrypted_and_profiles_survive_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(options(directory.path())).await.unwrap();
+    let model = storage
+        .create_ai_model(StoredAiModel {
+            id: String::new(),
+            revision: String::new(),
+            name: "Private provider".to_owned(),
+            api_url: "https://provider.example/v1".to_owned(),
+            model: "private-model".to_owned(),
+            api_key: "filesystem-provider-secret".to_owned(),
+        })
+        .await
+        .unwrap();
+    let path = directory.path().join(SNAPSHOT_NAME);
+    let bytes = fs::read(&path).unwrap();
+    let stored = String::from_utf8_lossy(&bytes);
+    for secret in [
+        "filesystem-provider-secret",
+        "Private provider",
+        "provider.example",
+        "private-model",
+    ] {
+        assert!(!stored.contains(secret));
+    }
+    drop(storage);
+    let reopened = Storage::open(options(directory.path())).await.unwrap();
+    let restored = reopened.ai_model(&model.id).await.unwrap();
+    assert_eq!(restored.api_key, "filesystem-provider-secret");
+    assert_eq!(restored.revision, model.revision);
+}
+
+#[test]
+fn version_one_snapshots_without_ai_models_remain_readable() {
+    let mut snapshot = serde_json::to_value(Snapshot::empty()).unwrap();
+    snapshot.as_object_mut().unwrap().remove("ai_models");
+    let snapshot: Snapshot = serde_json::from_value(snapshot).unwrap();
+    assert!(snapshot.ai_models.is_empty());
+    assert!(snapshot.validate().is_ok());
+}
+
+#[tokio::test]
 async fn locks_survive_close_and_clones_until_last_drop() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::open(options(directory.path())).await.unwrap();

@@ -63,8 +63,9 @@ impl Connector for ClickHouseClient {
     }
     fn search(&self, request: SearchRequest) -> ConnectorFuture<'_, Value> {
         Box::pin(async move {
+            let row_offset = super::cursor_offset(request.cursor.as_deref(), request.from)?;
             let result = self
-                .search(
+                .search_page(
                     &request.query,
                     request.from,
                     request.size,
@@ -77,12 +78,17 @@ impl Connector for ClickHouseClient {
                         }),
                     request.sort_by.as_deref(),
                     request.sort_order.as_deref(),
+                    request.cursor.as_deref(),
+                    request.include_histogram,
                 )
                 .await?;
-            let hits: Vec<Value> = result.rows.into_iter().enumerate().map(|(offset, source)| json!({"index":request.index,"id":format!("row-{}",request.from + offset + 1),"score":null,"source":source})).collect();
-            Ok(
-                json!({"took":result.took,"timed_out":false,"total":result.total,"total_relation":"eq","columns":result.columns,"hits":hits,"histogram":result.histogram,"histogram_unavailable_reason":result.histogram_unavailable_reason}),
-            )
+            let hits: Vec<Value> = result.rows.into_iter().enumerate().map(|(offset, source)| json!({"index":request.index,"id":format!("row-{}",row_offset + offset as u64 + 1),"score":null,"source":source})).collect();
+            let relation = if result.next_cursor.is_some() { "gte" } else { "eq" };
+            let mut response = json!({"took":result.took,"timed_out":false,"total":result.total,"total_relation":relation,"columns":result.columns,"hits":hits,"histogram":result.histogram,"histogram_unavailable_reason":result.histogram_unavailable_reason});
+            if let Some(cursor) = result.next_cursor {
+                response["next_cursor"] = json!(cursor);
+            }
+            Ok(response)
         })
     }
     fn document<'a>(&'a self, _index: &'a str, _id: &'a str) -> ConnectorFuture<'a, Value> {

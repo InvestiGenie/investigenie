@@ -95,11 +95,14 @@ pub fn editable_configuration(
             field["name"].as_str(),
             field["visible_when"]["field"].as_str(),
         ) {
-            if descriptor.connection_fields.iter().any(|candidate| {
-                candidate["name"] == selector && candidate["editable"] == true
-            }) && updates.get(selector).is_some_and(|value| {
-                value != &field["visible_when"]["value"]
-            }) {
+            if descriptor
+                .connection_fields
+                .iter()
+                .any(|candidate| candidate["name"] == selector && candidate["editable"] == true)
+                && updates
+                    .get(selector)
+                    .is_some_and(|value| value != &field["visible_when"]["value"])
+            {
                 config.remove(name);
             }
         }
@@ -138,24 +141,37 @@ mod tests {
         let existing = json!({"auth_type":"basic","username":"user","password":" original ","tls_insecure":false});
         let existing = existing.as_object().unwrap();
         for updates in [json!({}), json!({"auth_type":"basic"})] {
-            assert_eq!(editable_configuration(&descriptor, existing, updates.as_object().unwrap()).unwrap(), *existing);
+            assert_eq!(
+                editable_configuration(&descriptor, existing, updates.as_object().unwrap())
+                    .unwrap(),
+                *existing
+            );
         }
         let updates = json!({"password":"","tls_insecure":true,"unknown":"ignored"});
-        let replaced = editable_configuration(&descriptor, existing, updates.as_object().unwrap()).unwrap();
+        let replaced =
+            editable_configuration(&descriptor, existing, updates.as_object().unwrap()).unwrap();
         assert_eq!(replaced["password"], "");
         assert_eq!(replaced["username"], "user");
         assert_eq!(replaced["tls_insecure"], false);
         assert!(!replaced.contains_key("unknown"));
         for malformed in [Value::Null, json!(false), json!(1), json!([]), json!({})] {
             let updates = json!({"password":malformed});
-            assert!(editable_configuration(&descriptor, existing, updates.as_object().unwrap()).is_err());
+            assert!(
+                editable_configuration(&descriptor, existing, updates.as_object().unwrap())
+                    .is_err()
+            );
         }
         for mode in ["none", "api_key"] {
             let updates = json!({"auth_type":mode,"api_key":" new key "});
-            let switched = editable_configuration(&descriptor, existing, updates.as_object().unwrap()).unwrap();
+            let switched =
+                editable_configuration(&descriptor, existing, updates.as_object().unwrap())
+                    .unwrap();
             assert!(!switched.contains_key("username"));
             assert!(!switched.contains_key("password"));
-            assert_eq!(switched.get("api_key"), (mode == "api_key").then_some(&json!(" new key ")));
+            assert_eq!(
+                switched.get("api_key"),
+                (mode == "api_key").then_some(&json!(" new key "))
+            );
         }
     }
 
@@ -169,11 +185,23 @@ mod tests {
         ];
         let existing = json!({"mode":"token","token":"saved","unlisted":"private"});
         let updates = json!({"mode":"anonymous","token":"replacement","label":"public"});
-        let config = editable_configuration(&descriptor, existing.as_object().unwrap(), updates.as_object().unwrap()).unwrap();
+        let config = editable_configuration(
+            &descriptor,
+            existing.as_object().unwrap(),
+            updates.as_object().unwrap(),
+        )
+        .unwrap();
         assert!(!config.contains_key("token"));
         assert_eq!(config["unlisted"], "private");
-        let computed = json!({"mode":"token","token":"secret","unlisted":"private","label":"public"});
-        assert_eq!(json!(public_configuration(&descriptor, computed.as_object().unwrap())), json!({"mode":"token","label":"public"}));
+        let computed =
+            json!({"mode":"token","token":"secret","unlisted":"private","label":"public"});
+        assert_eq!(
+            json!(public_configuration(
+                &descriptor,
+                computed.as_object().unwrap()
+            )),
+            json!({"mode":"token","label":"public"})
+        );
     }
 
     #[test]
@@ -191,7 +219,10 @@ mod tests {
                     assert!(field[key].is_boolean(), "{field}");
                 }
                 if let Some(group) = field.get("group") {
-                    assert!(matches!(group.as_str(), Some("authentication" | "credentials")));
+                    assert!(matches!(
+                        group.as_str(),
+                        Some("authentication" | "credentials")
+                    ));
                 }
                 if field["secret"] == true {
                     assert_eq!(field["editable"], true);

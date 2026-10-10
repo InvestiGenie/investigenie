@@ -20,6 +20,8 @@ pub(super) struct Snapshot {
     verifier: String,
     pub connections: BTreeMap<String, StoredConnection>,
     pub views: BTreeMap<String, DataView>,
+    #[serde(default)]
+    pub ai_models: BTreeMap<String, StoredAiModel>,
     pub settings: PublicSettings,
 }
 
@@ -30,6 +32,7 @@ impl Snapshot {
             verifier: String::from_utf8(VERIFIER.to_vec()).unwrap(),
             connections: BTreeMap::new(),
             views: BTreeMap::new(),
+            ai_models: BTreeMap::new(),
             settings: PublicSettings {
                 settings: json!({"theme":"system", "default_timezone":"UTC"}),
                 revision: revision(),
@@ -64,6 +67,16 @@ impl Snapshot {
             }
         }
         validate_settings(&self.settings.settings)?;
+        let mut model_names = BTreeSet::new();
+        for (id, model) in &self.ai_models {
+            validate_ai_model(model)?;
+            if id != &model.id
+                || Uuid::parse_str(&model.revision).is_err()
+                || !model_names.insert(model.name.to_lowercase())
+            {
+                return Err(StorageError::Invalid);
+            }
+        }
         if Uuid::parse_str(&self.settings.revision).is_err() {
             return Err(StorageError::Invalid);
         }
@@ -410,6 +423,75 @@ impl FileStorage {
                 revision: revision.clone(),
             };
             Ok(revision)
+        })
+        .await
+    }
+
+    pub async fn create_ai_model(
+        self: &Arc<Self>,
+        model: StoredAiModel,
+    ) -> Result<(), StorageError> {
+        self.mutate(move |snapshot| {
+            if snapshot.ai_models.contains_key(&model.id) {
+                return Err(StorageError::Duplicate);
+            }
+            if snapshot
+                .ai_models
+                .values()
+                .any(|other| other.name.eq_ignore_ascii_case(&model.name))
+            {
+                return Err(StorageError::Duplicate);
+            }
+            snapshot.ai_models.insert(model.id.clone(), model);
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn update_ai_model(
+        self: &Arc<Self>,
+        id: String,
+        expected: String,
+        mut model: StoredAiModel,
+    ) -> Result<(), StorageError> {
+        self.mutate(move |snapshot| {
+            let current = snapshot
+                .ai_models
+                .get(&id)
+                .ok_or(StorageError::AiModelNotFound)?;
+            if current.revision != expected {
+                return Err(StorageError::Conflict);
+            }
+            if model.id != id
+                || snapshot
+                    .ai_models
+                    .values()
+                    .any(|other| other.id != id && other.name.eq_ignore_ascii_case(&model.name))
+            {
+                return Err(StorageError::Duplicate);
+            }
+            model.revision = revision();
+            snapshot.ai_models.insert(id, model);
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn remove_ai_model(
+        self: &Arc<Self>,
+        id: String,
+        expected: String,
+    ) -> Result<(), StorageError> {
+        self.mutate(move |snapshot| {
+            let current = snapshot
+                .ai_models
+                .get(&id)
+                .ok_or(StorageError::AiModelNotFound)?;
+            if current.revision != expected {
+                return Err(StorageError::Conflict);
+            }
+            snapshot.ai_models.remove(&id);
+            Ok(())
         })
         .await
     }

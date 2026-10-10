@@ -9,6 +9,10 @@ pub struct SearchRequest {
     pub from: usize,
     #[serde(default = "default_page_size")]
     pub size: usize,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub include_histogram: Option<bool>,
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
     pub histogram_field: Option<String>,
@@ -34,7 +38,20 @@ impl TimeRange {
 
 #[cfg(test)]
 mod tests {
-    use super::TimeRange;
+    use super::{SearchRequest, TimeRange};
+
+    #[test]
+    fn omitted_pagination_fields_preserve_legacy_defaults() {
+        let request: SearchRequest = serde_json::from_str(r#"{"index":"logs"}"#).unwrap();
+        assert!(request.cursor.is_none());
+        assert_eq!(request.size, 50);
+        assert!(request.include_histogram.unwrap_or(true));
+        let request: SearchRequest =
+            serde_json::from_str(r#"{"index":"logs","cursor":"","include_histogram":false}"#)
+                .unwrap();
+        assert_eq!(request.cursor.as_deref(), Some(""));
+        assert_eq!(request.include_histogram, Some(false));
+    }
 
     #[test]
     fn time_ranges_require_ordered_supported_timestamps() {

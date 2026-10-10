@@ -11,6 +11,22 @@ use thiserror::Error;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_QUERY_BYTES: usize = 8192;
 const MAX_PAGE_SIZE: usize = 100;
+const MAX_CURSOR_OFFSET: u64 = i64::MAX as u64 - MAX_PAGE_SIZE as u64;
+
+pub(super) fn cursor_offset(cursor: Option<&str>, from: usize) -> Result<u64, ClickHouseError> {
+    match cursor {
+        None if from <= 10_000 => Ok(from as u64),
+        Some("") => Ok(0),
+        Some(token) if token.len() <= 19 && token.bytes().all(|byte| byte.is_ascii_digit()) => {
+            token
+                .parse::<u64>()
+                .ok()
+                .filter(|offset| *offset <= MAX_CURSOR_OFFSET)
+                .ok_or(ClickHouseError::InvalidQuery)
+        }
+        _ => Err(ClickHouseError::InvalidQuery),
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct ClickHouseTimeField<'a> {
@@ -75,6 +91,7 @@ struct ColumnMeta {
 
 #[derive(Debug)]
 pub struct ClickHouseSearchResult {
+    pub next_cursor: Option<String>,
     pub took: u64,
     pub columns: Vec<String>,
     pub rows: Vec<Value>,
@@ -196,7 +213,25 @@ impl ClickHouseClient {
         sort_by: Option<&str>,
         sort_order: Option<&str>,
     ) -> Result<ClickHouseSearchResult, ClickHouseError> {
+        self.search_page(
+            query, from, size, time_field, sort_by, sort_order, None, None,
+        )
+        .await
+    }
+
+    pub async fn search_page(
+        &self,
+        query: &str,
+        from: usize,
+        size: usize,
+        time_field: Option<ClickHouseTimeField<'_>>,
+        sort_by: Option<&str>,
+        sort_order: Option<&str>,
+        cursor: Option<&str>,
+        include_histogram: Option<bool>,
+    ) -> Result<ClickHouseSearchResult, ClickHouseError> {
         validate_read_query(query)?;
+        let offset = cursor_offset(cursor, from)?;
         let histogram_field = time_field.map(|field| field.name);
         let filtered_query = match time_field {
             Some(ClickHouseTimeField {
@@ -210,7 +245,7 @@ impl ClickHouseClient {
             }
             _ => query.to_owned(),
         };
-        if size == 0 || size > MAX_PAGE_SIZE || from > 10_000 {
+        if size == 0 || size > MAX_PAGE_SIZE {
             return Err(ClickHouseError::InvalidQuery);
         }
         if sort_order.is_some_and(|order| order != "asc" && order != "desc") {
@@ -225,22 +260,35 @@ impl ClickHouseClient {
             } else {
                 "DESC"
             };
-            format!(" ORDER BY {} {direction}", quote_identifier(field))
+            let tie = if cursor.is_some() {
+                ", tuple(*) ASC"
+            } else {
+                ""
+            };
+            format!(" ORDER BY {} {direction}{tie}", quote_identifier(field))
+        } else if cursor.is_some() {
+            " ORDER BY ALL".to_owned()
         } else {
             String::new()
         };
         let bounded_query = format!(
-            "SELECT * FROM ({filtered_query}){ordering} LIMIT {size} OFFSET {from} FORMAT JSON"
+            "SELECT * FROM ({filtered_query}){ordering} LIMIT {size} OFFSET {offset} FORMAT JSON"
         );
         let started = Instant::now();
-        let response = self.execute(&bounded_query).await?;
+        let response = self
+            .execute_with_limits(&bounded_query, cursor.is_some())
+            .await?;
         let parsed: JsonResponse =
             serde_json::from_value(response).map_err(|_| ClickHouseError::InvalidResponse)?;
         let mut histogram = Vec::new();
         let mut histogram_unavailable_reason = None;
-        if let Some(field) = histogram_field {
+        if let Some(field) = histogram_field
+            .filter(|_| include_histogram.unwrap_or(true) && cursor.is_none_or(str::is_empty))
+        {
             if parsed.meta.iter().any(|column| column.name == field) {
-                histogram = self.histogram(&filtered_query, field).await?;
+                histogram = self
+                    .histogram(&filtered_query, field, cursor.is_some())
+                    .await?;
             } else {
                 histogram_unavailable_reason =
                     Some("The SQL result does not include the data view's time field.");
@@ -248,10 +296,21 @@ impl ClickHouseClient {
         }
         let elapsed = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         Ok(ClickHouseSearchResult {
+            next_cursor: if cursor.is_some() && parsed.data.len() == size {
+                Some(
+                    offset
+                        .checked_add(size as u64)
+                        .filter(|next| *next <= MAX_CURSOR_OFFSET)
+                        .ok_or(ClickHouseError::InvalidQuery)?
+                        .to_string(),
+                )
+            } else {
+                None
+            },
             took: elapsed,
             columns: parsed.meta.into_iter().map(|column| column.name).collect(),
+            total: if cursor.is_some() { offset.saturating_add(parsed.data.len() as u64) } else { parsed.rows },
             rows: parsed.data,
-            total: parsed.rows,
             histogram,
             histogram_unavailable_reason,
         })
@@ -261,6 +320,7 @@ impl ClickHouseClient {
         &self,
         query: &str,
         field: &str,
+        paginated: bool,
     ) -> Result<Vec<ClickHouseHistogramBucket>, ClickHouseError> {
         if field.is_empty() || field.len() > 255 {
             return Err(ClickHouseError::InvalidIdentifier);
@@ -273,8 +333,11 @@ impl ClickHouseClient {
              FROM histogram_source CROSS JOIN histogram_bounds GROUP BY intDiv(time_ms, interval_ms) * interval_ms \
              ORDER BY intDiv(time_ms, interval_ms) * interval_ms LIMIT 61 FORMAT JSON"
         );
-        let response: JsonResponse = serde_json::from_value(self.execute(&histogram_query).await?)
-            .map_err(|_| ClickHouseError::InvalidResponse)?;
+        let response: JsonResponse = serde_json::from_value(
+            self.execute_with_limits(&histogram_query, paginated)
+                .await?,
+        )
+        .map_err(|_| ClickHouseError::InvalidResponse)?;
         response
             .data
             .into_iter()
@@ -297,11 +360,28 @@ impl ClickHouseClient {
     }
 
     async fn execute(&self, query: &str) -> Result<Value, ClickHouseError> {
+        self.execute_with_limits(query, false).await
+    }
+
+    async fn execute_with_limits(
+        &self,
+        query: &str,
+        paginated: bool,
+    ) -> Result<Value, ClickHouseError> {
         let mut request = self
             .client
             .post(self.url.clone())
             .query(&[("default_format", "JSON"), ("readonly", "1")])
             .body(query.to_owned());
+        if paginated {
+            request = request.query(&[
+                ("max_execution_time", "10"),
+                ("timeout_overflow_mode", "throw"),
+                ("max_memory_usage", "268435456"),
+                ("max_result_rows", "100"),
+                ("result_overflow_mode", "throw"),
+            ]);
+        }
         if let Some(database) = self.database.as_deref() {
             request = request.query(&[("database", database)]);
         }
@@ -361,6 +441,133 @@ async fn decode(response: Response) -> Result<Value, ClickHouseError> {
 mod tests {
     use super::{validate_read_query, ClickHouseClient, ClickHouseError};
     use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn numeric_cursor_offsets_are_checked_without_the_legacy_ceiling() {
+        assert_eq!(super::cursor_offset(Some(""), 90000).unwrap(), 0);
+        assert_eq!(super::cursor_offset(Some("10001"), 0).unwrap(), 10001);
+        assert_eq!(super::cursor_offset(None, 10000).unwrap(), 10000);
+        assert!(super::cursor_offset(None, 10001).is_err());
+        assert!(super::cursor_offset(Some(&super::MAX_CURSOR_OFFSET.to_string()), 0).is_ok());
+        for token in [
+            "-1",
+            "+1",
+            " 1",
+            "1.0",
+            "1; SELECT 1",
+            "18446744073709551616",
+            "9223372036854775807",
+        ] {
+            assert!(super::cursor_offset(Some(token), 0).is_err(), "{token}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cursor_connector_advances_offsets_and_skips_subsequent_histograms() {
+        use crate::integrations::Connector;
+        use serde_json::{json, Value};
+        let server = MockServer::start().await;
+        for (offset, data) in [
+            (0, json!([{"created_at":"a"},{"created_at":"b"}])),
+            (2, json!([{"created_at":"c"}])),
+        ] {
+            let rows = data.as_array().unwrap().len();
+            Mock::given(matchers::method("POST"))
+                .and(matchers::query_param("readonly", "1"))
+                .and(matchers::query_param("max_execution_time", "10"))
+                .and(matchers::query_param("timeout_overflow_mode", "throw"))
+                .and(matchers::query_param("max_result_rows", "100"))
+                .and(matchers::query_param("result_overflow_mode", "throw"))
+                .and(matchers::body_string(format!("SELECT * FROM (SELECT created_at FROM events) ORDER BY `created_at` ASC, tuple(*) ASC LIMIT 2 OFFSET {offset} FORMAT JSON")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta":[{"name":"created_at"}],"data":data,"rows":rows
+                }))).expect(1).mount(&server).await;
+        }
+        Mock::given(matchers::method("POST"))
+            .and(matchers::query_param("max_execution_time", "10"))
+            .and(matchers::query_param("max_memory_usage", "268435456"))
+            .and(|request: &wiremock::Request| {
+                String::from_utf8_lossy(&request.body).starts_with("WITH histogram_source")
+            })
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"meta":[],"data":[],"rows":0})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = ClickHouseClient::new(&server.uri(), None, None, None).unwrap();
+        let request = |token: &str| {
+            serde_json::from_value(json!({
+            "index":"events","query":"SELECT created_at FROM events","from":99999,"size":2,
+            "sort_by":"created_at","sort_order":"asc","histogram_field":"created_at","cursor":token
+        })).unwrap()
+        };
+        let first: Value = Connector::search(&client, request("")).await.unwrap();
+        assert_eq!(first["next_cursor"], "2");
+        assert_eq!(first["total"], 2);
+        assert_eq!(first["total_relation"], "gte");
+        assert_eq!(first["hits"][0]["id"], "row-1");
+        let last = Connector::search(&client, request(first["next_cursor"].as_str().unwrap()))
+            .await
+            .unwrap();
+        assert!(last.get("next_cursor").is_none());
+        assert_eq!(last["total"], 3);
+        assert_eq!(last["total_relation"], "eq");
+        assert_eq!(last["hits"][0]["id"], "row-3");
+        assert_eq!(last["histogram"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn cursor_search_passes_deep_offsets_and_histogram_opt_out() {
+        use serde_json::json;
+        let server = MockServer::start().await;
+        for (token, offset) in [("", 0), ("10001", 10001)] {
+            Mock::given(matchers::method("POST"))
+                .and(matchers::body_string(format!("SELECT * FROM (SELECT created_at FROM events) ORDER BY ALL LIMIT 1 OFFSET {offset} FORMAT JSON")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta":[{"name":"created_at"}],"data":[{"created_at":"2026-10-10"}],"rows":1
+                }))).expect(1).mount(&server).await;
+            let client = ClickHouseClient::new(&server.uri(), None, None, None).unwrap();
+            let result = client
+                .search_page(
+                    "SELECT created_at FROM events",
+                    usize::MAX,
+                    1,
+                    Some(super::ClickHouseTimeField {
+                        name: "created_at",
+                        range: None,
+                    }),
+                    None,
+                    None,
+                    Some(token),
+                    Some(false),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result.next_cursor.as_deref(),
+                Some((offset + 1).to_string().as_str())
+            );
+            assert!(result.histogram.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn cursor_search_rejects_invalid_offsets_and_sizes_before_io() {
+        let server = MockServer::start().await;
+        let client = ClickHouseClient::new(&server.uri(), None, None, None).unwrap();
+        for (token, size) in [("invalid", 1), ("", 101), ("", 0)] {
+            assert!(client
+                .search_page("SELECT 1", 0, size, None, None, None, Some(token), None)
+                .await
+                .is_err());
+        }
+        assert!(client
+            .search("SELECT 1", 10001, 1, None, None, None)
+            .await
+            .is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
 
     #[test]
     fn read_query_accepts_select_and_with_only() {
