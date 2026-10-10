@@ -40,6 +40,24 @@ describe('HistogramChart', () => {
     expect(chartMocks.axis.mock.calls[0][0].domain).toEqual([30_000, 90_000]);
   });
 
+  it('shows the full selected week with no matching records', () => {
+    const start = Date.parse('2026-10-01T00:00:00Z');
+    const end = Date.parse('2026-10-08T00:00:00Z');
+    render(<HistogramChart data={[]} timeRange={{ start, end }} />);
+    expect(chartMocks.axis.mock.calls[0][0]).toMatchObject({ domain: [start, end], allowDataOverflow: true, padding: { left: 0, right: 0 } });
+    expect(chartMocks.axis.mock.calls[0][0].ticks).toEqual([start, start + (end - start) / 4, start + (end - start) / 2, start + (end - start) * 3 / 4, end]);
+    expect(chartMocks.chart.mock.calls[0][0].data).toEqual([]);
+  });
+
+  it('keeps a single matching bucket inside the selected week without narrowing the axis', () => {
+    const start = Date.parse('2026-10-01T00:00:00Z');
+    const end = Date.parse('2026-10-08T00:00:00Z');
+    const data = [{ timestamp: start + 2 * 86_400_000, count: 1, label: null }];
+    render(<HistogramChart data={data} timeRange={{ start, end }} />);
+    expect(chartMocks.axis.mock.calls[0][0].domain).toEqual([start, end]);
+    expect(chartMocks.chart.mock.calls[0][0].data).toEqual(data);
+  });
+
   it('includes seconds when adjacent buckets are less than a minute apart', () => {
     render(<HistogramChart data={[{ timestamp: 60_000, count: 1, label: null }, { timestamp: 90_000, count: 2, label: null }]} />);
     const formatter = chartMocks.axis.mock.calls[0][0].tickFormatter;

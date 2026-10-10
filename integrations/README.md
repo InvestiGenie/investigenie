@@ -1,5 +1,7 @@
 # Create an integration
 
+For the complete implementation workflow, security restrictions, paging contract, AI compatibility requirements, and test checklist, use the [build-integration skill](../.github/skills/build-integration/SKILL.md).
+
 Your connector converts native datasource responses into Northstar's shared JSON shape. Start from [ClickHouse](clickhouse/mod.rs) and its [connector](clickhouse/connector.rs), or the [Elasticsearch connector](elasticsearch/connector.rs).
 
 ## 1. Make it visible

@@ -40,6 +40,23 @@ describe('Discover', () => {
 
   afterEach(() => vi.restoreAllMocks());
 
+  it('renders an empty histogram for an applied week-long timeframe', async () => {
+    vi.spyOn(api, 'connections').mockResolvedValue([connectionFixture(elasticsearchIntegration)]);
+    vi.spyOn(api, 'dataViews').mockResolvedValue([{ id: 'view', revision: 'r1', name: 'Events', connection_id: 'source', index: 'events', time_field: '@timestamp' }]);
+    vi.spyOn(api, 'fields').mockResolvedValue([{ name: '@timestamp', field_type: 'date' }]);
+    const search = vi.spyOn(api, 'search').mockResolvedValue({ took: 1, timed_out: false, total: 0, total_relation: 'eq', hits: [], histogram: [] });
+    renderExplore();
+    await screen.findByText('No timestamped documents match this query.');
+    fireEvent.click(screen.getByRole('button', { name: 'Edit time window' }));
+    enterDateTime('Start', '2026-10-01T00:00:00');
+    enterDateTime('End', '2026-10-08T00:00:00');
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+    expect(await screen.findByRole('img', { name: 'Document counts over time' })).toBeInTheDocument();
+    expect(screen.queryByText('No timestamped documents match this query.')).not.toBeInTheDocument();
+    expect(search.mock.calls.at(-1)?.[1].time_range).toEqual({ start: Date.parse('2026-10-01T00:00:00Z'), end: Date.parse('2026-10-08T00:00:00Z') });
+  });
+
   it('pages using the applied query, reuses histograms, caches previous pages, and resets on search', async () => {
     const page = (id: string, cursor: string | null) => ({ took: 2, timed_out: false, total: 101, total_relation: 'eq', hits: [{ index: 'events', id, score: null, source: { message: `${id} message` } }], histogram: [], next_cursor: cursor });
     vi.spyOn(api, 'connections').mockResolvedValue([connectionFixture(elasticsearchIntegration)]);

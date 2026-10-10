@@ -86,6 +86,7 @@ export default function App() {
   const [pageNumber, setPageNumber] = useState(1);
   const [previousPages, setPreviousPages] = useState<Array<{ number: number; result: SearchResult }>>([]);
   const [forwardPages, setForwardPages] = useState<Array<{ number: number; result: SearchResult }>>([]);
+  const [histogramTimeRange, setHistogramTimeRange] = useState<{ start: number; end: number } | undefined>();
   const appliedSearch = useRef<ReturnType<typeof makeSearchRequest> | null>(null);
 
   function firstPageRequest(body: ReturnType<typeof makeSearchRequest>) {
@@ -94,6 +95,7 @@ export default function App() {
 
   function acceptFirstPage(response: SearchResult, body: ReturnType<typeof makeSearchRequest>) {
     appliedSearch.current = body;
+    setHistogramTimeRange(body.time_range);
     setResults(response);
     setPageNumber(1);
     setPreviousPages([]);
@@ -422,8 +424,8 @@ export default function App() {
 
             {histogramField && results && <section className="histogram-panel" aria-labelledby="histogram-title">
               <div className="histogram-heading"><div><h2 id="histogram-title">Documents over time</h2><p>{histogramField} · {formatCount(String(queryMetadata?.histogram_total_from_buckets ? results.histogram.reduce((count, bucket) => count + bucket.count, 0) : results.total))} matching documents</p></div><span className="histogram-interval">{timeZone} · AUTO INTERVAL</span></div>
-              {results.histogram.length > 0
-                ? <Suspense fallback={<div className="histogram-chart" aria-hidden="true" />}><HistogramChart data={results.histogram} timeZone={timeZone} /></Suspense>
+              {results.histogram.length > 0 || (histogramTimeRange && !results.histogram_unavailable_reason)
+                ? <Suspense fallback={<div className="histogram-chart" aria-hidden="true" />}><HistogramChart data={results.histogram} timeZone={timeZone} timeRange={histogramTimeRange} /></Suspense>
                 : <div className="histogram-empty">{results.histogram_unavailable_reason ?? 'No timestamped documents match this query.'}</div>}
             </section>}
 
