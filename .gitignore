@@ -13,4 +13,3 @@ data/
 northstar_data/
 configuration.snapshot
 configuration.lock
-backend/migrations/
