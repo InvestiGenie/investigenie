@@ -19,7 +19,7 @@ describe('API requests', () => {
 
   it('rejects readiness transport failures', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
-    await expect(api.ready()).rejects.toThrow('Cannot reach the Northstar API');
+    await expect(api.ready()).rejects.toThrow('Cannot reach the InvestiGenie API');
   });
 
   it.each(['connected', 'not_connected'] as const)('validates datasource status %s and forwards cancellation', async (status) => {
@@ -47,7 +47,7 @@ describe('API requests', () => {
 
   it('rejects status transport failures and preserves cancellation', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
-    await expect(api.connectionStatus('source')).rejects.toThrow('Cannot reach the Northstar API');
+    await expect(api.connectionStatus('source')).rejects.toThrow('Cannot reach the InvestiGenie API');
     const controller = new AbortController();
     const cancellation = new DOMException('Aborted', 'AbortError');
     controller.abort();
@@ -118,7 +118,7 @@ describe('API requests', () => {
 
   it('identifies transport failures as application API connectivity problems', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
-    await expect(api.integrations()).rejects.toThrow('Cannot reach the Northstar API');
+    await expect(api.integrations()).rejects.toThrow('Cannot reach the InvestiGenie API');
   });
 
   it('preserves aborted requests without reporting an offline API', async () => {

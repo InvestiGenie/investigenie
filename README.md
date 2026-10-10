@@ -1,10 +1,14 @@
-# Northstar Discover
+# InvestiGenie
 
 A multi-source document explorer with a React/TypeScript browser UI and a Rust/Axum API. Datasource endpoints and credentials are configured in the UI and remain on the server.
 
+## Rename Compatibility
+
+The product and repository were renamed from Northstar to InvestiGenie. Existing encrypted configuration identifiers, browser preference keys, and the `northstar_data` directory setting are intentionally preserved so existing installations keep their saved connections, AI profiles, and preferences. They are storage compatibility details, not the product name. Keep the existing encryption key and configured filesystem path when upgrading. New installations may set `FILESYSTEM_PATH=./investigenie_data` instead.
+
 ## Repository layout
 
-The publishable application lives in `northstar/`. Run the commands below from that directory. If you opened the parent workspace, first run `cd northstar`.
+The publishable application lives in `investigenie/`. Run the commands below from that directory. If you opened the parent workspace, first run `cd investigenie`.
 
 - `backend/` contains the Axum API, application configuration, and connection registry.
 - `frontend/` contains the React/TypeScript/Vite UI.
@@ -42,11 +46,11 @@ Integration folders are discovered and registered automatically during Cargo bui
 
 Copy `.env.example` to `.env` to configure the application process and persistence. Datasource URLs, databases, and credentials are configured through the Connections UI. The configuration-storage database URL and encryption key are private bootstrap settings; never commit them. The `.env` file is ignored by Git.
 
-AI providers are managed at runtime in the Northstar AI page. Add a named OpenAI-compatible profile with its API base URL (for example, `https://api.example.com/v1`), model, and API key. Northstar tests the provider with a small JSON-mode request before saving the profile. The browser receives only the profile name, URL, model, revision, and `has_api_key`; the key is never returned by an API. Investigations explicitly select a saved profile. No AI provider environment variables are used.
+AI providers are managed at runtime in the InvestiGenie AI page. Add a named OpenAI-compatible profile with its API base URL (for example, `https://api.example.com/v1`), model, and API key. InvestiGenie tests the provider with a small JSON-mode request before saving the profile. The browser receives only the profile name, URL, model, revision, and `has_api_key`; the key is never returned by an API. Investigations explicitly select a saved profile. No AI provider environment variables are used.
 
-Northstar AI scans matching records from planned Data Views in sequential 100-record pages until the source is exhausted. The selected timeframe is a query filter, not a sampling restriction. There is no overall 50-record or 20-example cap. Repeated signals are grouped across pages with observed counts and representative event IDs; distinct evidence is split into small prompts rather than discarded. One planning call is followed by as many analysis cycles as needed, maintaining a rolling summary of important findings. Actual provider usage is aggregated across those cycles. More distinct evidence means more provider calls; batching controls memory and prompt size but cannot guarantee a fixed total price. Each inquiry is independent; multi-turn memory and dashboard generation are not implemented.
+InvestiGenie AI scans matching records from planned Data Views in sequential 100-record pages until the source is exhausted. The selected timeframe is a query filter, not a sampling restriction. There is no overall 50-record or 20-example cap. Repeated signals are grouped across pages with observed counts and representative event IDs; distinct evidence is split into small prompts rather than discarded. One planning call is followed by as many analysis cycles as needed, maintaining a rolling summary of important findings. Actual provider usage is aggregated across those cycles. More distinct evidence means more provider calls; batching controls memory and prompt size but cannot guarantee a fixed total price. Each inquiry is independent; multi-turn memory and dashboard generation are not implemented.
 
-**AI data handling:** the question and compacted examples from selected sources are sent to the configured provider. Credentials and source URLs are not. Treat provider processing as external data sharing: review retention/training and regional processing terms, and avoid sensitive data until Northstar has user authentication, authorization, and field-level redaction. The API currently has no built-in user auth; keep it behind a trusted authenticated gateway and do not expose it to untrusted networks. Findings are hypotheses grounded in returned evidence, not a verified root-cause guarantee.
+**AI data handling:** the question and compacted examples from selected sources are sent to the configured provider. Credentials and source URLs are not. Treat provider processing as external data sharing: review retention/training and regional processing terms, and avoid sensitive data until InvestiGenie has user authentication, authorization, and field-level redaction. The API currently has no built-in user auth; keep it behind a trusted authenticated gateway and do not expose it to untrusted networks. Findings are hypotheses grounded in returned evidence, not a verified root-cause guarantee.
 
 Add Elasticsearch connections with an HTTP(S) endpoint and optional Basic Auth or API key. Add ClickHouse connections with its HTTP endpoint (commonly port `8123`), an optional database, and optional username/password. TLS verification remains enabled for Elasticsearch unless explicitly disabled for that connection in the UI; this development-only bypass must not be used in production or on untrusted networks. Stored connection configuration is encrypted with AES-GCM and is never returned with credentials to the browser.
 
@@ -78,30 +82,30 @@ Store that key securely before ending the session; this command only sets the cu
 **Database:** use PostgreSQL for multi-replica deployments. The URL must explicitly use `sslmode=verify-full`; `sslmode=disable` is allowed only for loopback development endpoints. Before starting replicas, run the migration command on a fresh database and after each release that adds schema changes:
 
 ```powershell
-cargo run -p discover-api -- migrate
+cargo run -p investigenie-api -- migrate
 ```
 
 Startup verifies the schema instead of automatically migrating it. Use a migration role for schema changes and a restricted runtime role for normal access. Provision database replication/failover, backups, and restore tests separately; database mode alone does not make the deployment highly available.
 
-**Filesystem:** set `PERSISTENCE_MODE=filesystem` and `FILESYSTEM_PATH`, for example `F:/Northstar/objects` or `./data`. Startup creates an encrypted `configuration.snapshot` in that directory. It uses atomic replacement and a writer lock; only one API instance can open that directory. This is not a shared-filesystem HA backend. The snapshot is limited to 16 MiB. Restrict directory access (Windows ACLs must be set by the operator), keep backups of the snapshot and its separate key, and place custom storage paths outside the source tree. Do not manually edit encrypted objects. Filesystem mode does not need PostgreSQL or an explicit migration.
+**Filesystem:** set `PERSISTENCE_MODE=filesystem` and `FILESYSTEM_PATH`, for example `F:/InvestiGenie/objects` or `./data`. Startup creates an encrypted `configuration.snapshot` in that directory. It uses atomic replacement and a writer lock; only one API instance can open that directory. This is not a shared-filesystem HA backend. The snapshot is limited to 16 MiB. Restrict directory access (Windows ACLs must be set by the operator), keep backups of the snapshot and its separate key, and place custom storage paths outside the source tree. Do not manually edit encrypted objects. Filesystem mode does not need PostgreSQL or an explicit migration.
 
 Updates and deletes require `If-Match: "<revision>"` from the last read. Missing headers return `428`; stale revisions return `409`. The UI handles these headers. Failed or cancelled responses can be ambiguous around a completed commit: reload state before retrying.
 
-### Northstar AI (early investigation MVP)
+### InvestiGenie AI (early investigation MVP)
 
 Add one or more OpenAI-compatible providers from the AI page. Each profile is tested against `{base_url}/chat/completions` in JSON mode with a bounded 15-second timeout before it can be saved. A test sends only a fixed probe prompt and does not include a question, data-view schema, or source data. The profile must return JSON containing `{"ok":true}`. Failed provider responses are bounded and reported without exposing provider response bodies or keys. The default UI remains usable with no profiles saved.
 
 In database mode, provider API keys are encrypted with AES-GCM using the configured encryption key and model-specific associated data. In filesystem mode, profiles and keys are part of the existing authenticated-encrypted snapshot. Model metadata and keys are never saved through public `/api/settings`; model list and mutation responses omit keys. Replacing a key is optional during edits: omitting `api_key` keeps the existing key. Model updates and deletes require the current quoted `If-Match` revision. The endpoint URL must be HTTP(S), contain no embedded credentials, query, or fragment, and fit the configured length limit. Provider hosts are resolved and contacted by the API server; URLs resolving to private network addresses are not blocked, as with the existing operator-configured datasource endpoints. Only configure provider hosts you trust.
 
-In **Northstar AI**, select 1–5 saved Data Views, choose a timeframe, and ask a question. The server, not the model, resolves the selected views, inspects their schemas, builds source-specific structured filters, and executes searches through Northstar connectors. Raw model SQL is not accepted. The default window is the last 30 minutes; clearing it searches All time. Each source is paged sequentially and evidence is compacted into approximately 9 KB cycle buffers. Completed responses report records scanned and source pages processed. Findings remain a bounded rolling summary, not an exhaustive event listing. Source or provider failures fail the request rather than silently claiming complete coverage. Investigations are still synchronous HTTP requests: very large scopes may run for a long time or exceed gateway timeouts, and do not persist resumable background jobs.
+In **InvestiGenie AI**, select 1–5 saved Data Views, choose a timeframe, and ask a question. The server, not the model, resolves the selected views, inspects their schemas, builds source-specific structured filters, and executes searches through InvestiGenie connectors. Raw model SQL is not accepted. The default window is the last 30 minutes; clearing it searches All time. Each source is paged sequentially and evidence is compacted into approximately 9 KB cycle buffers. Completed responses report records scanned and source pages processed. Findings remain a bounded rolling summary, not an exhaustive event listing. Source or provider failures fail the request rather than silently claiming complete coverage. Investigations are still synchronous HTTP requests: very large scopes may run for a long time or exceed gateway timeouts, and do not persist resumable background jobs.
 
 Explore loads 50 documents per page, with Next/Previous navigation and a bounded cache of five recent pages in each direction. Pagination keeps the applied query, sort, and time window unchanged until a new search, and reuses the initial histogram instead of recomputing it on every page. Elasticsearch uses a point-in-time snapshot and `search_after` to move beyond the 10,000-result offset window. Abandoned snapshots expire after one minute; expired snapshots require a new search. ClickHouse uses deterministic, bounded LIMIT/OFFSET pages without the old 10,000-offset ceiling, skips repeated histogram queries, and applies per-query execution/resource limits. Deep ClickHouse offsets can still require repeated scans and sorting; they are not snapshot-consistent under concurrent writes. Efficient keyset paging for arbitrary SQL requires a source-specific stable unique key and is not implemented here.
 
-When the provider returns usage metadata, each investigation displays prompt, completion, and total tokens separately for the planning and analysis calls. Providers that omit usage metadata are shown as not reporting counts; Northstar does not estimate them. Counts are currently response-only and are not persisted or attributed to users. A future audit view requires built-in authentication and user identity before per-user accounting is meaningful.
+When the provider returns usage metadata, each investigation displays prompt, completion, and total tokens separately for the planning and analysis calls. Providers that omit usage metadata are shown as not reporting counts; InvestiGenie does not estimate them. Counts are currently response-only and are not persisted or attributed to users. A future audit view requires built-in authentication and user identity before per-user accounting is meaningful.
 
-**Provider privacy:** matching event examples and the investigation question are sent to the configured AI provider. Connection credentials and datasource URLs are not sent. Review the provider's retention, training, and regional processing policies before enabling this for sensitive data. Redact secrets and personal data at ingestion/source mapping; truncation alone is not a privacy filter. Configure only a provider you trust. Northstar currently has no built-in user authentication/authorization, so do not expose the AI endpoint to untrusted users; it can query every saved Data View available to this API instance.
+**Provider privacy:** matching event examples and the investigation question are sent to the configured AI provider. Connection credentials and datasource URLs are not sent. Review the provider's retention, training, and regional processing policies before enabling this for sensitive data. Redact secrets and personal data at ingestion/source mapping; truncation alone is not a privacy filter. Configure only a provider you trust. InvestiGenie currently has no built-in user authentication/authorization, so do not expose the AI endpoint to untrusted users; it can query every saved Data View available to this API instance.
 
-The investigator makes at most two model requests per run (plan and findings), is limited to four concurrent runs, a 15-second provider timeout per call, and bounded request/response sizes. Source access still uses Northstar's shared upstream concurrency limit. These limits are initial safeguards, not production capacity guarantees. Provider API keys are runtime model-profile secrets, not public application settings.
+The investigator makes at most two model requests per run (plan and findings), is limited to four concurrent runs, a 15-second provider timeout per call, and bounded request/response sizes. Source access still uses InvestiGenie's shared upstream concurrency limit. These limits are initial safeguards, not production capacity guarantees. Provider API keys are runtime model-profile secrets, not public application settings.
 
 `RUST_API_BIND` defaults to `127.0.0.1:3000`, and `WEB_ORIGIN` defaults to `http://127.0.0.1:5173`. Configure `WEB_ORIGIN` to the exact browser origin used by the deployed UI. The browser defaults to the local API URL; configure `VITE_API_BASE_URL` in the Vite environment if the API uses another URL. To bind the API to a network interface for a trusted deployment, set `RUST_API_BIND` explicitly and review network access controls. Authentication and user authorization are intentionally deferred, so do not expose this initial app to untrusted users or networks.
 
@@ -112,7 +116,7 @@ The Vite development server binds to `127.0.0.1:5173`; the API allows browser re
 In one terminal, start the backend:
 
 ```powershell
-cargo run -p discover-api
+cargo run -p investigenie-api
 ```
 
 In another terminal, install web dependencies and start the UI:
@@ -127,7 +131,7 @@ Open the URL printed by Vite. `/api/health` and `/api/health/live` are liveness 
 ## Checks
 
 ```powershell
-cargo test -p discover-api
+cargo test -p investigenie-api
 npm run test:web
 npm run build:web
 ```

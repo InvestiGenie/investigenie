@@ -205,7 +205,7 @@ export default function ConnectionsPage({ connections, onConnectionsChange }: Co
           {credentialFields.map(renderField)}
         </div></fieldset>}
 
-        <div className="connection-form-footer"><span>Northstar connections</span><button className="search-button" type="submit" disabled={busy}>{busy ? <span className="spinner" /> : <span aria-hidden="true">⌁</span>}{busy ? 'Testing connection' : editingConnectionId ? 'Save changes' : 'Test and add'}</button></div>
+        <div className="connection-form-footer"><span>InvestiGenie connections</span><button className="search-button" type="submit" disabled={busy}>{busy ? <span className="spinner" /> : <span aria-hidden="true">⌁</span>}{busy ? 'Testing connection' : editingConnectionId ? 'Save changes' : 'Test and add'}</button></div>
       </form>
     </section>}
   </main>;

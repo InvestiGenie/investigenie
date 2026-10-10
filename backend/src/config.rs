@@ -143,7 +143,7 @@ mod tests {
         let mut database = base.to_vec();
         database.push((
             "DATABASE_URL",
-            "postgres://localhost/northstar?sslmode=disable",
+            "postgres://localhost/investigenie?sslmode=disable",
         ));
         assert!(matches!(
             parse(&database),

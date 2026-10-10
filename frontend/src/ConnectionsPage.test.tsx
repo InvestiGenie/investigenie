@@ -220,7 +220,7 @@ describe('ConnectionsPage', () => {
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: /Add connection/ }));
     expect(screen.getByRole('status')).toHaveTextContent('Loading data sources...');
-    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot reach the Northstar API');
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot reach the InvestiGenie API');
     expect(screen.queryByText('No integrations are registered in the backend.')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Retry data sources' }));
     expect(await screen.findByRole('button', { name: /ClickHouse/ })).toBeInTheDocument();

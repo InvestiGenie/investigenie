@@ -1,11 +1,11 @@
 ---
 name: build-integration
-description: 'Use when adding, building, extending, or reviewing a Northstar datasource integration or connector for another system. Covers discovery, descriptor metadata, credentials, read-only querying, cursor pagination, timeframe-aware histograms, AI compatibility, resource limits, and required tests.'
+description: 'Use when adding, building, extending, or reviewing an InvestiGenie datasource integration or connector for another system. Covers discovery, descriptor metadata, credentials, read-only querying, cursor pagination, timeframe-aware histograms, AI compatibility, resource limits, and required tests.'
 ---
 
-# Build a Northstar Integration
+# Build an InvestiGenie Integration
 
-Implement a datasource adapter that works through Northstar's shared connector and metadata contracts. This skill is also a checklist for human developers. Paths below are relative to the repository root, `northstar/`, not its parent workspace.
+Implement a datasource adapter that works through InvestiGenie's shared connector and metadata contracts. This skill is also a checklist for human developers. Paths below are relative to the repository root, `investigenie/`, not its parent workspace.
 
 ## Start With Verified Contracts
 
@@ -45,7 +45,7 @@ Choose the native query language, read-only credentials, stable record identity,
 - Validate dataset/index names, sort identifiers, timestamps, operators, page sizes, cursor tokens, endpoint schemes, and query byte lengths before upstream I/O. Use structured APIs, parameterization, and native escaping where possible; never concatenate unvalidated user/model identifiers or values.
 - Keep credentials on the API server. Never return or log them, place them in cursor tokens, send them to AI providers, or commit them in fixtures, examples, or local configuration.
 - Errors must use sanitized `ConnectorError { status, code, message }`. Do not return raw upstream bodies, URLs with credentials, authorization headers, or native diagnostic strings containing secrets. Preserve useful status/code distinctions without leaking details.
-- Configure TLS verification by default; any insecure option must be explicit. Do not silently follow credential-bearing redirects to another host. Document endpoint trust and private-network access: Northstar currently does not provide a general SSRF isolation boundary.
+- Configure TLS verification by default; any insecure option must be explicit. Do not silently follow credential-bearing redirects to another host. Document endpoint trust and private-network access: InvestiGenie currently does not provide a general SSRF isolation boundary.
 - Do not implement custom encryption or persistence for secrets. Use the existing encrypted saved-object storage, including revision checks and both persistence modes. Preserve `If-Match` conflict semantics.
 - The current API has no built-in user authentication or datasource authorization. New adapters must not be described as adding those guarantees; deployments still need a trusted authenticated gateway.
 
@@ -101,7 +101,7 @@ Build-time registration makes a source available to Explore, not automatically t
 6. Validate from the repository root:
 
    ```sh
-   cargo test --locked -p discover-api
+   cargo test --locked -p investigenie-api
    npm run test:web -- --maxWorkers=1
    npm run build:web
    ```

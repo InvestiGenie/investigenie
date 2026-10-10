@@ -3,12 +3,12 @@ import { ArrowUp, BrainCircuit, Check, CircleAlert, Database, Search, X } from '
 import { api, type AIModelSummary, type DataViewSummary, type InvestigationResult } from './api';
 import TimeRangePicker from './TimeRangePicker';
 
-type NorthstarAIPageProps = {
+type InvestiGenieAIPageProps = {
   dataViews: DataViewSummary[];
   onManageModels?: () => void;
 };
 
-export default function NorthstarAIPage({ dataViews, onManageModels }: NorthstarAIPageProps) {
+export default function InvestiGenieAIPage({ dataViews, onManageModels }: InvestiGenieAIPageProps) {
   const [models, setModels] = useState<AIModelSummary[]>([]);
   const [modelStatus, setModelStatus] = useState<'loading' | 'ready' | 'empty' | 'failed'>('loading');
   const [modelError, setModelError] = useState('');
@@ -113,7 +113,7 @@ export default function NorthstarAIPage({ dataViews, onManageModels }: Northstar
   }
 
   return <main className="ai-page">
-    <section className="ai-workspace" aria-label="Northstar AI investigation">
+    <section className="ai-workspace" aria-label="InvestiGenie AI investigation">
       <div className="ai-controls-row">
       <div className="ai-dataview-picker" ref={pickerRef}>
         <button ref={pickerTriggerRef} type="button" className={`ai-dataview-trigger${dataViewPickerOpen ? ' open' : ''}`} aria-label="Choose Data Views" aria-expanded={dataViewPickerOpen} aria-controls="ai-dataview-menu" disabled={dataViews.length === 0} onClick={() => setDataViewPickerOpen((open) => !open)}>
@@ -167,7 +167,7 @@ export default function NorthstarAIPage({ dataViews, onManageModels }: Northstar
       </section>
 
       <form className="ai-composer" onSubmit={(event) => void investigate(event)}>
-        <label className="sr-only" htmlFor="ai-question">Ask Northstar AI</label>
+        <label className="sr-only" htmlFor="ai-question">Ask InvestiGenie AI</label>
         <textarea id="ai-question" value={question} maxLength={2000} rows={3} placeholder="Describe what you’re investigating…" onChange={(event) => setQuestion(event.target.value)} onKeyDown={handleComposerKeyDown} disabled={busy || dataViews.length === 0 || !selectedModelId} />
         <div className="ai-composer-footer">
           <div className="ai-model-picker">
@@ -179,7 +179,7 @@ export default function NorthstarAIPage({ dataViews, onManageModels }: Northstar
           <button className="ai-send" type="submit" aria-label="Run investigation" title="Run investigation" disabled={busy || !question.trim() || selectedIds.length === 0 || !selectedModelId}><ArrowUp size={17} aria-hidden="true" /></button>
         </div>
       </form>
-      <p className="ai-privacy-note">Connection credentials remain in Northstar. Selected evidence is sent to the configured AI provider for analysis.</p>
+      <p className="ai-privacy-note">Connection credentials remain in InvestiGenie. Selected evidence is sent to the configured AI provider for analysis.</p>
     </section>
   </main>;
 }

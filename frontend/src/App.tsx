@@ -8,7 +8,7 @@ import { formatTimestamp, initialTimeZone, isDateField } from './time';
 import { applyQueryTemplate, resolveSearchQuery } from './query';
 
 const HistogramChart = lazy(() => import('./HistogramChart'));
-const NorthstarAIPage = lazy(() => import('./NorthstarAIPage'));
+const InvestiGenieAIPage = lazy(() => import('./InvestiGenieAIPage'));
 const AIModelsPage = lazy(() => import('./AIModelsPage'));
 
 type Theme = 'light' | 'dark';
@@ -68,7 +68,7 @@ export default function App() {
   const [connections, setConnections] = useState<ConnectionSummary[]>([]);
   const [dataViews, setDataViews] = useState<DataViewSummary[]>([]);
   const [selectedDataViewId, setSelectedDataViewId] = useState('');
-  const [activePage, setActivePage] = useState<'discover' | 'northstar-ai' | 'connections' | 'data-views' | 'ai-models'>('northstar-ai');
+  const [activePage, setActivePage] = useState<'discover' | 'investigenie-ai' | 'connections' | 'data-views' | 'ai-models'>('investigenie-ai');
   const [fields, setFields] = useState<FieldSummary[]>([]);
   const [fieldFilter, setFieldFilter] = useState('');
   const [selectedFieldsByView, setSelectedFieldsByView] = useState<Record<string, string[]>>({});
@@ -362,9 +362,9 @@ export default function App() {
   return (
     <div className={`app-shell${navExpanded ? ' nav-expanded' : ''}`}>
       <aside className="rail" aria-label="Primary navigation">
-        <div className="rail-brand"><div className="brand-mark" aria-label="Northstar">N</div><span className="nav-label">Northstar</span></div>
+        <div className="rail-brand"><div className="brand-mark" aria-label="InvestiGenie">I</div><span className="nav-label">InvestiGenie</span></div>
         <nav className="rail-nav" aria-label="Main menu">
-          <button className={`rail-button${activePage === 'northstar-ai' ? ' active' : ''}`} aria-label="Northstar AI" title="Northstar AI" onClick={() => setActivePage('northstar-ai')}><span className="rail-icon" aria-hidden="true"><BrainCircuit size={19} /></span><span className="nav-label">Northstar AI</span></button>
+          <button className={`rail-button${activePage === 'investigenie-ai' ? ' active' : ''}`} aria-label="InvestiGenie AI" title="InvestiGenie AI" onClick={() => setActivePage('investigenie-ai')}><span className="rail-icon" aria-hidden="true"><BrainCircuit size={19} /></span><span className="nav-label">InvestiGenie AI</span></button>
           <button className={`rail-button${activePage === 'discover' ? ' active' : ''}`} aria-label="Explore" title="Explore" onClick={() => setActivePage('discover')}><span className="rail-icon" aria-hidden="true">⌕</span><span className="nav-label">Explore</span></button>
           <button className="rail-button" aria-label="Dashboard" title="Dashboard" disabled><span className="rail-icon" aria-hidden="true">▦</span><span className="nav-label">Dashboard</span></button>
           <div className="rail-nav-group" role="group" aria-label="Management">
@@ -379,12 +379,12 @@ export default function App() {
 
       <div className="workspace">
         <header className="topbar">
-          <div className="breadcrumb"><h1 className="workspace-title">{activePage === 'connections' ? 'Connections' : activePage === 'data-views' ? 'Data Views' : activePage === 'ai-models' ? 'AI Models' : activePage === 'northstar-ai' ? 'Northstar AI' : 'Explore'}</h1></div>
+          <div className="breadcrumb"><h1 className="workspace-title">{activePage === 'connections' ? 'Connections' : activePage === 'data-views' ? 'Data Views' : activePage === 'ai-models' ? 'AI Models' : activePage === 'investigenie-ai' ? 'InvestiGenie AI' : 'Explore'}</h1></div>
           <div className="topbar-right"><button className="theme-toggle" type="button" aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`} aria-pressed={theme === 'dark'} title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`} onClick={() => setTheme((current) => current === 'light' ? 'dark' : 'light')}><span aria-hidden="true">{theme === 'light' ? '☾' : '☀'}</span></button></div>
         </header>
 
-        {activePage === 'northstar-ai'
-          ? <Suspense fallback={<div className="loading-state"><span className="spinner dark" /> Loading Northstar AI…</div>}><NorthstarAIPage dataViews={dataViews} onManageModels={() => setActivePage('ai-models')} /></Suspense>
+        {activePage === 'investigenie-ai'
+          ? <Suspense fallback={<div className="loading-state"><span className="spinner dark" /> Loading InvestiGenie AI…</div>}><InvestiGenieAIPage dataViews={dataViews} onManageModels={() => setActivePage('ai-models')} /></Suspense>
           : activePage === 'ai-models'
             ? <Suspense fallback={<div className="loading-state"><span className="spinner dark" /> Loading AI models…</div>}><AIModelsPage /></Suspense>
           : activePage === 'connections'

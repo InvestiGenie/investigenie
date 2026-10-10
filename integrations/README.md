@@ -2,7 +2,7 @@
 
 For the complete implementation workflow, security restrictions, paging contract, AI compatibility requirements, and test checklist, use the [build-integration skill](../.github/skills/build-integration/SKILL.md).
 
-Your connector converts native datasource responses into Northstar's shared JSON shape. Start from [ClickHouse](clickhouse/mod.rs) and its [connector](clickhouse/connector.rs), or the [Elasticsearch connector](elasticsearch/connector.rs).
+Your connector converts native datasource responses into InvestiGenie's shared JSON shape. Start from [ClickHouse](clickhouse/mod.rs) and its [connector](clickhouse/connector.rs), or the [Elasticsearch connector](elasticsearch/connector.rs).
 
 ## 1. Make it visible
 
@@ -71,10 +71,10 @@ Honor `index`, `query`, `from`, `size`, optional `sort_by`/`sort_order` (`asc`/`
 
 Add unit/mock-upstream tests for settings, credentials, fields, response shape, empty results, sorting, time filters, histogram counts, and errors. Enforce read-only access, page/query limits (existing adapters cap pages at 100), timeouts, and cancellation; shared API concurrency limits are not enough.
 
-From `northstar/`:
+From `investigenie/`:
 
 ```sh
-cargo test -p discover-api
+cargo test -p investigenie-api
 npm run test:web
 npm run build:web
 ```

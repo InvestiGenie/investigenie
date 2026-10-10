@@ -184,7 +184,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     response = await fetch(`${apiBase}${path}`, init);
   } catch (reason) {
     if (init?.signal?.aborted || (reason instanceof DOMException && reason.name === 'AbortError')) throw reason;
-    throw new Error('Cannot reach the Northstar API. Check that the API is running and its URL and allowed web origin match this page.');
+    throw new Error('Cannot reach the InvestiGenie API. Check that the API is running and its URL and allowed web origin match this page.');
   }
   const body: unknown = await response.json().catch(() => null);
   if (!response.ok) {

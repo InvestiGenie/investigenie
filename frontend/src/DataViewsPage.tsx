@@ -146,7 +146,7 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
             <label>Time series time field<select required value={timeField} disabled={!index || fields.filter(isTimeField).length === 0} onChange={(event) => setTimeField(event.target.value)}><option value="">Select a date/time field</option>{fields.filter(isTimeField).map((field) => <option key={field.name} value={field.name}>{field.name} · {field.field_type}</option>)}</select></label>
           </div>
           {index && fields.length > 0 && fields.filter(isTimeField).length === 0 && <p className="connections-empty">The selected source has no date/time fields; this index/table cannot be used for a time-series data view.</p>}
-          <div className="connection-form-footer"><span>Northstar data views</span><button className="search-button" type="submit" disabled={busy || !connectionId || !indices.some((item) => item.name === index) || !fields.some((field) => field.name === timeField && isTimeField(field))}>{busy ? <span className="spinner" /> : <span aria-hidden="true">＋</span>}{busy ? 'Validating' : editingViewId ? 'Save changes' : 'Create data view'}</button></div>
+          <div className="connection-form-footer"><span>InvestiGenie data views</span><button className="search-button" type="submit" disabled={busy || !connectionId || !indices.some((item) => item.name === index) || !fields.some((field) => field.name === timeField && isTimeField(field))}>{busy ? <span className="spinner" /> : <span aria-hidden="true">＋</span>}{busy ? 'Validating' : editingViewId ? 'Save changes' : 'Create data view'}</button></div>
         </form>}
     </section>}
   </main>;

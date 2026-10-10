@@ -17,7 +17,7 @@ impl TestDatabase {
             key_id: "test-v1".to_owned(),
             max_connections: 4,
         };
-        let schema = format!("northstar_test_{}", Uuid::new_v4().simple());
+        let schema = format!("investigenie_test_{}", Uuid::new_v4().simple());
         let admin = Storage::pool(&options, None).await.unwrap();
         sqlx::query(&format!("CREATE SCHEMA {schema}"))
             .execute(&admin)

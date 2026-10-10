@@ -123,7 +123,7 @@ describe('Discover', () => {
     expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/status'))).toHaveLength(2);
   });
 
-  it('opens Northstar AI as the default home page and shows the empty state when no Data Views exist', async () => {
+  it('opens InvestiGenie AI as the default home page and shows the empty state when no Data Views exist', async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockImplementation(async (input, init) => {
       const url = String(input);
@@ -134,7 +134,8 @@ describe('Discover', () => {
     });
     render(<App />);
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    expect(screen.getByRole('heading', { name: 'Northstar AI', level: 1 })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'InvestiGenie AI', level: 1 })).toBeInTheDocument();
+    expect(screen.getByLabelText('InvestiGenie')).toHaveTextContent('I');
     expect(await screen.findByText('Create a Data View before starting an investigation.')).toBeInTheDocument();
   });
 
@@ -152,7 +153,7 @@ describe('Discover', () => {
     fireEvent.click(screen.getByRole('button', { name: 'AI Models' }));
     expect(await screen.findByRole('heading', { name: 'Saved AI models' })).toBeInTheDocument();
     expect(await screen.findByText('No AI models configured')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Northstar AI' }));
+    fireEvent.click(screen.getByRole('button', { name: 'InvestiGenie AI' }));
     expect(await screen.findByText('No saved AI models')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Open AI model management' }));
     expect(await screen.findByRole('heading', { name: 'Saved AI models' })).toBeInTheDocument();
@@ -173,7 +174,7 @@ describe('Discover', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
     fireEvent.click(screen.getByRole('button', { name: /Add connection/ }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot reach the Northstar API');
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot reach the InvestiGenie API');
     expect(screen.getAllByRole('alert')).toHaveLength(1);
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
@@ -277,7 +278,7 @@ describe('Discover', () => {
     expect(String(fetchMock.mock.calls[4][0])).toContain('/api/connections/logs-local/search');
     fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'));
     fireEvent.click(screen.getByRole('button', { name: 'Search' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot reach the Northstar API');
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot reach the InvestiGenie API');
   });
 
   it('switches query language and searches the selected saved data view', async () => {
@@ -640,12 +641,12 @@ describe('Discover', () => {
     expect(document.documentElement.dataset.theme).toBe('dark');
   });
 
-  it('starts at Northstar AI and orders Explore, Dashboard, and Management navigation', async () => {
+  it('starts at InvestiGenie AI and orders Explore, Dashboard, and Management navigation', async () => {
     render(<App />);
     expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
-    expect(screen.getByRole('heading', { name: 'Northstar AI', level: 1 })).toHaveClass('workspace-title');
+    expect(screen.getByRole('heading', { name: 'InvestiGenie AI', level: 1 })).toHaveClass('workspace-title');
     const primaryButtons = within(screen.getByRole('navigation', { name: 'Main menu' })).getAllByRole('button');
-    expect(primaryButtons.slice(0, 3).map((button) => button.getAttribute('aria-label'))).toEqual(['Northstar AI', 'Explore', 'Dashboard']);
+    expect(primaryButtons.slice(0, 3).map((button) => button.getAttribute('aria-label'))).toEqual(['InvestiGenie AI', 'Explore', 'Dashboard']);
     expect(screen.queryByLabelText('CONNECTION')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Refresh' })).not.toBeInTheDocument();
     expect(document.querySelector('.rail-bottom .status-light')).toBeNull();

@@ -1,5 +1,5 @@
 {
-  "name": "discover-platform",
+  "name": "investigenie-platform",
   "private": true,
   "workspaces": [
     "frontend"
