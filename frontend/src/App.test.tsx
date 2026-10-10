@@ -136,7 +136,8 @@ describe('Discover', () => {
     render(<App />);
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     expect(screen.getByRole('heading', { name: 'InvestiGenie AI', level: 1 })).toBeInTheDocument();
-    expect(screen.getByLabelText('InvestiGenie')).toHaveTextContent('I');
+    expect(screen.getByLabelText('InvestiGenie').tagName).toBe('IMG');
+    expect(screen.getByLabelText('InvestiGenie')).toHaveAttribute('src', expect.stringMatching(/^data:image\/svg\+xml/));
     expect(await screen.findByText('Create a Data View before starting an investigation.')).toBeInTheDocument();
   });
 

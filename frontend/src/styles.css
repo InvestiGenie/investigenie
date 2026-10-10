@@ -36,7 +36,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, tr:focus-visibl
 .app-shell { min-height: 100vh; display: flex; }
 .rail { width: 64px; flex: 0 0 64px; background: #17272c; color: #e7f1ee; display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 14px 0; transition: width .18s ease, flex-basis .18s ease; }
 .rail-brand { width: 100%; display: flex; align-items: center; justify-content: center; gap: 11px; margin-bottom: 14px; padding: 0 12px; }
-.brand-mark { width: 34px; height: 34px; flex: 0 0 34px; display: grid; place-items: center; color: #14372f; background: #a9e1cf; border-radius: 10px; font-size: 18px; font-weight: 700; }
+.brand-mark { width: 38px; height: 38px; flex: 0 0 38px; display: block; object-fit: contain; filter: drop-shadow(0 0 8px #16ccf64a); }
 .rail-nav { width: 100%; display: grid; justify-items: center; gap: 8px; }
 .rail-nav-group { width: 100%; display: grid; justify-items: center; gap: 8px; margin-top: 8px; padding-top: 16px; border-top: 1px solid #324449; }
 .rail-group-label { display: none; }
@@ -608,7 +608,6 @@ th[aria-sort="ascending"] .column-sort-button, th[aria-sort="descending"] .colum
 .rail-toggle:hover { color: #fff; background: #1b2b4c; }
 .nav-expanded .rail-brand .nav-label { color: #e1eaff; }
 .nav-expanded .rail-group-label { color: #9babc9; }
-.brand-mark { color: #fff; background: linear-gradient(140deg, var(--brand-cyan) 0%, #4b5df0 53%, var(--brand-violet) 100%); box-shadow: 0 0 18px #6659ef45; }
 .theme-toggle:hover { color: var(--green); background: var(--green-soft); }
 .range-calendar .rdp-root { --rdp-accent-color: var(--green); --rdp-accent-background-color: var(--green-soft); --rdp-selected-border: 1px solid var(--green); }
 .range-calendar .rdp-day_button:hover { background: var(--brand-cyan-soft); }

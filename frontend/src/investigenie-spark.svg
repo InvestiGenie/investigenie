@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="spark" x1="12" y1="10" x2="52" y2="54" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#34E7FF"/>
+      <stop offset=".58" stop-color="#54B8FF"/>
+      <stop offset="1" stop-color="#C23DFF"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="2.5" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+  <path d="M32 3.5 38.2 25.8 60.5 32 38.2 38.2 32 60.5 25.8 38.2 3.5 32 25.8 25.8 32 3.5Z" fill="url(#spark)" filter="url(#glow)"/>
+  <path d="M32 12 36.1 27.9 52 32 36.1 36.1 32 52 27.9 36.1 12 32 27.9 27.9 32 12Z" fill="#EAFDFF" fill-opacity=".84"/>
+</svg>

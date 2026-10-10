@@ -7,6 +7,7 @@ import TimeRangePicker from './TimeRangePicker';
 import { getPreference, setPreference } from './preferences';
 import { formatTimestamp, initialTimeZone, isDateField } from './time';
 import { applyQueryTemplate, resolveSearchQuery } from './query';
+import investigenieSpark from './investigenie-spark.svg';
 
 const HistogramChart = lazy(() => import('./HistogramChart'));
 const InvestiGenieAIPage = lazy(() => import('./InvestiGenieAIPage'));
@@ -363,7 +364,7 @@ export default function App() {
   return (
     <div className={`app-shell${navExpanded ? ' nav-expanded' : ''}`}>
       <aside className="rail" aria-label="Primary navigation">
-        <div className="rail-brand"><div className="brand-mark" aria-label="InvestiGenie">I</div><span className="nav-label">InvestiGenie</span></div>
+        <div className="rail-brand"><img className="brand-mark" src={investigenieSpark} alt="" aria-label="InvestiGenie" /><span className="nav-label" aria-hidden="true">InvestiGenie</span></div>
         <nav className="rail-nav" aria-label="Main menu">
           <button className={`rail-button${activePage === 'investigenie-ai' ? ' active' : ''}`} aria-label="InvestiGenie AI" title="InvestiGenie AI" onClick={() => setActivePage('investigenie-ai')}><span className="rail-icon" aria-hidden="true"><BrainCircuit size={19} /></span><span className="nav-label">InvestiGenie AI</span></button>
           <button className={`rail-button${activePage === 'discover' ? ' active' : ''}`} aria-label="Explore" title="Explore" onClick={() => setActivePage('discover')}><span className="rail-icon" aria-hidden="true">⌕</span><span className="nav-label">Explore</span></button>
