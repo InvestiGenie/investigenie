@@ -2,6 +2,8 @@
 
 A multi-source document explorer with a React/TypeScript browser UI and a Rust/Axum API. Datasource endpoints and credentials are configured in the UI and remain on the server.
 
+Project website: [investigenie.com](https://investigenie.com)
+
 ## Repository layout
 
 The publishable application lives in `investigenie/`. Run the commands below from that directory. If you opened the parent workspace, first run `cd investigenie`.
