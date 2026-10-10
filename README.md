@@ -4,6 +4,10 @@ A multi-source document explorer with a React/TypeScript browser UI and a Rust/A
 
 Project website: [investigenie.com](https://investigenie.com)
 
+## License
+
+InvestiGenie is licensed under the [Apache License 2.0](LICENSE). This license permits commercial use, redistribution, and derivative works subject to its terms.
+
 ## Repository layout
 
 The publishable application lives in `investigenie/`. Run the commands below from that directory. If you opened the parent workspace, first run `cd investigenie`.
