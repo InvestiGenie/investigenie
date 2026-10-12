@@ -1,0 +1,122 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '[0-9]+.[0-9]+.[0-9]+*'
+  release:
+    types: [published, created]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name to release (e.g. 0.1.0-alpha)'
+        required: true
+        default: '0.1.0-alpha'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+            binary_name: investigenie-api
+            ext: ""
+          - os: macos-14
+            platform: darwin
+            arch: arm64
+            target: aarch64-apple-darwin
+            binary_name: investigenie-api
+            ext: ""
+          - os: windows-latest
+            platform: windows
+            arch: amd64
+            target: x86_64-pc-windows-msvc
+            binary_name: investigenie-api.exe
+            ext: ".exe"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Determine Tag Name
+        id: vars
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "release" ]; then
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build Web UI
+        run: |
+          npm ci
+          npm run build:web
+
+      - name: Build Backend
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} -p investigenie-api
+
+      - name: Package Bundle (Unix & macOS)
+        if: matrix.platform != 'windows'
+        shell: bash
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          DIST_DIR="dist_pkg/investigenie"
+          mkdir -p "$DIST_DIR/web"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "$DIST_DIR/"
+          cp -r frontend/dist/* "$DIST_DIR/web/"
+          cp .env.example README.md LICENSE "$DIST_DIR/"
+          cd dist_pkg
+          zip -r "../investigenie-${{ matrix.platform }}-${{ matrix.arch }}-${TAG}.zip" investigenie
+          cd ..
+
+      - name: Package Bundle (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.vars.outputs.tag }}"
+          $distDir = "dist_pkg/investigenie"
+          New-Item -ItemType Directory -Force -Path "$distDir/web" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "$distDir/"
+          Copy-Item -Recurse "frontend/dist/*" "$distDir/web/"
+          Copy-Item ".env.example", "README.md", "LICENSE" "$distDir/"
+          Compress-Archive -Path "dist_pkg/investigenie" -DestinationPath "investigenie-${{ matrix.platform }}-${{ matrix.arch }}-$tag.zip" -Force
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          files: investigenie-${{ matrix.platform }}-${{ matrix.arch }}-*.zip
+          prerelease: ${{ contains(steps.vars.outputs.tag, 'alpha') || contains(steps.vars.outputs.tag, 'beta') || contains(steps.vars.outputs.tag, 'rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: investigenie-${{ matrix.platform }}-${{ matrix.arch }}-${{ steps.vars.outputs.tag }}
+          path: investigenie-${{ matrix.platform }}-${{ matrix.arch }}-*.zip
