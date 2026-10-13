@@ -22,6 +22,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .init();
 
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        return healthcheck().await;
+    }
     let settings = Settings::from_env()?;
     match std::env::args().nth(1).as_deref() {
         Some("migrate") => {
@@ -29,7 +32,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             tracing::info!("Configuration schema migrated");
             return Ok(());
         }
-        Some(_) => return Err("Unsupported command; use migrate or no arguments".into()),
+        Some(_) => {
+            return Err("Unsupported command; use migrate, healthcheck, or no arguments".into())
+        }
         None => {}
     }
     let web_origin = settings.web_origin.parse()?;
@@ -51,11 +56,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     tracing::info!(address = %settings.bind, "InvestiGenie API listening");
     match &settings.web_dir {
-        Some(directory) => tracing::info!(
-            ui = %directory.display(),
-            "Open http://{} in your browser",
-            settings.bind
-        ),
+        Some(directory) => {
+            if settings.bind.ip().is_unspecified() {
+                tracing::info!(
+                    ui = %directory.display(),
+                    "Open http://127.0.0.1:{} in your browser (in Docker, use the mapped host port)",
+                    settings.bind.port()
+                )
+            } else {
+                tracing::info!(
+                    ui = %directory.display(),
+                    "Open http://{} in your browser",
+                    settings.bind
+                )
+            }
+        }
         None => tracing::info!("No bundled web UI found; serve the frontend separately"),
     }
     tracing::info!("Datasource connections are managed from the Connections UI");
@@ -91,6 +106,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("API server stopped unexpectedly".into());
     }
 
+    Ok(())
+}
+
+/// Probes the local readiness endpoint; used by container health checks.
+async fn healthcheck() -> Result<(), Box<dyn Error>> {
+    let mut address: std::net::SocketAddr = std::env::var("RUST_API_BIND")
+        .unwrap_or_else(|_| "127.0.0.1:3000".to_owned())
+        .parse()?;
+    if address.ip().is_unspecified() {
+        address.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+    }
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?
+        .get(format!("http://{address}/api/health/ready"))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(format!("Readiness check returned {}", response.status()).into());
+    }
     Ok(())
 }
 

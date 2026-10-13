@@ -1,0 +1,17 @@
+services:
+  investigenie:
+    build: .
+    image: investigenie:local
+    # Published only on this machine: the API has no built-in authentication.
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - investigenie-data:/data
+    # For shared or production use, set PERSISTENCE_MODE and CONFIG_ENCRYPTION_KEY here or in an env file.
+    # environment:
+    #   PERSISTENCE_MODE: filesystem
+    #   CONFIG_ENCRYPTION_KEY: ${CONFIG_ENCRYPTION_KEY}
+    restart: unless-stopped
+
+volumes:
+  investigenie-data:

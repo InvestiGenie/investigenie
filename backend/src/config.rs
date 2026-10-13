@@ -70,7 +70,7 @@ impl Settings {
         let storage = if storage_configured {
             persistence_from_values(|name| env::var(name).ok())?
         } else {
-            quickstart_storage(&application_directory().join(QUICKSTART_DATA_DIRECTORY))?
+            quickstart_storage(&quickstart_directory())?
         };
         let web_dir = match env::var("WEB_DIR") {
             Ok(path) if !path.trim().is_empty() => Some(PathBuf::from(path)),
@@ -93,6 +93,14 @@ fn application_directory() -> PathBuf {
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn quickstart_directory() -> PathBuf {
+    env::var("FILESYSTEM_PATH")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| application_directory().join(QUICKSTART_DATA_DIRECTORY))
 }
 
 fn quickstart_storage(directory: &Path) -> Result<PersistenceOptions, ConfigError> {

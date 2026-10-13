@@ -1,0 +1,15 @@
+.git
+.github
+**/target
+**/node_modules
+frontend/dist
+**/*.tsbuildinfo
+**/coverage
+.env
+.env.*
+!.env.example
+investigenie_data
+northstar_data
+**/configuration.snapshot
+**/configuration.lock
+**/encryption.key

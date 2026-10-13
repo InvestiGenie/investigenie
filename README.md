@@ -48,6 +48,18 @@ The API serves the bundled `web/` UI from the same address. Without storage sett
 
 Release binaries are not signed. On macOS run `xattr -d com.apple.quarantine investigenie-api` once; on Windows choose **More info → Run anyway** if SmartScreen warns. To listen on another address, set `RUST_API_BIND` (for example `0.0.0.0:3000`) and keep the API behind an authenticated gateway.
 
+## Run with Docker
+
+Images for `linux/amd64` and `linux/arm64` are published with each release:
+
+```sh
+docker run -d --name investigenie -p 127.0.0.1:3000:3000 -v investigenie-data:/data ghcr.io/investigenie/investigenie:<version>
+```
+
+Then open http://127.0.0.1:3000. Data is stored in the `investigenie-data` volume; keep it to keep your saved configuration. To build from source instead, run `docker compose up -d --build` in this directory.
+
+Without storage settings the container uses quickstart mode, with a generated key stored in the volume. For shared or production use, pass `-e PERSISTENCE_MODE=filesystem -e CONFIG_ENCRYPTION_KEY=...` (or `PERSISTENCE_MODE=database` with `DATABASE_URL`). For database mode, run `docker run --rm <env> <image> migrate` once before starting. The examples publish the port on `127.0.0.1` only; InvestiGenie has no built-in authentication, so put it behind an authenticated gateway before exposing it.
+
 ## Requirements
 
 - Node.js 20.19+ or 22.12+, with npm.
