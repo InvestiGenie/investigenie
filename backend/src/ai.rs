@@ -1,13 +1,14 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    future::Future,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     search::{SearchRequest, TimeRange},
@@ -19,6 +20,7 @@ pub struct AiSettings {
     pub api_url: String,
     pub api_key: String,
     pub model: String,
+    pub timeout: Duration,
 }
 
 const MAX_DATA_VIEWS: usize = 5;
@@ -27,7 +29,10 @@ const MAX_FINDINGS: usize = 8;
 const MAX_EVIDENCE_IDS: usize = 5;
 const MAX_PROMPT_BYTES: usize = 65_536;
 const MAX_COMPLETION_BYTES: usize = 32_768;
-const AI_TIMEOUT: Duration = Duration::from_secs(15);
+pub const AI_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_TIME_BUDGET_SECS: u64 = 120;
+const DECISION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const WINDOW_MS: i64 = 30 * 60 * 1000;
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +43,36 @@ pub struct InvestigationRequest {
     pub ai_model_id: String,
     #[serde(default = "default_time_range")]
     pub time_range: Option<TimeRange>,
+    /// Maximum wait for each AI provider response.
+    #[serde(default)]
+    pub ai_timeout_seconds: Option<u64>,
+    /// Background investigations pause for a continue/terminate decision after this long.
+    #[serde(default)]
+    pub time_budget_seconds: Option<u64>,
+}
+
+pub fn provider_timeout(request: &InvestigationRequest) -> Result<Duration, InvestigationError> {
+    let seconds = request
+        .ai_timeout_seconds
+        .unwrap_or(DEFAULT_PROVIDER_TIMEOUT_SECS);
+    if !(5..=600).contains(&seconds) {
+        return Err(InvestigationError::invalid(
+            "AI response timeout must be between 5 and 600 seconds",
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+pub fn time_budget(request: &InvestigationRequest) -> Result<Duration, InvestigationError> {
+    let seconds = request
+        .time_budget_seconds
+        .unwrap_or(DEFAULT_TIME_BUDGET_SECS);
+    if !(30..=3_600).contains(&seconds) {
+        return Err(InvestigationError::invalid(
+            "Investigation check-in time must be between 30 and 3600 seconds",
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 fn default_time_range() -> Option<TimeRange> {
@@ -65,16 +100,17 @@ fn time_scope(time_range: Option<TimeRange>) -> Result<String, InvestigationErro
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct InvestigationResponse {
     summary: String,
     findings: Vec<Finding>,
     sources: Vec<InvestigationSource>,
     caveats: Vec<String>,
     token_usage: Vec<ProviderCallUsage>,
+    complete: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ProviderCallUsage {
     stage: String,
     prompt_tokens: Option<u64>,
@@ -82,7 +118,7 @@ pub struct ProviderCallUsage {
     total_tokens: Option<u64>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ModelUsage {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
@@ -95,7 +131,7 @@ struct ModelCompletion<T> {
     usage: ModelUsage,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Finding {
     title: String,
     detail: String,
@@ -104,7 +140,7 @@ pub struct Finding {
     evidence: Vec<FindingEvidence>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Critical,
@@ -114,7 +150,7 @@ pub enum Severity {
     Info,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Confidence {
     High,
@@ -122,7 +158,7 @@ pub enum Confidence {
     Low,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FindingEvidence {
     data_view_id: String,
     data_view_name: String,
@@ -130,7 +166,7 @@ pub struct FindingEvidence {
     count: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct InvestigationSource {
     data_view_id: String,
     name: String,
@@ -160,6 +196,14 @@ impl InvestigationError {
             status: StatusCode::BAD_GATEWAY,
             code,
             message: message.to_owned(),
+        }
+    }
+    fn terminated() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "investigation_terminated",
+            message: "The investigation was terminated before any findings were produced"
+                .to_owned(),
         }
     }
     fn storage(error: StorageError) -> Self {
@@ -209,7 +253,7 @@ enum Operator {
     Lte,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ModelFindings {
     summary: String,
@@ -232,6 +276,7 @@ pub async fn investigate(
     settings: &AiSettings,
     request: InvestigationRequest,
     upstream_slots: &Arc<Semaphore>,
+    control: &Control,
 ) -> Result<InvestigationResponse, InvestigationError> {
     let time_range = request.time_range;
     let scope = time_scope(time_range)?;
@@ -292,7 +337,19 @@ pub async fn investigate(
         }));
     }
 
-    let plan_completion: ModelCompletion<Plan> = call_model(settings, "Return a JSON object with {\"views\":[{\"data_view_id\":string,\"filters\":[{\"field\":string,\"operator\":string,\"value\":scalar}]}]}. Choose only supplied view IDs and fields, and only operators listed for that view. Use at most 10 filters per view; omit filters when unnecessary. Values must be strings, numbers, or booleans.", &json!({"question":question,"time_scope":scope,"available_views":field_catalog})).await?;
+    let plan_input =
+        json!({"question":question,"time_scope":scope,"available_views":field_catalog});
+    control.report(|progress| progress.stage = "Planning source queries".to_owned());
+    let plan_completion: ModelCompletion<Plan> = match control
+        .call(
+            || call_model(settings, "Return a JSON object with {\"views\":[{\"data_view_id\":string,\"filters\":[{\"field\":string,\"operator\":string,\"value\":scalar}]}]}. Choose only supplied view IDs and fields, and only operators listed for that view. Use at most 10 filters per view; omit filters when unnecessary. Values must be strings, numbers, or booleans.", &plan_input),
+            || None,
+        )
+        .await?
+    {
+        Step::Done(completion) => completion,
+        Step::Stopped => return Err(InvestigationError::terminated()),
+    };
     let plan_usage = plan_completion.usage;
     let plan = plan_completion.value;
     if plan.views.is_empty() || plan.views.len() > MAX_DATA_VIEWS {
@@ -362,15 +419,16 @@ pub async fn investigate(
     }
 
     let mut output: Option<ModelFindings> = None;
-    let mut token_usage = vec![ProviderCallUsage {
+    let planning_usage = ProviderCallUsage {
         stage: "planning".to_owned(),
         prompt_tokens: plan_usage.prompt_tokens,
         completion_tokens: plan_usage.completion_tokens,
         total_tokens: plan_usage.total_tokens,
-    }];
+    };
     let mut analysis_usage: Option<ModelUsage> = None;
     let mut batches_processed = vec![0u64; sources.len()];
-    for source_index in 0..sources.len() {
+    let mut terminated = false;
+    'scan: for source_index in 0..sources.len() {
         let view = &sources[source_index].view;
         let connection = storage
             .connection(&view.connection_id)
@@ -381,9 +439,27 @@ pub async fn investigate(
             view,
             &sources[source_index].filters,
         )?;
+        let view_name = view.name.clone();
         let mut cursor = Some(String::new());
         let mut evidence_buffer = Vec::new();
         loop {
+            if !control
+                .checkpoint(|| {
+                    partial_response(
+                        output.as_ref(),
+                        &sources,
+                        &batches_processed,
+                        &planning_usage,
+                        analysis_usage.as_ref(),
+                        &scope,
+                    )
+                })
+                .await
+            {
+                terminated = true;
+                break 'scan;
+            }
+            control.report(|progress| progress.stage = format!("Scanning {view_name}"));
             let result = {
                 let _permit = acquire_upstream(upstream_slots)?;
                 connection
@@ -399,6 +475,7 @@ pub async fn investigate(
                         time_range,
                         cursor: cursor.clone(),
                         include_histogram: Some(false),
+                        ..Default::default()
                     })
                     .await
                     .map_err(|_| {
@@ -424,6 +501,10 @@ pub async fn investigate(
             if !hits.is_empty() {
                 batches_processed[source_index] += 1;
             }
+            control.report(|progress| {
+                progress.records_examined += hits.len() as u64;
+                progress.batches_processed += u64::from(!hits.is_empty());
+            });
             let examples = compact_examples(&hits);
             let mut chunks = buffer_examples(&mut evidence_buffer, examples);
             if next_cursor.is_none() && !evidence_buffer.is_empty() {
@@ -437,11 +518,35 @@ pub async fn investigate(
                     .filter_map(|example| example["record_id"].as_str().map(str::to_owned))
                     .collect::<Vec<_>>();
                 sources[source_index].record_ids.extend(current_ids);
-                let completion =
-                    analyze_cycle(settings, question, &scope, &sources, output.as_ref()).await?;
+                control.report(|progress| {
+                    progress.stage = format!("Analyzing evidence from {view_name}")
+                });
+                let completion = match control
+                    .call(
+                        || analyze_cycle(settings, question, &scope, &sources, output.as_ref()),
+                        || {
+                            partial_response(
+                                output.as_ref(),
+                                &sources,
+                                &batches_processed,
+                                &planning_usage,
+                                analysis_usage.as_ref(),
+                                &scope,
+                            )
+                        },
+                    )
+                    .await?
+                {
+                    Step::Done(completion) => completion,
+                    Step::Stopped => {
+                        terminated = true;
+                        break 'scan;
+                    }
+                };
                 validate_findings(&completion.value, &sources)?;
                 merge_usage(&mut analysis_usage, completion.usage);
                 output = Some(completion.value);
+                control.report(|progress| progress.analysis_cycles += 1);
                 for source in &mut sources {
                     source.examples.clear();
                     source.record_ids = output
@@ -463,42 +568,101 @@ pub async fn investigate(
     }
     let output = match output {
         Some(output) => output,
+        None if terminated => return Err(InvestigationError::terminated()),
         None => {
-            let completion = analyze_cycle(settings, question, &scope, &sources, None).await?;
+            control.report(|progress| progress.stage = "Summarizing".to_owned());
+            let completion = match control
+                .call(
+                    || analyze_cycle(settings, question, &scope, &sources, None),
+                    || None,
+                )
+                .await?
+            {
+                Step::Done(completion) => completion,
+                Step::Stopped => return Err(InvestigationError::terminated()),
+            };
             validate_findings(&completion.value, &sources)?;
             merge_usage(&mut analysis_usage, completion.usage);
             completion.value
         }
     };
-    let usage = analysis_usage.unwrap_or_default();
-    token_usage.push(ProviderCallUsage {
-        stage: "analysis".to_owned(),
-        prompt_tokens: usage.prompt_tokens,
-        completion_tokens: usage.completion_tokens,
-        total_tokens: usage.total_tokens,
-    });
+    Ok(assemble_response(
+        &output,
+        &sources,
+        &batches_processed,
+        &planning_usage,
+        analysis_usage.as_ref(),
+        &scope,
+        !terminated,
+    ))
+}
+
+fn assemble_response(
+    output: &ModelFindings,
+    sources: &[SourceResult],
+    batches_processed: &[u64],
+    planning_usage: &ProviderCallUsage,
+    analysis_usage: Option<&ModelUsage>,
+    scope: &str,
+    complete: bool,
+) -> InvestigationResponse {
+    let usage = analysis_usage.cloned().unwrap_or_default();
+    let token_usage = vec![
+        planning_usage.clone(),
+        ProviderCallUsage {
+            stage: "analysis".to_owned(),
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+        },
+    ];
     let response_sources = sources
-        .into_iter()
-        .enumerate()
-        .map(|(index, source)| InvestigationSource {
-            query_summary: query_summary(&source.filters, &scope),
-            data_view_id: source.view.id,
-            name: source.view.name,
-            index: source.view.index,
+        .iter()
+        .zip(batches_processed)
+        .map(|(source, batches)| InvestigationSource {
+            query_summary: query_summary(&source.filters, scope),
+            data_view_id: source.view.id.clone(),
+            name: source.view.name.clone(),
+            index: source.view.index.clone(),
             records_examined: source.records_examined,
-            batches_processed: batches_processed[index],
+            batches_processed: *batches,
         })
         .collect();
-    let mut caveats = output.caveats;
+    let mut caveats = output.caveats.clone();
     caveats.truncate(19);
-    caveats.push("All matching records returned by the source were scanned in sequential batches. Findings are a rolling, compacted summary, not an exhaustive listing of every event.".to_owned());
-    Ok(InvestigationResponse {
-        summary: output.summary,
-        findings: output.findings,
+    caveats.push(if complete {
+        "All matching records returned by the source were scanned in sequential batches. Findings are a rolling, compacted summary, not an exhaustive listing of every event.".to_owned()
+    } else {
+        "The investigation was stopped before every matching record was analyzed. Findings cover only the records examined so far.".to_owned()
+    });
+    InvestigationResponse {
+        summary: output.summary.clone(),
+        findings: output.findings.clone(),
         sources: response_sources,
         caveats,
         token_usage,
-    })
+        complete,
+    }
+}
+
+fn partial_response(
+    output: Option<&ModelFindings>,
+    sources: &[SourceResult],
+    batches_processed: &[u64],
+    planning_usage: &ProviderCallUsage,
+    analysis_usage: Option<&ModelUsage>,
+    scope: &str,
+) -> Option<Value> {
+    let response = assemble_response(
+        output?,
+        sources,
+        batches_processed,
+        planning_usage,
+        analysis_usage,
+        scope,
+        false,
+    );
+    serde_json::to_value(response).ok()
 }
 
 async fn analyze_cycle(
@@ -980,9 +1144,397 @@ fn query_summary(filters: &[PlannedFilter], scope: &str) -> String {
     }
 }
 
+pub enum Step<T> {
+    Done(T),
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JobStatus {
+    Running,
+    AwaitingDecision,
+    Completed,
+    Terminated,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Decision {
+    Continue,
+    Terminate,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct Progress {
+    stage: String,
+    records_examined: u64,
+    batches_processed: u64,
+    analysis_cycles: u64,
+}
+
+struct JobState {
+    status: JobStatus,
+    progress: Progress,
+    pause_reason: Option<String>,
+    deadline: Instant,
+    decision: Option<Decision>,
+    terminate_requested: bool,
+    result: Option<Value>,
+    error: Option<(&'static str, String)>,
+    finished_at: Option<Instant>,
+}
+
+/// A background investigation that pauses for a user decision when its time budget elapses
+/// or the AI provider times out.
+pub struct InvestigationJob {
+    pub id: String,
+    started: Instant,
+    budget: Duration,
+    state: Mutex<JobState>,
+    changed: Notify,
+}
+
+impl InvestigationJob {
+    pub fn new(id: String, budget: Duration) -> Arc<Self> {
+        let started = Instant::now();
+        Arc::new(Self {
+            id,
+            started,
+            budget,
+            state: Mutex::new(JobState {
+                status: JobStatus::Running,
+                progress: Progress {
+                    stage: "Starting".to_owned(),
+                    ..Progress::default()
+                },
+                pause_reason: None,
+                deadline: started + budget,
+                decision: None,
+                terminate_requested: false,
+                result: None,
+                error: None,
+                finished_at: None,
+            }),
+            changed: Notify::new(),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, JobState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn snapshot(&self) -> Value {
+        let state = self.lock();
+        let status = match state.status {
+            JobStatus::Running if state.terminate_requested => "stopping",
+            JobStatus::Running => "running",
+            JobStatus::AwaitingDecision => "awaiting_decision",
+            JobStatus::Completed => "completed",
+            JobStatus::Terminated => "terminated",
+            JobStatus::Failed => "failed",
+        };
+        let elapsed = state
+            .finished_at
+            .unwrap_or_else(Instant::now)
+            .duration_since(self.started);
+        json!({
+            "id": self.id,
+            "status": status,
+            "progress": {
+                "stage": state.progress.stage,
+                "records_examined": state.progress.records_examined,
+                "batches_processed": state.progress.batches_processed,
+                "analysis_cycles": state.progress.analysis_cycles,
+                "elapsed_ms": elapsed.as_millis().min(u64::MAX as u128) as u64,
+            },
+            "time_budget_seconds": self.budget.as_secs(),
+            "pause_reason": state.pause_reason,
+            "result": state.result,
+            "error": state.error.as_ref().map(|(code, message)| json!({"code": code, "message": message})),
+        })
+    }
+
+    pub fn decide(&self, decision: Decision) -> Result<(), &'static str> {
+        {
+            let mut state = self.lock();
+            match (state.status, decision) {
+                (JobStatus::AwaitingDecision, _) => state.decision = Some(decision),
+                (JobStatus::Running, Decision::Terminate) => {}
+                _ => return Err("This investigation is not waiting for a decision"),
+            }
+            if decision == Decision::Terminate {
+                state.terminate_requested = true;
+            }
+        }
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    pub fn finish(&self, result: Result<InvestigationResponse, InvestigationError>) {
+        let mut state = self.lock();
+        match result {
+            Ok(response) => {
+                state.status = if response.complete {
+                    JobStatus::Completed
+                } else {
+                    JobStatus::Terminated
+                };
+                state.result = serde_json::to_value(response).ok();
+            }
+            Err(error) => {
+                state.status = if error.code == "investigation_terminated" {
+                    JobStatus::Terminated
+                } else {
+                    JobStatus::Failed
+                };
+                state.error = Some((error.code, error.message));
+            }
+        }
+        state.pause_reason = None;
+        state.finished_at = Some(Instant::now());
+    }
+
+    pub fn finished_before(&self, cutoff: Instant) -> bool {
+        self.lock()
+            .finished_at
+            .is_some_and(|finished| finished < cutoff)
+    }
+}
+
+fn describe_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match (seconds / 60, seconds % 60) {
+        (0, seconds) => format!("{seconds} seconds"),
+        (1, 0) => "1 minute".to_owned(),
+        (minutes, 0) => format!("{minutes} minutes"),
+        _ => format!("{seconds} seconds"),
+    }
+}
+
+pub struct Control {
+    job: Option<Arc<InvestigationJob>>,
+}
+
+impl Control {
+    /// Never pauses; provider timeouts fail the investigation.
+    pub fn unattended() -> Self {
+        Self { job: None }
+    }
+
+    pub fn for_job(job: Arc<InvestigationJob>) -> Self {
+        Self { job: Some(job) }
+    }
+
+    fn report(&self, update: impl FnOnce(&mut Progress)) {
+        if let Some(job) = &self.job {
+            update(&mut job.lock().progress);
+        }
+    }
+
+    /// Returns false when the investigation should stop scanning.
+    async fn checkpoint(&self, partial: impl FnOnce() -> Option<Value>) -> bool {
+        let Some(job) = &self.job else {
+            return true;
+        };
+        {
+            let state = job.lock();
+            if state.terminate_requested {
+                return false;
+            }
+            if Instant::now() < state.deadline {
+                return true;
+            }
+        }
+        let reason = format!(
+            "The investigation has run for {} without finishing. Continue for another {}, or stop and keep the findings so far.",
+            describe_duration(job.started.elapsed()),
+            describe_duration(job.budget)
+        );
+        self.pause(job, reason, partial()).await
+    }
+
+    async fn pause(&self, job: &InvestigationJob, reason: String, partial: Option<Value>) -> bool {
+        {
+            let mut state = job.lock();
+            state.status = JobStatus::AwaitingDecision;
+            state.pause_reason = Some(reason);
+            state.decision = None;
+            if partial.is_some() {
+                state.result = partial;
+            }
+        }
+        let give_up_at = tokio::time::Instant::now() + DECISION_TIMEOUT;
+        loop {
+            let notified = job.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = job.lock();
+                if let Some(decision) = state.decision.take() {
+                    state.status = JobStatus::Running;
+                    state.pause_reason = None;
+                    if decision == Decision::Continue {
+                        state.deadline = Instant::now() + job.budget;
+                        return true;
+                    }
+                    return false;
+                }
+            }
+            if tokio::time::timeout_at(give_up_at, notified).await.is_err() {
+                let mut state = job.lock();
+                state.status = JobStatus::Running;
+                state.pause_reason = None;
+                state.terminate_requested = true;
+                return false;
+            }
+        }
+    }
+
+    async fn cancelled(&self) {
+        let Some(job) = &self.job else {
+            return std::future::pending().await;
+        };
+        loop {
+            let notified = job.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if job.lock().terminate_requested {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Runs a provider call that can be cancelled, and retried after a timeout if the user agrees.
+    async fn call<T, F, Fut, P>(
+        &self,
+        mut make: F,
+        partial: P,
+    ) -> Result<Step<T>, InvestigationError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, InvestigationError>>,
+        P: Fn() -> Option<Value>,
+    {
+        loop {
+            let result = tokio::select! {
+                result = make() => result,
+                _ = self.cancelled() => return Ok(Step::Stopped),
+            };
+            match (result, &self.job) {
+                (Err(error), Some(job)) if error.code == "ai_timeout" => {
+                    let reason = "The AI provider did not respond within the configured timeout. Retry the request, or stop and keep the findings so far.".to_owned();
+                    if !self.pause(job, reason, partial()).await {
+                        return Ok(Step::Stopped);
+                    }
+                }
+                (result, _) => return result.map(Step::Done),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn decide_when_paused(job: Arc<InvestigationJob>, decision: Decision) {
+        for _ in 0..500 {
+            if job.snapshot()["status"] == "awaiting_decision" {
+                job.decide(decision).unwrap();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("investigation never paused");
+    }
+
+    #[tokio::test]
+    async fn provider_timeouts_and_elapsed_budgets_pause_for_a_user_decision() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let job = InvestigationJob::new("job".to_owned(), Duration::from_secs(60));
+        let control = Control::for_job(job.clone());
+        assert!(job.decide(Decision::Continue).is_err());
+        let attempts = AtomicUsize::new(0);
+        let decider = tokio::spawn(decide_when_paused(job.clone(), Decision::Continue));
+        let retried = control
+            .call(
+                || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if attempt == 0 {
+                            Err(InvestigationError::upstream("ai_timeout", "timed out"))
+                        } else {
+                            Ok(7)
+                        }
+                    }
+                },
+                || Some(json!({"summary":"partial"})),
+            )
+            .await
+            .unwrap();
+        decider.await.unwrap();
+        assert!(matches!(retried, Step::Done(7)));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let snapshot = job.snapshot();
+        assert_eq!(snapshot["status"], "running");
+        assert_eq!(snapshot["result"]["summary"], "partial");
+
+        let decider = tokio::spawn(decide_when_paused(job.clone(), Decision::Terminate));
+        let stopped = control
+            .call(
+                || async { Err::<(), _>(InvestigationError::upstream("ai_timeout", "timed out")) },
+                || None,
+            )
+            .await
+            .unwrap();
+        decider.await.unwrap();
+        assert!(matches!(stopped, Step::Stopped));
+        assert_eq!(job.snapshot()["status"], "stopping");
+        job.finish(Err(InvestigationError::terminated()));
+        assert_eq!(job.snapshot()["status"], "terminated");
+
+        let expired = InvestigationJob::new("budget".to_owned(), Duration::ZERO);
+        let control = Control::for_job(expired.clone());
+        let decider = tokio::spawn(decide_when_paused(expired.clone(), Decision::Continue));
+        assert!(control.checkpoint(|| None).await);
+        decider.await.unwrap();
+        expired.decide(Decision::Terminate).unwrap();
+        assert!(!control.checkpoint(|| None).await);
+
+        let unattended = Control::unattended()
+            .call(
+                || async { Err::<(), _>(InvestigationError::upstream("ai_timeout", "timed out")) },
+                || None,
+            )
+            .await;
+        assert!(matches!(unattended, Err(error) if error.code == "ai_timeout"));
+    }
+
+    #[tokio::test]
+    async fn terminating_a_running_job_cancels_the_in_flight_provider_call() {
+        let job = InvestigationJob::new("job".to_owned(), Duration::from_secs(60));
+        let control = Control::for_job(job.clone());
+        let terminator = {
+            let job = job.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                job.decide(Decision::Terminate).unwrap();
+            })
+        };
+        let result = control
+            .call(
+                || std::future::pending::<Result<(), InvestigationError>>(),
+                || None,
+            )
+            .await
+            .unwrap();
+        terminator.await.unwrap();
+        assert!(matches!(result, Step::Stopped));
+    }
 
     #[test]
     fn evidence_cycles_merge_repeated_signals_without_truncating_distinct_examples() {
@@ -1130,7 +1682,7 @@ async fn call_model<T: for<'de> Deserialize<'de>>(
     input: &Value,
 ) -> Result<ModelCompletion<T>, InvestigationError> {
     let client = reqwest::Client::builder()
-        .timeout(AI_TIMEOUT)
+        .timeout(settings.timeout)
         .build()
         .map_err(|_| {
             InvestigationError::upstream(
@@ -1162,11 +1714,18 @@ async fn call_model<T: for<'de> Deserialize<'de>>(
         .json(&body)
         .send()
         .await
-        .map_err(|_| {
-            InvestigationError::upstream(
-                "ai_unavailable",
-                "The AI provider request failed or timed out",
-            )
+        .map_err(|error| {
+            if error.is_timeout() {
+                InvestigationError::upstream(
+                    "ai_timeout",
+                    "The AI provider did not respond before the configured timeout",
+                )
+            } else {
+                InvestigationError::upstream(
+                    "ai_unavailable",
+                    "The AI provider request failed or timed out",
+                )
+            }
         })?;
     if !response.status().is_success()
         || response
@@ -1180,11 +1739,18 @@ async fn call_model<T: for<'de> Deserialize<'de>>(
     }
     let mut response = response;
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| {
-        InvestigationError::upstream(
-            "ai_provider_error",
-            "The AI provider returned an unusable response",
-        )
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        if error.is_timeout() {
+            InvestigationError::upstream(
+                "ai_timeout",
+                "The AI provider did not respond before the configured timeout",
+            )
+        } else {
+            InvestigationError::upstream(
+                "ai_provider_error",
+                "The AI provider returned an unusable response",
+            )
+        }
     })? {
         if bytes.len() + chunk.len() > MAX_COMPLETION_BYTES {
             return Err(InvestigationError::upstream(

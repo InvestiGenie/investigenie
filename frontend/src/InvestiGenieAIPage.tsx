@@ -1,8 +1,29 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
-import { ArrowUp, BrainCircuit, Check, CircleAlert, Database, Search, X } from 'lucide-react';
-import { api, type AIModelSummary, type DataViewSummary, type InvestigationResult } from './api';
+import { ArrowUp, BrainCircuit, Check, CircleAlert, CirclePause, Database, Play, Search, Square, X } from 'lucide-react';
+import { api, type AIModelSummary, type DataViewSummary, type InvestigationJob } from './api';
 import TimeRangePicker from './TimeRangePicker';
-import { getPreference, setPreference } from './preferences';
+import { getPreference, setPreference, type PreferenceName } from './preferences';
+
+const TIMEOUT_OPTIONS = [15, 30, 60, 120, 300, 600];
+const CHECK_IN_OPTIONS = [60, 120, 300, 600, 1800, 3600];
+const ACTIVE_POLL_MS = 1_000;
+const PAUSED_POLL_MS = 5_000;
+
+function durationLabel(seconds: number): string {
+  return seconds < 60 ? `${seconds} sec` : `${seconds / 60} min`;
+}
+
+function elapsedLabel(milliseconds: number): string {
+  const seconds = Math.floor(milliseconds / 1000);
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
+function storedSeconds(name: PreferenceName, options: number[], fallback: number): number {
+  const saved = Number(getPreference(name));
+  return options.includes(saved) ? saved : fallback;
+}
+
+const activeStatuses = new Set<InvestigationJob['status']>(['running', 'stopping', 'awaiting_decision']);
 
 type InvestiGenieAIPageProps = {
   dataViews: DataViewSummary[];
@@ -19,10 +40,13 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
   const [dataViewFilter, setDataViewFilter] = useState('');
   const [dataViewPickerOpen, setDataViewPickerOpen] = useState(false);
   const [question, setQuestion] = useState('');
-  const [result, setResult] = useState<InvestigationResult | null>(null);
+  const [job, setJob] = useState<InvestigationJob | null>(null);
   const [submittedQuestion, setSubmittedQuestion] = useState('');
-  const [busy, setBusy] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [deciding, setDeciding] = useState(false);
   const [error, setError] = useState('');
+  const [aiTimeout, setAiTimeout] = useState(() => storedSeconds('ai-timeout', TIMEOUT_OPTIONS, 60));
+  const [checkIn, setCheckIn] = useState(() => storedSeconds('ai-check-in', CHECK_IN_OPTIONS, 120));
   const [initialTime] = useState(() => Date.now());
   const [startDate, setStartDate] = useState(() => new Date(initialTime - 30 * 60_000).toISOString().slice(0, 19));
   const [endDate, setEndDate] = useState(() => new Date(initialTime).toISOString().slice(0, 19));
@@ -65,6 +89,28 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
     return () => document.removeEventListener('pointerdown', closeOnOutsideClick);
   }, [dataViewPickerOpen]);
 
+  useEffect(() => {
+    if (!job || !activeStatuses.has(job.status)) return;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      api.investigation(job.id, controller.signal)
+        .then((next) => {
+          if (controller.signal.aborted) return;
+          setJob(next);
+          if (next.status === 'failed') setError(next.error?.message ?? 'The investigation could not be completed.');
+        })
+        .catch((reason: unknown) => {
+          if (controller.signal.aborted) return;
+          setError(reason instanceof Error ? reason.message : 'Lost track of the investigation.');
+          setJob((current) => current && { ...current, status: 'failed' });
+        });
+    }, job.status === 'awaiting_decision' ? PAUSED_POLL_MS : ACTIVE_POLL_MS);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [job]);
+
   function selectModel(id: string) {
     setSelectedModelId(id);
     setPreference('ai-model', id);
@@ -86,24 +132,51 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
     return view ? [view] : [];
   });
 
+  const busy = starting || (job !== null && activeStatuses.has(job.status));
+  const result = job?.result ?? null;
+
   async function investigate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const prompt = question.trim();
     if (!prompt || !selectedIds.length || !selectedModelId || busy) return;
-    setBusy(true);
+    setStarting(true);
     setError('');
-    setResult(null);
+    setJob(null);
     setSubmittedQuestion(prompt);
     try {
       const timeRange = startDate && endDate ? { start: Date.parse(`${startDate}Z`), end: Date.parse(`${endDate}Z`) } : null;
-      const investigation = await api.investigate(prompt, selectedIds, selectedModelId, timeRange);
-      setResult(investigation);
+      const started = await api.startInvestigation(prompt, selectedIds, selectedModelId, timeRange, { ai_timeout_seconds: aiTimeout, time_budget_seconds: checkIn });
+      setJob(started);
       setQuestion('');
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'The investigation could not be completed.');
+      setError(reason instanceof Error ? reason.message : 'The investigation could not be started.');
     } finally {
-      setBusy(false);
+      setStarting(false);
     }
+  }
+
+  async function decide(action: 'continue' | 'terminate') {
+    if (!job || deciding) return;
+    setDeciding(true);
+    setError('');
+    try {
+      setJob(await api.decideInvestigation(job.id, action));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'The decision could not be sent.');
+      api.investigation(job.id).then(setJob).catch(() => undefined);
+    } finally {
+      setDeciding(false);
+    }
+  }
+
+  function updateTimeout(seconds: number) {
+    setAiTimeout(seconds);
+    setPreference('ai-timeout', String(seconds));
+  }
+
+  function updateCheckIn(seconds: number) {
+    setCheckIn(seconds);
+    setPreference('ai-check-in', String(seconds));
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -141,10 +214,28 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
       <section className="ai-transcript" aria-live="polite" aria-label="Investigation result">
         {!submittedQuestion && !busy && <div className="ai-welcome"><h2>Start a new investigation</h2>{modelStatus === 'empty' && <button className="sample-query" onClick={() => onManageModels?.()}>Open AI model management</button>}</div>}
         {submittedQuestion && <div className="ai-user-message"><span>You</span><p>{submittedQuestion}</p></div>}
-        {busy && <div className="ai-thinking" role="status"><span className="spinner dark" /> Investigation in progress…</div>}
+        {starting && <div className="ai-thinking" role="status"><span className="spinner dark" /> Starting investigation…</div>}
+        {job && (job.status === 'running' || job.status === 'stopping') && <div className="ai-progress" role="status">
+          <span className="spinner dark" />
+          <div className="ai-progress-text">
+            <strong>{job.status === 'stopping' ? 'Stopping and keeping findings so far…' : job.progress.stage || 'Investigation in progress…'}</strong>
+            <small>{job.progress.records_examined.toLocaleString()} records · {job.progress.batches_processed.toLocaleString()} batches · {job.progress.analysis_cycles.toLocaleString()} analysis cycles · {elapsedLabel(job.progress.elapsed_ms)} elapsed</small>
+          </div>
+          {job.status === 'running' && <button type="button" className="quiet-button ai-stop" disabled={deciding} onClick={() => void decide('terminate')}><Square size={12} aria-hidden="true" /> Stop</button>}
+        </div>}
+        {job?.status === 'awaiting_decision' && <section className="ai-decision" role="group" aria-label="Continue or stop the investigation">
+          <div className="ai-decision-heading"><CirclePause size={16} aria-hidden="true" /><strong>Should InvestiGenie keep investigating?</strong></div>
+          <p>{job.pause_reason}</p>
+          <small>{job.progress.records_examined.toLocaleString()} records examined in {job.progress.batches_processed.toLocaleString()} batches · {elapsedLabel(job.progress.elapsed_ms)} elapsed</small>
+          <div className="ai-decision-actions">
+            <button type="button" className="search-button" disabled={deciding} onClick={() => void decide('continue')}><Play size={13} aria-hidden="true" /> Continue investigation</button>
+            <button type="button" className="quiet-button" disabled={deciding} onClick={() => void decide('terminate')}><Square size={12} aria-hidden="true" /> Stop and show findings</button>
+          </div>
+        </section>}
         {error && <div className="alert ai-error" role="alert"><CircleAlert size={16} aria-hidden="true" /><span>{error}</span></div>}
+        {job?.status === 'terminated' && !result && <p className="ai-empty-sources">The investigation was stopped before any findings were produced.</p>}
         {result && <article className="ai-result">
-          <div className="ai-result-label"><BrainCircuit size={15} aria-hidden="true" /> Investigation</div>
+          <div className="ai-result-label"><BrainCircuit size={15} aria-hidden="true" /> {job?.status === 'completed' ? 'Investigation' : job && activeStatuses.has(job.status) ? 'Findings so far' : 'Partial investigation'}</div>
           <p className="ai-summary">{result.summary}</p>
           <section className="ai-token-usage" aria-label="Token usage">
             <strong>Provider token usage</strong>
@@ -176,6 +267,8 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
             {modelStatus === 'failed' && <div className="alert ai-error" role="alert"><CircleAlert size={16} aria-hidden="true" /><span>{modelError}</span><button type="button" className="icon-button" aria-label="Retry loading AI models" title="Retry loading AI models" onClick={() => setModelAttempt((attempt) => attempt + 1)}>↻</button></div>}
             {modelStatus === 'empty' && <><span>No saved AI models</span><button type="button" className="quiet-button" onClick={() => onManageModels?.()}>Manage AI models</button></>}
             {modelStatus === 'ready' && <label className="ai-model-compact" htmlFor="ai-model-select"><span className="sr-only">Model</span><select id="ai-model-select" aria-label="AI model" value={selectedModelId} disabled={busy} onChange={(event) => selectModel(event.target.value)}>{models.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.model}</option>)}</select></label>}
+            <label className="ai-run-setting" title="How long to wait for each AI provider response"><span>Timeout</span><select aria-label="AI response timeout" value={aiTimeout} disabled={busy} onChange={(event) => updateTimeout(Number(event.target.value))}>{TIMEOUT_OPTIONS.map((seconds) => <option key={seconds} value={seconds}>{durationLabel(seconds)}</option>)}</select></label>
+            <label className="ai-run-setting" title="Ask whether to continue after the investigation runs this long"><span>Ask after</span><select aria-label="Ask to continue after" value={checkIn} disabled={busy} onChange={(event) => updateCheckIn(Number(event.target.value))}>{CHECK_IN_OPTIONS.map((seconds) => <option key={seconds} value={seconds}>{durationLabel(seconds)}</option>)}</select></label>
           </div>
           <button className="ai-send" type="submit" aria-label="Run investigation" title="Run investigation" disabled={busy || !question.trim() || selectedIds.length === 0 || !selectedModelId}><ArrowUp size={17} aria-hidden="true" /></button>
         </div>

@@ -38,6 +38,16 @@ Integration folders are discovered and registered automatically during Cargo bui
 - The compact time-range button opens an editor with a timezone menu, custom dates, and presets. Apply sets an inclusive window, then Search runs it; Cancel discards date edits. Presets capture a fixed range when selected. All time removes the window. The API validates bounds and filters documents and histograms before pagination; ClickHouse custom SQL must project the saved time field when a window is active.
 - Authentication, ACLs, and tenants are not implemented. Do not expose the API to untrusted users or networks.
 
+## Quick start from a release
+
+1. Download the zip for your platform from [Releases](https://github.com/InvestiGenie/investigenie/releases) and extract it.
+2. Run `investigenie-api` (`investigenie-api.exe` on Windows) from the extracted `investigenie` folder.
+3. Open the address it prints, `http://127.0.0.1:3000`.
+
+The API serves the bundled `web/` UI from the same address. Without storage settings, it starts in **quickstart mode**: configuration is saved in `investigenie_data/` next to the binary, encrypted with a generated key in `investigenie_data/encryption.key`. Keep that folder to keep your saved connections. For shared or production use, set `PERSISTENCE_MODE`, `CONFIG_ENCRYPTION_KEY`, and the related settings below (a `.env` file next to the binary works), so the key is not stored beside the data.
+
+Release binaries are not signed. On macOS run `xattr -d com.apple.quarantine investigenie-api` once; on Windows choose **More info → Run anyway** if SmartScreen warns. To listen on another address, set `RUST_API_BIND` (for example `0.0.0.0:3000`) and keep the API behind an authenticated gateway.
+
 ## Requirements
 
 - Node.js 20.19+ or 22.12+, with npm.

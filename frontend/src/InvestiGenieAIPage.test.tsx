@@ -1,8 +1,8 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import InvestiGenieAIPage from './InvestiGenieAIPage';
-import { api, type InvestigationResult } from './api';
-import { clearPreference } from './preferences';
+import { api, type InvestigationJob, type InvestigationResult } from './api';
+import { clearPreference, getPreference } from './preferences';
 
 const dataViews = [
   { id: 'service-one', revision: 'r1', name: 'Service 1', connection_id: 'source', index: 'service-one-*', time_field: '@timestamp' },
@@ -30,9 +30,26 @@ function openDataViewPicker() {
   fireEvent.click(screen.getByRole('button', { name: 'Choose Data Views' }));
 }
 
+const defaultControls = { ai_timeout_seconds: 60, time_budget_seconds: 120 };
+
+function job(overrides: Partial<InvestigationJob> = {}): InvestigationJob {
+  return {
+    id: 'job-1',
+    status: 'completed',
+    progress: { stage: 'Done', records_examined: 12, batches_processed: 1, analysis_cycles: 1, elapsed_ms: 4_000 },
+    time_budget_seconds: 120,
+    pause_reason: null,
+    result,
+    error: null,
+    ...overrides,
+  };
+}
+
 describe('InvestiGenieAIPage', () => {
   beforeEach(() => {
     clearPreference('ai-model');
+    clearPreference('ai-timeout');
+    clearPreference('ai-check-in');
     vi.spyOn(api, 'aiModels').mockResolvedValue([{
       id: 'model-primary', revision: 'rev-1', name: 'Primary', api_url: 'https://provider.example/v1', model: 'model-x', has_api_key: true,
     }]);
@@ -40,7 +57,7 @@ describe('InvestiGenieAIPage', () => {
   afterEach(() => vi.restoreAllMocks());
 
   it('requires a selected model and views and submits their IDs with the question', async () => {
-    const investigate = vi.spyOn(api, 'investigate').mockResolvedValue(result);
+    const investigate = vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
     render(<InvestiGenieAIPage dataViews={dataViews} />);
     expect(await screen.findByRole('combobox', { name: /AI model/ })).toHaveValue('model-primary');
     expect(screen.getByRole('button', { name: 'Run investigation' })).toBeDisabled();
@@ -49,12 +66,12 @@ describe('InvestiGenieAIPage', () => {
     fireEvent.click(screen.getByLabelText(/Service 2/));
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'What is impacting the services?' } });
     fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
-    await waitFor(() => expect(investigate).toHaveBeenCalledWith('What is impacting the services?', ['service-one', 'service-two'], 'model-primary', { start: expect.any(Number), end: expect.any(Number) }));
+    await waitFor(() => expect(investigate).toHaveBeenCalledWith('What is impacting the services?', ['service-one', 'service-two'], 'model-primary', { start: expect.any(Number), end: expect.any(Number) }, defaultControls));
     expect(await screen.findByText(result.summary)).toBeInTheDocument();
   });
 
   it('renders findings, confidence, evidence and bounded sources', async () => {
-    vi.spyOn(api, 'investigate').mockResolvedValue(result);
+    vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
     render(<InvestiGenieAIPage dataViews={dataViews} />);
     await screen.findByRole('combobox', { name: /AI model/ });
     openDataViewPicker();
@@ -71,7 +88,7 @@ describe('InvestiGenieAIPage', () => {
   });
 
   it('shows provider setup errors without losing the question', async () => {
-    vi.spyOn(api, 'investigate').mockRejectedValue(new Error('InvestiGenie AI is not configured'));
+    vi.spyOn(api, 'startInvestigation').mockRejectedValue(new Error('InvestiGenie AI is not configured'));
     render(<InvestiGenieAIPage dataViews={dataViews} />);
     await screen.findByRole('combobox', { name: /AI model/ });
     openDataViewPicker();
@@ -94,7 +111,7 @@ describe('InvestiGenieAIPage', () => {
   });
 
   it('submits with Enter while Shift+Enter keeps the composer open for multiline text', async () => {
-    const investigate = vi.spyOn(api, 'investigate').mockResolvedValue(result);
+    const investigate = vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
     render(<InvestiGenieAIPage dataViews={dataViews} />);
     await screen.findByRole('combobox', { name: /AI model/ });
     openDataViewPicker();
@@ -142,7 +159,7 @@ describe('InvestiGenieAIPage', () => {
   });
 
   it('uses the Explore timeframe picker and keeps the model below the chat', async () => {
-    const investigate = vi.spyOn(api, 'investigate').mockResolvedValue(result);
+    const investigate = vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
     render(<InvestiGenieAIPage dataViews={dataViews} />);
     const model = await screen.findByRole('combobox', { name: 'AI model' });
     expect(model.closest('.ai-composer-footer')).not.toBeNull();
@@ -160,11 +177,11 @@ describe('InvestiGenieAIPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
     await waitFor(() => expect(investigate).toHaveBeenCalledWith('Historical errors?', ['service-one'], 'model-primary', {
       start: Date.parse('2026-10-06T08:00:00Z'), end: Date.parse('2026-10-06T09:00:00Z'),
-    }));
+    }, defaultControls));
   });
 
   it('sends an explicit all-time scope when the time window is cleared', async () => {
-    const investigate = vi.spyOn(api, 'investigate').mockResolvedValue(result);
+    const investigate = vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
     render(<InvestiGenieAIPage dataViews={dataViews} />);
     await screen.findByRole('combobox', { name: 'AI model' });
     fireEvent.click(screen.getByRole('button', { name: 'Clear time window' }));
@@ -173,7 +190,77 @@ describe('InvestiGenieAIPage', () => {
     fireEvent.click(screen.getByLabelText(/Service 1/));
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Any errors?' } });
     fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
-    await waitFor(() => expect(investigate).toHaveBeenCalledWith('Any errors?', ['service-one'], 'model-primary', null));
+    await waitFor(() => expect(investigate).toHaveBeenCalledWith('Any errors?', ['service-one'], 'model-primary', null, defaultControls));
+  });
+
+  it('sends saved timeout and check-in controls with the investigation', async () => {
+    const investigate = vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
+    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    await screen.findByRole('combobox', { name: 'AI model' });
+    fireEvent.change(screen.getByLabelText('AI response timeout'), { target: { value: '300' } });
+    fireEvent.change(screen.getByLabelText('Ask to continue after'), { target: { value: '600' } });
+    openDataViewPicker();
+    fireEvent.click(screen.getByLabelText(/Service 1/));
+    fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Large index?' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
+    await waitFor(() => expect(investigate).toHaveBeenCalledWith('Large index?', ['service-one'], 'model-primary', expect.anything(), { ai_timeout_seconds: 300, time_budget_seconds: 600 }));
+    expect(getPreference('ai-timeout')).toBe('300');
+    expect(getPreference('ai-check-in')).toBe('600');
+  });
+
+  it('asks whether to continue, shows findings so far, and resumes polling until completion', async () => {
+    const partial = { ...result, summary: 'Early timeout signals.', complete: false };
+    vi.spyOn(api, 'startInvestigation').mockResolvedValue(job({ status: 'running', result: null, progress: { stage: 'Scanning Service 1', records_examined: 100, batches_processed: 1, analysis_cycles: 0, elapsed_ms: 1_000 } }));
+    const poll = vi.spyOn(api, 'investigation')
+      .mockResolvedValueOnce(job({ status: 'awaiting_decision', result: partial, pause_reason: 'The investigation has run for 2 minutes without finishing.' }))
+      .mockResolvedValueOnce(job());
+    const decide = vi.spyOn(api, 'decideInvestigation').mockResolvedValue(job({ status: 'running', result: partial }));
+    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    await screen.findByRole('combobox', { name: 'AI model' });
+    openDataViewPicker();
+    fireEvent.click(screen.getByLabelText(/Service 1/));
+    fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Why so slow?' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
+    expect(await screen.findByText('Scanning Service 1')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Stop/ })).toBeInTheDocument();
+    const decision = await screen.findByRole('group', { name: 'Continue or stop the investigation' }, { timeout: 3_000 });
+    expect(decision).toHaveTextContent('run for 2 minutes');
+    expect(screen.getByText('Findings so far')).toBeInTheDocument();
+    expect(screen.getByText('Early timeout signals.')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Continue investigation/ }));
+    await waitFor(() => expect(decide).toHaveBeenCalledWith('job-1', 'continue'));
+    expect(await screen.findByText(result.summary, undefined, { timeout: 3_000 })).toBeInTheDocument();
+    expect(poll).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole('group', { name: 'Continue or stop the investigation' })).not.toBeInTheDocument();
+  });
+
+  it('stops a paused investigation and labels the findings as partial', async () => {
+    const partial = { ...result, complete: false };
+    vi.spyOn(api, 'startInvestigation').mockResolvedValue(job({ status: 'awaiting_decision', result: partial, pause_reason: 'The AI provider did not respond within the configured timeout.' }));
+    const decide = vi.spyOn(api, 'decideInvestigation').mockResolvedValue(job({ status: 'terminated', result: partial }));
+    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    await screen.findByRole('combobox', { name: 'AI model' });
+    openDataViewPicker();
+    fireEvent.click(screen.getByLabelText(/Service 1/));
+    fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Errors?' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
+    expect(await screen.findByText(/did not respond within the configured timeout/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Stop and show findings/ }));
+    await waitFor(() => expect(decide).toHaveBeenCalledWith('job-1', 'terminate'));
+    expect(await screen.findByText('Partial investigation')).toBeInTheDocument();
+    expect(screen.getByLabelText('Ask InvestiGenie AI')).not.toBeDisabled();
+  });
+
+  it('reports failed background investigations', async () => {
+    vi.spyOn(api, 'startInvestigation').mockResolvedValue(job({ status: 'running', result: null }));
+    vi.spyOn(api, 'investigation').mockResolvedValue(job({ status: 'failed', result: null, error: { code: 'source_query_failed', message: 'A batched source query failed' } }));
+    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    await screen.findByRole('combobox', { name: 'AI model' });
+    openDataViewPicker();
+    fireEvent.click(screen.getByLabelText(/Service 1/));
+    fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Errors?' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
+    expect(await screen.findByRole('alert', undefined, { timeout: 3_000 })).toHaveTextContent('A batched source query failed');
   });
 
   it('links to model management and disables investigations when no profile exists', async () => {

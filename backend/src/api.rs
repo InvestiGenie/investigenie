@@ -1,7 +1,12 @@
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    path::Path as FilePath,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use axum::{
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -11,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::cors::CorsLayer;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::ai::{self, InvestigationRequest};
 use crate::integrations::{
@@ -24,12 +30,17 @@ use crate::storage::{
 };
 
 const MAX_CONCURRENT_UPSTREAM_REQUESTS: usize = 64;
+const MAX_TRACKED_INVESTIGATIONS: usize = 64;
+const FINISHED_INVESTIGATION_RETENTION: Duration = Duration::from_secs(30 * 60);
+
+type InvestigationJobs = Arc<Mutex<HashMap<String, Arc<ai::InvestigationJob>>>>;
 
 #[derive(Clone)]
 struct AppState {
     storage: Storage,
     upstream_slots: Arc<Semaphore>,
     ai_slots: Arc<Semaphore>,
+    investigations: InvestigationJobs,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +87,7 @@ pub fn router(web_origin: HeaderValue, storage: Storage) -> Router {
         storage,
         upstream_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_UPSTREAM_REQUESTS)),
         ai_slots: Arc::new(Semaphore::new(4)),
+        investigations: Arc::default(),
     };
     let cors = CorsLayer::new()
         .allow_origin(web_origin)
@@ -122,6 +134,15 @@ pub fn router(web_origin: HeaderValue, storage: Storage) -> Router {
             "/api/ai/investigate",
             post(investigate).layer(DefaultBodyLimit::max(65_536)),
         )
+        .route(
+            "/api/ai/investigations",
+            post(start_investigation).layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route("/api/ai/investigations/{id}", get(investigation_status))
+        .route(
+            "/api/ai/investigations/{id}/decision",
+            post(decide_investigation),
+        )
         .route("/api/ai/models", get(ai_models).post(create_ai_model))
         .route(
             "/api/ai/models/{model_id}",
@@ -131,24 +152,147 @@ pub fn router(web_origin: HeaderValue, storage: Storage) -> Router {
         .layer(cors)
 }
 
+/// Serves the built UI from the same origin as the API; unknown non-API paths load the SPA.
+pub fn with_web(router: Router, directory: &FilePath) -> Router {
+    let files = ServeDir::new(directory).fallback(ServeFile::new(directory.join("index.html")));
+    router.fallback(move |request: Request| {
+        let mut files = files.clone();
+        async move {
+            if request.uri().path().starts_with("/api/") {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(
+                        json!({ "error": { "code": "not_found", "message": "Unknown API route" } }),
+                    ),
+                )
+                    .into_response();
+            }
+            match files.try_call(request).await {
+                Ok(response) => response.map(axum::body::Body::new),
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+    })
+}
+
 async fn investigate(
     State(state): State<AppState>,
     Json(request): Json<InvestigationRequest>,
 ) -> Result<Json<ai::InvestigationResponse>, ApiError> {
+    let timeout = ai::provider_timeout(&request).map_err(ApiError::Investigation)?;
     let model = state.storage.ai_model(&request.ai_model_id).await?;
     let settings = ai::AiSettings {
         api_url: model.api_url,
         api_key: model.api_key,
         model: model.model,
+        timeout,
     };
     let permit = state
         .ai_slots
         .clone()
         .try_acquire_owned()
         .map_err(|_| ApiError::Unavailable)?;
-    let result = ai::investigate(&state.storage, &settings, request, &state.upstream_slots).await;
+    let result = ai::investigate(
+        &state.storage,
+        &settings,
+        request,
+        &state.upstream_slots,
+        &ai::Control::unattended(),
+    )
+    .await;
     drop(permit);
     result.map(Json).map_err(ApiError::Investigation)
+}
+
+async fn start_investigation(
+    State(state): State<AppState>,
+    Json(request): Json<InvestigationRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let timeout = ai::provider_timeout(&request).map_err(ApiError::Investigation)?;
+    let budget = ai::time_budget(&request).map_err(ApiError::Investigation)?;
+    let model = state.storage.ai_model(&request.ai_model_id).await?;
+    let settings = ai::AiSettings {
+        api_url: model.api_url,
+        api_key: model.api_key,
+        model: model.model,
+        timeout,
+    };
+    let permit = state
+        .ai_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::Unavailable)?;
+    let job = ai::InvestigationJob::new(uuid::Uuid::new_v4().to_string(), budget);
+    {
+        let mut jobs = state
+            .investigations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cutoff = Instant::now()
+            .checked_sub(FINISHED_INVESTIGATION_RETENTION)
+            .unwrap_or_else(Instant::now);
+        jobs.retain(|_, job| !job.finished_before(cutoff));
+        if jobs.len() >= MAX_TRACKED_INVESTIGATIONS {
+            jobs.retain(|_, job| !job.finished_before(Instant::now()));
+        }
+        if jobs.len() >= MAX_TRACKED_INVESTIGATIONS {
+            return Err(ApiError::Unavailable);
+        }
+        jobs.insert(job.id.clone(), job.clone());
+    }
+    let task_job = job.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let control = ai::Control::for_job(task_job.clone());
+        let result = ai::investigate(
+            &state.storage,
+            &settings,
+            request,
+            &state.upstream_slots,
+            &control,
+        )
+        .await;
+        task_job.finish(result);
+    });
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "investigation": job.snapshot() })),
+    ))
+}
+
+fn find_investigation(state: &AppState, id: &str) -> Result<Arc<ai::InvestigationJob>, ApiError> {
+    state
+        .investigations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(id)
+        .cloned()
+        .ok_or(ApiError::InvestigationNotFound)
+}
+
+async fn investigation_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let job = find_investigation(&state, &id)?;
+    Ok(Json(json!({ "investigation": job.snapshot() })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvestigationDecisionRequest {
+    action: ai::Decision,
+}
+
+async fn decide_investigation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<InvestigationDecisionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let job = find_investigation(&state, &id)?;
+    job.decide(request.action)
+        .map_err(ApiError::InvestigationDecision)?;
+    Ok(Json(json!({ "investigation": job.snapshot() })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,6 +356,7 @@ async fn create_ai_model(
         api_url: model.api_url.clone(),
         api_key: model.api_key.clone(),
         model: model.model.clone(),
+        timeout: ai::AI_TIMEOUT,
     })
     .await
     .map_err(ApiError::AiModelTest)?;
@@ -247,6 +392,7 @@ async fn update_ai_model(
         api_url: model.api_url.clone(),
         api_key: model.api_key.clone(),
         model: model.model.clone(),
+        timeout: ai::AI_TIMEOUT,
     })
     .await
     .map_err(ApiError::AiModelTest)?;
@@ -455,6 +601,8 @@ enum ApiError {
     DuplicateAiModel,
     AiModelTest(&'static str),
     Investigation(ai::InvestigationError),
+    InvestigationNotFound,
+    InvestigationDecision(&'static str),
 }
 
 impl From<StorageError> for ApiError {
@@ -506,6 +654,8 @@ impl IntoResponse for ApiError {
             Self::DuplicateAiModel => (StatusCode::CONFLICT, "duplicate", "An AI model with this name already exists".to_owned()),
             Self::AiModelTest(message) => (StatusCode::BAD_GATEWAY, "ai_model_test_failed", message.to_owned()),
             Self::Investigation(error) => (error.status, error.code, error.message),
+            Self::InvestigationNotFound => (StatusCode::NOT_FOUND, "investigation_not_found", "The investigation does not exist or has expired".to_owned()),
+            Self::InvestigationDecision(message) => (StatusCode::CONFLICT, "investigation_not_paused", message.to_owned()),
         };
 
         (

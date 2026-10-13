@@ -1,12 +1,13 @@
 import { Fragment, lazy, Suspense, useEffect, useRef, useState, type FormEvent } from 'react';
-import { ArrowDown, ArrowUp, ArrowUpDown, BrainCircuit, ChevronLeft, ChevronRight } from 'lucide-react';
-import { api, makeSearchRequest, type ConnectionSummary, type DataViewSummary, type DocumentResult, type FieldSummary, type SearchResult } from './api';
+import { ArrowDown, ArrowUp, ArrowUpDown, BrainCircuit, ChevronLeft, ChevronRight, Eye, EyeOff } from 'lucide-react';
+import { api, makeSearchRequest, type ConnectionSummary, type DataViewSummary, type DocumentResult, type FieldSummary, type SearchRequest, type SearchResult } from './api';
 import ConnectionsPage from './ConnectionsPage';
 import DataViewsPage from './DataViewsPage';
 import TimeRangePicker from './TimeRangePicker';
 import { getPreference, setPreference } from './preferences';
 import { formatTimestamp, initialTimeZone, isDateField } from './time';
 import { applyQueryTemplate, resolveSearchQuery } from './query';
+import { describeInterval, INTERVAL_CHOICES, resolveInterval, type IntervalChoice } from './histogram';
 import investigenieSpark from './investigenie-spark.svg';
 
 const HistogramChart = lazy(() => import('./HistogramChart'));
@@ -57,6 +58,18 @@ function sourceField(source: Record<string, unknown> | null, name: string): unkn
   return value;
 }
 
+const ELASTICSEARCH_AGGREGATABLE = new Set(['keyword', 'constant_keyword', 'boolean', 'ip', 'long', 'integer', 'short', 'byte', 'double', 'float', 'half_float', 'scaled_float', 'unsigned_long', 'version']);
+
+function canBreakDown(field: FieldSummary, integrationId: string | undefined): boolean {
+  if (isDateField(field.field_type)) return false;
+  if (integrationId === 'elasticsearch') return ELASTICSEARCH_AGGREGATABLE.has(field.field_type);
+  return !/^(object|nested|array|map|tuple|json|text)/i.test(field.field_type.replace(/^Nullable\(/i, ''));
+}
+
+function utcInput(timestamp: number): string {
+  return new Date(timestamp).toISOString().slice(0, 23);
+}
+
 export default function App() {
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [timeZone, setTimeZone] = useState(initialTimeZone);
@@ -89,10 +102,19 @@ export default function App() {
   const [previousPages, setPreviousPages] = useState<Array<{ number: number; result: SearchResult }>>([]);
   const [forwardPages, setForwardPages] = useState<Array<{ number: number; result: SearchResult }>>([]);
   const [histogramTimeRange, setHistogramTimeRange] = useState<{ start: number; end: number } | undefined>();
+  const [histogramInterval, setHistogramInterval] = useState<IntervalChoice>('auto');
+  const [breakdownField, setBreakdownField] = useState('');
+  const [histogramVisible, setHistogramVisible] = useState(() => getPreference('histogram-visible') !== 'false');
   const appliedSearch = useRef<ReturnType<typeof makeSearchRequest> | null>(null);
 
-  function firstPageRequest(body: ReturnType<typeof makeSearchRequest>) {
-    return { ...body, cursor: '' };
+  function firstPageRequest(body: ReturnType<typeof makeSearchRequest>, choice = histogramInterval, breakdown = breakdownField): SearchRequest {
+    const resolved = body.time_range ? resolveInterval(choice, body.time_range) : null;
+    return {
+      ...body,
+      cursor: '',
+      ...(resolved ? { histogram_interval: resolved.interval, time_zone: timeZone } : {}),
+      ...(resolved && breakdown ? { histogram_breakdown_field: breakdown } : {}),
+    };
   }
 
   function acceptFirstPage(response: SearchResult, body: ReturnType<typeof makeSearchRequest>) {
@@ -209,7 +231,7 @@ export default function App() {
   async function runSearch(
     event?: FormEvent<HTMLFormElement>,
     nextOffset = 0,
-    overrides: { sortBy?: string; sortOrder?: 'asc' | 'desc' } = {},
+    overrides: { sortBy?: string; sortOrder?: 'asc' | 'desc'; startDate?: string; endDate?: string; interval?: IntervalChoice; breakdown?: string } = {},
   ) {
     event?.preventDefault();
     if (!selectedIndex || !selectedConnectionId || !queryMetadata) return;
@@ -226,9 +248,9 @@ export default function App() {
           overrides.sortBy ?? sortBy,
           selectedDataView?.time_field,
           overrides.sortOrder ?? sortOrder,
-          startDate,
-          endDate,
-        ));
+          overrides.startDate ?? startDate,
+          overrides.endDate ?? endDate,
+        ), overrides.interval, overrides.breakdown);
       const response = await api.search(
         selectedConnectionId,
         body,
@@ -308,6 +330,35 @@ export default function App() {
     ? [{ name: histogramField, field_type: 'date/time' }, ...selectableFields] : selectableFields;
   const selectedSidebarFields = histogramField ? [histogramField, ...selectedFields] : selectedFields;
   const matchingFields = sidebarFields.filter((field) => `${field.name} ${field.field_type}`.toLowerCase().includes(fieldFilter.toLowerCase()));
+
+  const breakdownFields = fields.filter((field) => field.name !== histogramField && canBreakDown(field, integration?.id));
+  const resolvedInterval = histogramTimeRange ? resolveInterval(histogramInterval, histogramTimeRange) : null;
+  const effectiveInterval = results?.histogram_interval ?? resolvedInterval?.interval ?? null;
+  const breakdownMissing = Boolean(breakdownField && results?.histogram.length && !results.histogram.some((bucket) => bucket.breakdown));
+
+  function changeHistogramInterval(choice: IntervalChoice) {
+    setHistogramInterval(choice);
+    void runSearch(undefined, 0, { interval: choice });
+  }
+
+  function changeBreakdown(field: string) {
+    setBreakdownField(field);
+    void runSearch(undefined, 0, { breakdown: field });
+  }
+
+  function zoomTo(range: { start: number; end: number }) {
+    const start = utcInput(range.start);
+    const end = utcInput(range.end);
+    setStartDate(start);
+    setEndDate(end);
+    void runSearch(undefined, 0, { startDate: start, endDate: end });
+  }
+
+  function toggleHistogram() {
+    const next = !histogramVisible;
+    setHistogramVisible(next);
+    setPreference('histogram-visible', String(next));
+  }
 
   function displayField(name: string, value: unknown): string {
     if (name === histogramField || fields.some((field) => field.name === name && isDateField(field.field_type))) {
@@ -398,7 +449,7 @@ export default function App() {
             <section className="query-panel" aria-label="Search controls">
               <div className="query-topline">
                 <label className="select-label" htmlFor="data-view-select">DATA VIEW</label>
-                <select id="data-view-select" value={selectedDataViewId} onChange={(event) => { setSelectedDataViewId(event.target.value); setQuery(''); setSortBy(''); setSortOrder('desc'); setResults(null); }}>
+                <select id="data-view-select" value={selectedDataViewId} onChange={(event) => { setSelectedDataViewId(event.target.value); setQuery(''); setSortBy(''); setSortOrder('desc'); setBreakdownField(''); setResults(null); }}>
                   {dataViews.length === 0 && <option value="">No data views available</option>}
                   {dataViews.map((view) => <option key={view.id} value={view.id}>{view.name}</option>)}
                 </select>
@@ -424,11 +475,34 @@ export default function App() {
 
             {error && <div className="alert" role="alert"><span className="alert-symbol">!</span><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError('')}>×</button></div>}
 
-            {histogramField && results && <section className="histogram-panel" aria-labelledby="histogram-title">
-              <div className="histogram-heading"><div><h2 id="histogram-title">Documents over time</h2><p>{histogramField} · {formatCount(String(queryMetadata?.histogram_total_from_buckets ? results.histogram.reduce((count, bucket) => count + bucket.count, 0) : results.total))} matching documents</p></div><span className="histogram-interval">{timeZone} · AUTO INTERVAL</span></div>
-              {results.histogram.length > 0 || (histogramTimeRange && !results.histogram_unavailable_reason)
-                ? <Suspense fallback={<div className="histogram-chart" aria-hidden="true" />}><HistogramChart data={results.histogram} timeZone={timeZone} timeRange={histogramTimeRange} /></Suspense>
-                : <div className="histogram-empty">{results.histogram_unavailable_reason ?? 'No timestamped documents match this query.'}</div>}
+            {histogramField && results && <section className={`histogram-panel${histogramVisible ? '' : ' collapsed'}`} aria-labelledby="histogram-title">
+              <div className="histogram-heading">
+                <div><h2 id="histogram-title">Documents over time</h2><p>{histogramField} · {formatCount(String(queryMetadata?.histogram_total_from_buckets ? results.histogram.reduce((count, bucket) => count + bucket.count, 0) : results.total))} matching documents</p></div>
+                <div className="histogram-controls">
+                  {histogramVisible && <>
+                    <label className="histogram-control" title={histogramTimeRange ? 'Histogram bucket size' : 'Choose a time window to set the interval'}>
+                      <span>Interval</span>
+                      <select aria-label="Histogram interval" value={histogramTimeRange ? histogramInterval : 'auto'} disabled={!histogramTimeRange || loading} onChange={(event) => changeHistogramInterval(event.target.value as IntervalChoice)}>
+                        {INTERVAL_CHOICES.map((choice) => <option key={choice.value} value={choice.value}>{choice.value === 'auto' && effectiveInterval && histogramInterval === 'auto' ? `Auto - ${describeInterval(effectiveInterval)}` : choice.label}</option>)}
+                      </select>
+                    </label>
+                    {resolvedInterval?.scaled && <span className="histogram-scaled" role="note" title={`The ${histogramInterval} interval creates too many buckets for this time range, so it was scaled up.`}>Scaled to {describeInterval(resolvedInterval.interval)}</span>}
+                    <label className="histogram-control" title={histogramTimeRange ? 'Stack bars by the top values of a field' : 'Choose a time window to break down by a field'}>
+                      <span>Break down by</span>
+                      <select aria-label="Break down by" value={breakdownField} disabled={!histogramTimeRange || loading || breakdownFields.length === 0} onChange={(event) => changeBreakdown(event.target.value)}>
+                        <option value="">No breakdown</option>
+                        {histogramTimeRange && breakdownFields.map((field) => <option key={field.name} value={field.name}>{field.name}</option>)}
+                      </select>
+                    </label>
+                  </>}
+                  <span className="histogram-interval">{timeZone}</span>
+                  <button type="button" className="icon-button histogram-toggle" aria-label={histogramVisible ? 'Hide chart' : 'Show chart'} title={histogramVisible ? 'Hide chart' : 'Show chart'} aria-expanded={histogramVisible} onClick={toggleHistogram}>{histogramVisible ? <EyeOff size={14} aria-hidden="true" /> : <Eye size={14} aria-hidden="true" />}</button>
+                </div>
+              </div>
+              {histogramVisible && (results.histogram.length > 0 || (histogramTimeRange && !results.histogram_unavailable_reason)
+                ? <Suspense fallback={<div className="histogram-chart" aria-hidden="true" />}><HistogramChart data={results.histogram} timeZone={timeZone} timeRange={histogramTimeRange} interval={effectiveInterval} onBrush={loading ? undefined : zoomTo} /></Suspense>
+                : histogramVisible && <div className="histogram-empty">{results.histogram_unavailable_reason ?? 'No timestamped documents match this query.'}</div>)}
+              {histogramVisible && breakdownMissing && <p className="histogram-note">{breakdownField} is not available for this query, so the chart is not broken down. For SQL sources, include it in the SELECT list.</p>}
             </section>}
 
             <section className="results-section" aria-label="Search results">

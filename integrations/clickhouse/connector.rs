@@ -64,8 +64,11 @@ impl Connector for ClickHouseClient {
     fn search(&self, request: SearchRequest) -> ConnectorFuture<'_, Value> {
         Box::pin(async move {
             let row_offset = super::cursor_offset(request.cursor.as_deref(), request.from)?;
+            let histogram_options = request
+                .histogram_options()
+                .map_err(|_| ClickHouseError::InvalidQuery)?;
             let result = self
-                .search_page(
+                .search_page_with_histogram(
                     &request.query,
                     request.from,
                     request.size,
@@ -80,11 +83,15 @@ impl Connector for ClickHouseClient {
                     request.sort_order.as_deref(),
                     request.cursor.as_deref(),
                     request.include_histogram,
+                    &histogram_options,
                 )
                 .await?;
             let hits: Vec<Value> = result.rows.into_iter().enumerate().map(|(offset, source)| json!({"index":request.index,"id":format!("row-{}",row_offset + offset as u64 + 1),"score":null,"source":source})).collect();
             let relation = if result.next_cursor.is_some() { "gte" } else { "eq" };
             let mut response = json!({"took":result.took,"timed_out":false,"total":result.total,"total_relation":relation,"columns":result.columns,"hits":hits,"histogram":result.histogram,"histogram_unavailable_reason":result.histogram_unavailable_reason});
+            if let Some(interval) = result.histogram_interval {
+                response["histogram_interval"] = json!(interval);
+            }
             if let Some(cursor) = result.next_cursor {
                 response["next_cursor"] = json!(cursor);
             }

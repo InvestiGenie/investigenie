@@ -112,6 +112,30 @@ export type InvestigationResult = {
     completion_tokens: number | null;
     total_tokens: number | null;
   }>;
+  complete?: boolean;
+};
+
+export type InvestigationControls = {
+  ai_timeout_seconds: number;
+  time_budget_seconds: number;
+};
+
+export type InvestigationJobStatus = 'running' | 'stopping' | 'awaiting_decision' | 'completed' | 'terminated' | 'failed';
+
+export type InvestigationJob = {
+  id: string;
+  status: InvestigationJobStatus;
+  progress: {
+    stage: string;
+    records_examined: number;
+    batches_processed: number;
+    analysis_cycles: number;
+    elapsed_ms: number;
+  };
+  time_budget_seconds: number;
+  pause_reason: string | null;
+  result: InvestigationResult | null;
+  error: { code: string; message: string } | null;
 };
 
 export type CreateDataViewRequest = Omit<DataViewSummary, 'id' | 'revision'>;
@@ -147,13 +171,17 @@ export type SearchResult = {
   hits: SearchHit[];
   histogram: HistogramBucket[];
   histogram_unavailable_reason?: string | null;
+  histogram_interval?: string | null;
   columns?: string[];
 };
+
+export const BREAKDOWN_OTHER_KEY = '__other__';
 
 export type HistogramBucket = {
   timestamp: number;
   label: string | null;
   count: number;
+  breakdown?: Array<{ key: string; count: number }>;
 };
 
 export type DocumentResult = {
@@ -174,9 +202,13 @@ export type SearchRequest = {
   sort_order?: 'asc' | 'desc';
   histogram_field?: string;
   time_range?: { start: number; end: number };
+  histogram_interval?: string;
+  histogram_breakdown_field?: string;
+  time_zone?: string;
 };
 
-const apiBase = (import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:3000').replace(/\/$/, '');
+// Production builds are served by the API itself, so they default to the same origin.
+const apiBase = (import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:3000' : '')).replace(/\/$/, '');
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
@@ -256,6 +288,26 @@ export const api = {
       body: JSON.stringify({ question, data_view_ids: dataViewIds, ai_model_id: aiModelId, time_range: timeRange }),
       signal,
     });
+  },
+  async startInvestigation(question: string, dataViewIds: string[], aiModelId: string, timeRange: SearchRequest['time_range'] | null, controls: InvestigationControls): Promise<InvestigationJob> {
+    const response = await request<{ investigation: InvestigationJob }>('/api/ai/investigations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question, data_view_ids: dataViewIds, ai_model_id: aiModelId, time_range: timeRange, ...controls }),
+    });
+    return response.investigation;
+  },
+  async investigation(id: string, signal?: AbortSignal): Promise<InvestigationJob> {
+    const response = await request<{ investigation: InvestigationJob }>(`/api/ai/investigations/${encodeURIComponent(id)}`, { signal });
+    return response.investigation;
+  },
+  async decideInvestigation(id: string, action: 'continue' | 'terminate'): Promise<InvestigationJob> {
+    const response = await request<{ investigation: InvestigationJob }>(`/api/ai/investigations/${encodeURIComponent(id)}/decision`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    });
+    return response.investigation;
   },
   async addDataView(body: CreateDataViewRequest): Promise<void> {
     await request('/api/data-views', {

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import DataViewsPage from './DataViewsPage';
 import type { ConnectionSummary } from './api';
@@ -26,8 +26,8 @@ describe('DataViewsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: /Add data view/ }));
     fireEvent.change(screen.getByLabelText('Data view name'), { target: { value: 'Application logs' } });
     fireEvent.change(screen.getByLabelText('Connection'), { target: { value: 'logs-source' } });
-    await screen.findByRole('option', { name: 'logs' });
-    fireEvent.change(screen.getByLabelText('Index / table'), { target: { value: 'logs' } });
+    fireEvent.click(screen.getByRole('combobox', { name: 'Index / table' }));
+    fireEvent.click(await screen.findByRole('option', { name: 'logs' }));
     await waitFor(() => expect(screen.getByLabelText('Time series time field')).toHaveValue('timestamp'));
     expect(screen.queryByRole('option', { name: /message/ })).not.toBeInTheDocument();
   }
@@ -106,12 +106,46 @@ describe('DataViewsPage', () => {
     render(<DataViewsPage connections={connections} dataViews={[]} onDataViewsChange={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: /Add data view/ }));
     fireEvent.change(screen.getByLabelText('Connection'), { target: { value: 'logs-source' } });
-    await screen.findByRole('option', { name: 'logs' });
-    fireEvent.change(screen.getByLabelText('Index / table'), { target: { value: 'logs' } });
+    fireEvent.click(screen.getByRole('combobox', { name: 'Index / table' }));
+    fireEvent.click(await screen.findByRole('option', { name: 'logs' }));
     expect(await screen.findByRole('option', { name: 'backend_time · custom_timestamp' })).toBeInTheDocument();
     expect(screen.getByLabelText('Time series time field')).toHaveValue('backend_time');
     expect(screen.getByRole('option', { name: 'legacy_time · Nullable(DateTime64(3))' })).toBeInTheDocument();
     expect(screen.queryByRole('option', { name: 'not_time · date' })).not.toBeInTheDocument();
+  });
+
+  it('searches large index lists, bounds rendered options, and selects with the keyboard', async () => {
+    const defaultFetch = vi.mocked(fetch).getMockImplementation()!;
+    const indices = Array.from({ length: 600 }, (_, index) => ({ name: `logs-app-${String(index).padStart(3, '0')}`, document_count: String(index * 1000), health: index % 2 ? 'yellow' : 'green' }));
+    vi.mocked(fetch).mockImplementation(async (input, init) => String(input).endsWith('/indices')
+      ? { ok: true, status: 200, json: async () => ({ indices: [{ name: 'metrics-system', document_count: '5', health: 'green' }, ...indices] }) } as Response
+      : defaultFetch(input, init));
+    render(<DataViewsPage connections={connections} dataViews={[]} onDataViewsChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /Add data view/ }));
+    const picker = screen.getByRole('combobox', { name: 'Index / table' });
+    expect(picker).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('Connection'), { target: { value: 'logs-source' } });
+    fireEvent.click(picker);
+    await screen.findByRole('option', { name: 'logs-app-000' });
+    expect(screen.queryByRole('option', { name: 'metrics-system' })).not.toBeInTheDocument();
+    expect(within(screen.getByRole('listbox')).getAllByRole('option')).toHaveLength(200);
+    expect(screen.getByText(/601 of 601 · showing first 200/)).toBeInTheDocument();
+    fireEvent.change(picker, { target: { value: 'app 05' } });
+    expect(screen.getByText('16 of 601')).toBeInTheDocument();
+    fireEvent.change(picker, { target: { value: 'app-05' } });
+    expect(within(screen.getByRole('listbox')).getAllByRole('option')).toHaveLength(10);
+    expect(screen.getByText('10 of 601')).toBeInTheDocument();
+    fireEvent.keyDown(picker, { key: 'ArrowDown' });
+    expect(picker).toHaveAttribute('aria-activedescendant', screen.getByRole('option', { name: 'logs-app-051' }).id);
+    fireEvent.keyDown(picker, { key: 'Enter' });
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+    expect(picker).toHaveValue('logs-app-051');
+    await waitFor(() => expect(screen.getByLabelText('Time series time field')).toHaveValue('timestamp'));
+    fireEvent.click(picker);
+    fireEvent.change(picker, { target: { value: 'no-such-index' } });
+    expect(screen.getByText('No matches')).toBeInTheDocument();
+    fireEvent.keyDown(picker, { key: 'Escape' });
+    expect(picker).toHaveValue('logs-app-051');
   });
 
   it('refreshes saved views only after successful server validation', async () => {

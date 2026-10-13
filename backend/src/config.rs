@@ -1,14 +1,26 @@
-use std::{env, net::SocketAddr};
+use std::{
+    env, fs,
+    io::Write,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use crate::storage::{validate_encryption_key, PersistenceOptions, StorageOptions};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use thiserror::Error;
 use url::Url;
+
+const QUICKSTART_DATA_DIRECTORY: &str = "investigenie_data";
+const QUICKSTART_KEY_FILE: &str = "encryption.key";
 
 #[derive(Clone)]
 pub struct Settings {
     pub bind: SocketAddr,
     pub web_origin: String,
     pub storage: PersistenceOptions,
+    pub web_dir: Option<PathBuf>,
+    /// No storage settings were supplied, so a local filesystem store with a generated key is used.
+    pub quickstart: bool,
 }
 
 #[derive(Debug, Error)]
@@ -27,6 +39,8 @@ pub enum ConfigError {
     BindAddress,
     #[error("WEB_ORIGIN must be a valid HTTP or HTTPS origin")]
     WebOrigin,
+    #[error("Could not create or read the quickstart encryption key in {0}")]
+    QuickstartKey(String),
 }
 
 impl Settings {
@@ -50,13 +64,75 @@ impl Settings {
             return Err(ConfigError::WebOrigin);
         }
 
-        let storage = persistence_from_values(|name| env::var(name).ok())?;
+        let storage_configured = ["PERSISTENCE_MODE", "CONFIG_ENCRYPTION_KEY", "DATABASE_URL"]
+            .iter()
+            .any(|name| env::var(name).is_ok_and(|value| !value.trim().is_empty()));
+        let storage = if storage_configured {
+            persistence_from_values(|name| env::var(name).ok())?
+        } else {
+            quickstart_storage(&application_directory().join(QUICKSTART_DATA_DIRECTORY))?
+        };
+        let web_dir = match env::var("WEB_DIR") {
+            Ok(path) if !path.trim().is_empty() => Some(PathBuf::from(path)),
+            _ => Some(application_directory().join("web"))
+                .filter(|directory| directory.join("index.html").is_file()),
+        };
         Ok(Self {
             bind,
             web_origin,
             storage,
+            web_dir,
+            quickstart: !storage_configured,
         })
     }
+}
+
+/// Directory containing the executable, so double-click and other-cwd launches find bundled files.
+fn application_directory() -> PathBuf {
+    env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn quickstart_storage(directory: &Path) -> Result<PersistenceOptions, ConfigError> {
+    let failure = || ConfigError::QuickstartKey(directory.display().to_string());
+    let key_path = directory.join(QUICKSTART_KEY_FILE);
+    let key = match fs::read_to_string(&key_path) {
+        Ok(existing) => existing.trim().to_owned(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut directories = fs::DirBuilder::new();
+            directories.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                directories.mode(0o700);
+            }
+            directories.create(directory).map_err(|_| failure())?;
+            let mut bytes = [0u8; 32];
+            getrandom::getrandom(&mut bytes).map_err(|_| failure())?;
+            let key = STANDARD.encode(bytes);
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options
+                .open(&key_path)
+                .and_then(|mut file| file.write_all(key.as_bytes()))
+                .map_err(|_| failure())?;
+            key
+        }
+        Err(_) => return Err(failure()),
+    };
+    validate_encryption_key(&key, "v1").map_err(|_| ConfigError::Encryption)?;
+    Ok(PersistenceOptions::Filesystem {
+        path: directory.to_path_buf(),
+        key,
+        key_id: "v1".to_owned(),
+    })
 }
 
 fn persistence_from_values(
@@ -104,7 +180,31 @@ fn persistence_from_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    #[test]
+    fn quickstart_generates_a_key_once_and_reuses_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path().join("data");
+        let PersistenceOptions::Filesystem { path, key, key_id } =
+            quickstart_storage(&store).unwrap()
+        else {
+            panic!("quickstart uses filesystem storage");
+        };
+        assert_eq!(path, store);
+        assert_eq!(key_id, "v1");
+        assert!(validate_encryption_key(&key, "v1").is_ok());
+        let PersistenceOptions::Filesystem { key: reused, .. } =
+            quickstart_storage(&store).unwrap()
+        else {
+            panic!("quickstart uses filesystem storage");
+        };
+        assert_eq!(reused, key);
+        fs::write(store.join(QUICKSTART_KEY_FILE), "corrupt").unwrap();
+        assert!(matches!(
+            quickstart_storage(&store),
+            Err(ConfigError::Encryption)
+        ));
+    }
 
     fn parse(values: &[(&str, &str)]) -> Result<PersistenceOptions, ConfigError> {
         persistence_from_values(|name| {

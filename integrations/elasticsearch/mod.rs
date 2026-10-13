@@ -9,6 +9,7 @@ use thiserror::Error;
 use crate::integrations::IntegrationDescriptor;
 pub use crate::integrations::{FieldSummary, IndexSummary};
 pub use crate::search::SearchRequest;
+use crate::search::{BreakdownCount, HistogramOptions, BREAKDOWN_OTHER_KEY, MAX_BREAKDOWN_VALUES};
 mod connector;
 pub use connector::connect;
 
@@ -90,11 +91,24 @@ struct SearchEnvelope {
 #[derive(Debug, Deserialize)]
 struct SearchAggregations {
     documents_over_time: Option<AutoDateHistogram>,
+    breakdown_values: Option<BreakdownTerms>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AutoDateHistogram {
     buckets: Vec<ElasticsearchHistogramBucket>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BreakdownTerms {
+    buckets: Vec<BreakdownTermBucket>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BreakdownTermBucket {
+    key: Value,
+    key_as_string: Option<String>,
+    over_time: AutoDateHistogram,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +155,8 @@ pub struct SearchResult {
     pub total_relation: String,
     pub hits: Vec<SearchHit>,
     pub histogram: Vec<HistogramBucket>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub histogram_interval: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -148,6 +164,8 @@ pub struct HistogramBucket {
     pub timestamp: i64,
     pub label: Option<String>,
     pub count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breakdown: Option<Vec<BreakdownCount>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -298,6 +316,9 @@ impl ElasticsearchClient {
     pub async fn search(&self, request: SearchRequest) -> Result<SearchResult, ElasticsearchError> {
         validate_index(&request.index)?;
         validate_search(&request)?;
+        let histogram_options = request
+            .histogram_options()
+            .map_err(|_| ElasticsearchError::InvalidIndex)?;
 
         let query = if request.query.trim().is_empty() {
             json!({ "match_all": {} })
@@ -342,14 +363,7 @@ impl ElasticsearchClient {
             request.include_histogram.unwrap_or(true)
                 && request.cursor.as_deref().is_none_or(str::is_empty)
         }) {
-            body["aggs"] = json!({
-                "documents_over_time": {
-                    "auto_date_histogram": {
-                        "field": field,
-                        "buckets": 40
-                    }
-                }
-            });
+            body["aggs"] = histogram_aggregations(field, &request, &histogram_options);
         }
         let mut pit_id = None;
         let url = if let Some(token) = request.cursor.as_deref() {
@@ -451,20 +465,13 @@ impl ElasticsearchClient {
             Some(TotalHits::Count(value)) => (value, "eq".to_owned()),
             None => (0, "eq".to_owned()),
         };
+        let histogram_interval = histogram_options
+            .interval
+            .filter(|_| envelope.aggregations.is_some())
+            .map(|interval| format!("{}{}", interval.count, interval.suffix()));
         let histogram = envelope
             .aggregations
-            .and_then(|aggregations| aggregations.documents_over_time)
-            .map(|aggregation| {
-                aggregation
-                    .buckets
-                    .into_iter()
-                    .map(|bucket| HistogramBucket {
-                        timestamp: bucket.key,
-                        label: bucket.key_as_string,
-                        count: bucket.doc_count,
-                    })
-                    .collect()
-            })
+            .map(histogram_buckets)
             .unwrap_or_default();
 
         Ok(SearchResult {
@@ -475,6 +482,7 @@ impl ElasticsearchClient {
             total_relation,
             hits: envelope.hits.hits,
             histogram,
+            histogram_interval,
         })
     }
 
@@ -516,6 +524,83 @@ impl ElasticsearchClient {
         drop(path);
         Ok(url)
     }
+}
+
+fn histogram_aggregations(field: &str, request: &SearchRequest, options: &HistogramOptions) -> Value {
+    let over_time = match (options.interval, request.time_range) {
+        (Some(interval), Some(range)) => {
+            let kind = if interval.is_calendar() { "calendar_interval" } else { "fixed_interval" };
+            json!({ "date_histogram": {
+                "field": field,
+                (kind): format!("{}{}", interval.count, interval.suffix()),
+                "time_zone": options.time_zone,
+                "min_doc_count": 0,
+                "extended_bounds": { "min": range.start, "max": range.end }
+            } })
+        }
+        _ if options.time_zone != "UTC" => {
+            json!({ "auto_date_histogram": { "field": field, "buckets": 40, "time_zone": options.time_zone } })
+        }
+        _ => json!({ "auto_date_histogram": { "field": field, "buckets": 40 } }),
+    };
+    let mut aggregations = json!({ "documents_over_time": over_time.clone() });
+    // Automatic intervals can differ per sub-bucket, so breakdowns need an explicit interval.
+    if let (Some(breakdown), Some(_)) = (options.breakdown_field.as_deref(), options.interval) {
+        aggregations["breakdown_values"] = json!({
+            "terms": { "field": breakdown, "size": MAX_BREAKDOWN_VALUES },
+            "aggs": { "over_time": over_time }
+        });
+    }
+    aggregations
+}
+
+fn histogram_buckets(aggregations: SearchAggregations) -> Vec<HistogramBucket> {
+    let Some(histogram) = aggregations.documents_over_time else {
+        return Vec::new();
+    };
+    let breakdown = aggregations.breakdown_values.map(|terms| {
+        terms
+            .buckets
+            .into_iter()
+            .map(|bucket| {
+                let key = bucket.key_as_string.unwrap_or_else(|| match bucket.key {
+                    Value::String(key) => key,
+                    other => other.to_string(),
+                });
+                let counts = bucket
+                    .over_time
+                    .buckets
+                    .into_iter()
+                    .map(|time| (time.key, time.doc_count))
+                    .collect::<std::collections::HashMap<_, _>>();
+                (key, counts)
+            })
+            .collect::<Vec<_>>()
+    });
+    histogram
+        .buckets
+        .into_iter()
+        .map(|bucket| HistogramBucket {
+            breakdown: breakdown.as_ref().map(|values| {
+                let mut counts = values
+                    .iter()
+                    .map(|(key, counts)| BreakdownCount {
+                        key: key.clone(),
+                        count: counts.get(&bucket.key).copied().unwrap_or(0),
+                    })
+                    .collect::<Vec<_>>();
+                let listed: u64 = counts.iter().map(|value| value.count).sum();
+                counts.push(BreakdownCount {
+                    key: BREAKDOWN_OTHER_KEY.to_owned(),
+                    count: bucket.doc_count.saturating_sub(listed),
+                });
+                counts
+            }),
+            timestamp: bucket.key,
+            label: bucket.key_as_string,
+            count: bucket.doc_count,
+        })
+        .collect()
 }
 
 fn authorization_header(value: String) -> Result<header::HeaderMap, ElasticsearchError> {
@@ -904,6 +989,7 @@ mod tests {
             sort_order: Some("desc".to_owned()),
             histogram_field: Some("@timestamp".to_owned()),
             time_range: None,
+            ..Default::default()
         };
         assert!(validate_search(&valid).is_ok());
 
@@ -996,6 +1082,7 @@ mod tests {
                 start: 1000,
                 end: 2000,
             }),
+            ..Default::default()
         };
         request.time_range = Some(crate::search::TimeRange {
             start: 2000,
@@ -1010,6 +1097,64 @@ mod tests {
             .search(request)
             .await
             .expect("filtered search succeeds");
+    }
+
+    #[tokio::test]
+    async fn fixed_interval_histograms_use_timezone_bounds_and_break_down_top_values() {
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(|request: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("JSON search body");
+                let over_time = &body["aggs"]["documents_over_time"]["date_histogram"];
+                over_time["fixed_interval"] == "1m"
+                    && over_time["time_zone"] == "Europe/Berlin"
+                    && over_time["min_doc_count"] == 0
+                    && over_time["extended_bounds"] == json!({"min": 0, "max": 120000})
+                    && body["aggs"]["breakdown_values"]["terms"]
+                        == json!({"field": "service", "size": 3})
+                    && body["aggs"]["breakdown_values"]["aggs"]["over_time"]
+                        == body["aggs"]["documents_over_time"]
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "hits": {"total": {"value": 7, "relation": "eq"}, "hits": []},
+                "aggregations": {
+                    "documents_over_time": {"buckets": [
+                        {"key": 0, "doc_count": 5}, {"key": 60000, "doc_count": 2}
+                    ]},
+                    "breakdown_values": {"buckets": [
+                        {"key": "api", "doc_count": 4, "over_time": {"buckets": [{"key": 0, "doc_count": 3}, {"key": 60000, "doc_count": 1}]}},
+                        {"key": 500, "doc_count": 1, "over_time": {"buckets": [{"key": 0, "doc_count": 1}]}}
+                    ]}
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = ElasticsearchClient::new(ElasticsearchSettings {
+            url: Url::parse(&server.uri()).expect("mock URL"),
+            authentication: None,
+            tls_insecure: false,
+        })
+        .expect("valid client");
+        let request: SearchRequest = serde_json::from_value(json!({
+            "index": "logs", "histogram_field": "@timestamp", "histogram_interval": "1m",
+            "histogram_breakdown_field": "service", "time_zone": "Europe/Berlin",
+            "time_range": {"start": 0, "end": 120000}
+        }))
+        .unwrap();
+        let result = client.search(request).await.expect("histogram search succeeds");
+        assert_eq!(result.histogram_interval.as_deref(), Some("1m"));
+        let first = serde_json::to_value(&result.histogram[0]).unwrap();
+        assert_eq!(
+            first["breakdown"],
+            json!([{"key":"api","count":3},{"key":"500","count":1},{"key":"__other__","count":1}])
+        );
+        let second = serde_json::to_value(&result.histogram[1]).unwrap();
+        assert_eq!(
+            second["breakdown"],
+            json!([{"key":"api","count":1},{"key":"500","count":0},{"key":"__other__","count":1}])
+        );
     }
 
     #[tokio::test]
@@ -1077,6 +1222,7 @@ mod tests {
                 sort_order: None,
                 histogram_field: Some("@timestamp".to_owned()),
                 time_range: None,
+                ..Default::default()
             })
             .await
             .expect("mocked search succeeds");

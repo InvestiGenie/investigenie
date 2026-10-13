@@ -13,6 +13,7 @@ fn state(storage: Storage) -> AppState {
         storage,
         upstream_slots: Arc::new(Semaphore::new(4)),
         ai_slots: Arc::new(Semaphore::new(4)),
+        investigations: Arc::default(),
     }
 }
 
@@ -250,6 +251,168 @@ async fn ai_investigation_plans_queries_and_returns_only_cited_evidence() {
 }
 
 #[tokio::test]
+async fn bundled_web_ui_is_served_same_origin_without_shadowing_api_routes() {
+    let (_directory, storage) = status_storage().await;
+    let web = tempfile::tempdir().unwrap();
+    std::fs::write(
+        web.path().join("index.html"),
+        "<html>InvestiGenie UI</html>",
+    )
+    .unwrap();
+    std::fs::create_dir(web.path().join("assets")).unwrap();
+    std::fs::write(
+        web.path().join("assets").join("app.js"),
+        "console.log('ui')",
+    )
+    .unwrap();
+    let app = with_web(
+        router("http://localhost:5173".parse().unwrap(), storage),
+        web.path(),
+    );
+    let fetch = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+    let (status, body) = fetch("/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("InvestiGenie UI"));
+    assert_eq!(
+        fetch("/assets/app.js").await,
+        (StatusCode::OK, "console.log('ui')".to_owned())
+    );
+    assert!(fetch("/explore/anything")
+        .await
+        .1
+        .contains("InvestiGenie UI"));
+    assert!(!fetch("/../Cargo.toml").await.1.contains("[package]"));
+    let (status, body) = fetch("/api/not-a-route").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("not_found"));
+    assert_eq!(fetch("/api/health/live").await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn background_investigations_validate_controls_poll_status_and_reject_unknown_ids() {
+    let (_directory, storage) = status_storage().await;
+    let model = storage
+        .create_ai_model(StoredAiModel {
+            id: String::new(),
+            revision: String::new(),
+            name: "Background".to_owned(),
+            api_url: "http://127.0.0.1:9/v1".to_owned(),
+            api_key: "unused".to_owned(),
+            model: "test-model".to_owned(),
+        })
+        .await
+        .unwrap();
+    let app = router("http://localhost:5173".parse().unwrap(), storage);
+    let get = |uri: String| {
+        axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    async fn body(response: Response) -> Value {
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    for controls in [
+        json!({"ai_timeout_seconds": 1}),
+        json!({"time_budget_seconds": 5}),
+    ] {
+        let mut request =
+            json!({"question":"Errors?","data_view_ids":["missing-view"],"ai_model_id":model.id});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(controls.as_object().unwrap().clone());
+        let response = app
+            .clone()
+            .oneshot(json_request("/api/ai/investigations", request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "/api/ai/investigations",
+            json!({"question":"Errors?","data_view_ids":["missing-view"],"ai_model_id":model.id,"ai_timeout_seconds":30,"time_budget_seconds":60}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let started = body(response).await;
+    let id = started["investigation"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(started["investigation"]["time_budget_seconds"], 60);
+    let mut snapshot = Value::Null;
+    for _ in 0..200 {
+        snapshot = body(
+            app.clone()
+                .oneshot(get(format!("/api/ai/investigations/{id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        if snapshot["investigation"]["status"] == "failed" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(snapshot["investigation"]["status"], "failed", "{snapshot}");
+    assert_eq!(
+        snapshot["investigation"]["error"]["code"],
+        "invalid_investigation"
+    );
+    let late = app
+        .clone()
+        .oneshot(json_request(
+            &format!("/api/ai/investigations/{id}/decision"),
+            json!({"action":"continue"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(late.status(), StatusCode::CONFLICT);
+
+    let missing = app
+        .clone()
+        .oneshot(get("/api/ai/investigations/unknown".to_owned()))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let missing = app
+        .oneshot(json_request(
+            "/api/ai/investigations/unknown/decision",
+            json!({"action":"terminate"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn ai_investigation_scans_all_cursor_batches_and_retains_later_evidence() {
     assert_ai_investigation_cursor_batches(true).await;
 }
@@ -384,10 +547,13 @@ async fn assert_ai_investigation_cursor_batches(multiple_pages: bool) {
         }).to_string();
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/v1/chat/completions"))
-            .and(matchers::body_string_contains("Analyze only the provided records."))
+            .and(matchers::body_string_contains(
+                "Analyze only the provided records.",
+            ))
             .and(|request: &wiremock::Request| {
                 let body: Value = serde_json::from_slice(&request.body).unwrap();
-                let input: Value = serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+                let input: Value =
+                    serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
                 input["sources"][0]["records_examined"] == 102
             })
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -445,34 +611,78 @@ async fn assert_ai_investigation_cursor_batches(multiple_pages: bool) {
         json!(["event-1", "event-2"])
     );
     assert_eq!(body["sources"][0]["records_examined"], records_examined);
-    assert_eq!(body["sources"][0]["batches_processed"], if multiple_pages { 2 } else { 1 });
-    assert!(body["sources"][0]["query_summary"].as_str().unwrap().contains("1791630000000 to 1791633600000"));
-    assert_eq!(body["token_usage"][0], json!({"stage":"planning","prompt_tokens":210,"completion_tokens":44,"total_tokens":254}));
+    assert_eq!(
+        body["sources"][0]["batches_processed"],
+        if multiple_pages { 2 } else { 1 }
+    );
+    assert!(body["sources"][0]["query_summary"]
+        .as_str()
+        .unwrap()
+        .contains("1791630000000 to 1791633600000"));
+    assert_eq!(
+        body["token_usage"][0],
+        json!({"stage":"planning","prompt_tokens":210,"completion_tokens":44,"total_tokens":254})
+    );
     let analysis_calls = 1;
     assert_eq!(body["token_usage"].as_array().unwrap().len(), 2);
-    assert_eq!(body["token_usage"][1], json!({"stage":"analysis","prompt_tokens":420 * analysis_calls,"completion_tokens":96 * analysis_calls,"total_tokens":516 * analysis_calls}));
-    for secret in ["source-private-user", "source-private-password", "test-provider-secret"] {
+    assert_eq!(
+        body["token_usage"][1],
+        json!({"stage":"analysis","prompt_tokens":420 * analysis_calls,"completion_tokens":96 * analysis_calls,"total_tokens":516 * analysis_calls})
+    );
+    for secret in [
+        "source-private-user",
+        "source-private-password",
+        "test-provider-secret",
+    ] {
         assert!(!body.to_string().contains(secret));
     }
     let provider_requests = provider.received_requests().await.unwrap();
     assert_eq!(provider_requests.len(), 1 + analysis_calls as usize);
-    let analysis_inputs = provider_requests.iter()
+    let analysis_inputs = provider_requests
+        .iter()
         .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
-        .filter(|request| request["messages"][0]["content"].as_str().unwrap().contains("Analyze only the provided records."))
-        .map(|request| serde_json::from_str::<Value>(request["messages"][1]["content"].as_str().unwrap()).unwrap())
+        .filter(|request| {
+            request["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Analyze only the provided records.")
+        })
+        .map(|request| {
+            serde_json::from_str::<Value>(request["messages"][1]["content"].as_str().unwrap())
+                .unwrap()
+        })
         .collect::<Vec<_>>();
     assert_eq!(analysis_inputs.len(), analysis_calls as usize);
     assert!(analysis_inputs[0]["previous_findings"].is_null());
-    let first_examples = analysis_inputs[0]["sources"][0]["examples"].as_array().unwrap();
-    assert!(first_examples.iter().any(|example| example["record_id"] == "event-1"));
-    assert!(first_examples.iter().any(|example| example["record_id"] == "event-2"));
-    assert!(first_examples.iter().filter(|example| ["event-1", "event-2", "event-3"].contains(&example["record_id"].as_str().unwrap())).all(|example| example["observed_duplicate_count"] == first_page_size));
+    let first_examples = analysis_inputs[0]["sources"][0]["examples"]
+        .as_array()
+        .unwrap();
+    assert!(first_examples
+        .iter()
+        .any(|example| example["record_id"] == "event-1"));
+    assert!(first_examples
+        .iter()
+        .any(|example| example["record_id"] == "event-2"));
+    assert!(first_examples
+        .iter()
+        .filter(|example| ["event-1", "event-2", "event-3"]
+            .contains(&example["record_id"].as_str().unwrap()))
+        .all(|example| example["observed_duplicate_count"] == first_page_size));
     if multiple_pages {
         assert!(body["sources"][0]["records_examined"].as_u64().unwrap() > 100);
-        assert_eq!(body["findings"][1]["title"], "Payment authorization rejected");
-        assert_eq!(body["findings"][1]["evidence"][0]["record_ids"], json!(["event-101", "event-102"]));
-        let later_ids = first_examples.iter().filter(|example| example["observed_duplicate_count"] == 2)
-            .map(|example| example["record_id"].as_str().unwrap()).collect::<Vec<_>>();
+        assert_eq!(
+            body["findings"][1]["title"],
+            "Payment authorization rejected"
+        );
+        assert_eq!(
+            body["findings"][1]["evidence"][0]["record_ids"],
+            json!(["event-101", "event-102"])
+        );
+        let later_ids = first_examples
+            .iter()
+            .filter(|example| example["observed_duplicate_count"] == 2)
+            .map(|example| example["record_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(later_ids, vec!["event-101", "event-102"]);
     }
     let all_provider_input = provider_requests
@@ -1271,6 +1481,7 @@ async fn api_preserves_redaction_authentication_preconditions_and_capacity() {
         storage: database.storage.clone(),
         upstream_slots: Arc::new(Semaphore::new(1)),
         ai_slots: Arc::new(Semaphore::new(1)),
+        investigations: Arc::default(),
     };
     let permit = acquire(&single).await.unwrap();
     assert!(matches!(

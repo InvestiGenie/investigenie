@@ -1,89 +1,120 @@
-import { render } from '@testing-library/react';
-import type { ReactNode } from 'react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, within } from '@testing-library/react';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import HistogramChart from './HistogramChart';
+import { bucketEnd, countTicks, describeInterval, resolveInterval, tickLabel, timeTicks } from './histogram';
 
-const chartMocks = vi.hoisted(() => ({ axis: vi.fn(), chart: vi.fn(), tooltip: vi.fn() }));
+const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
+// Default chart size in jsdom: 640 wide, 46px left margin and 12px right margin.
+const PLOT_LEFT = 46;
+const PLOT_WIDTH = 640 - 46 - 12;
 
-vi.mock('recharts', () => ({
-  ResponsiveContainer: ({ children }: { children: ReactNode }) => children,
-  BarChart: (props: { children: ReactNode }) => {
-    chartMocks.chart(props);
-    return <div>{props.children}</div>;
-  },
-  XAxis: (props: unknown) => { chartMocks.axis(props); return null; },
-  YAxis: () => null,
-  CartesianGrid: () => null,
-  Tooltip: (props: unknown) => { chartMocks.tooltip(props); return null; },
-  Bar: () => null,
-}));
+beforeAll(() => {
+  if (!window.PointerEvent) Object.defineProperty(window, 'PointerEvent', { value: MouseEvent, configurable: true });
+});
+
+describe('histogram intervals', () => {
+  it('picks Kibana-like automatic intervals near 50 bars', () => {
+    expect(resolveInterval('auto', { start: 0, end: 15 * MINUTE })).toEqual({ interval: '30s', scaled: false });
+    expect(resolveInterval('auto', { start: 0, end: HOUR })).toEqual({ interval: '1m', scaled: false });
+    expect(resolveInterval('auto', { start: 0, end: DAY })).toEqual({ interval: '30m', scaled: false });
+    expect(resolveInterval('auto', { start: 0, end: 7 * DAY })).toEqual({ interval: '3h', scaled: false });
+  });
+
+  it('keeps fixed intervals that fit and scales those that create too many buckets', () => {
+    expect(resolveInterval('1h', { start: 0, end: DAY })).toEqual({ interval: '1h', scaled: false });
+    expect(resolveInterval('1m', { start: 0, end: 7 * DAY })).toEqual({ interval: '3h', scaled: true });
+    expect(describeInterval('3h')).toBe('3 hours');
+    expect(describeInterval('1M')).toBe('1 month');
+  });
+
+  it('ends calendar buckets on calendar boundaries in the display timezone', () => {
+    const february = Date.parse('2026-01-31T23:00:00Z');
+    expect(bucketEnd(february, '1M', 'Europe/Berlin')).toBe(Date.parse('2026-02-28T23:00:00Z'));
+    expect(bucketEnd(0, '30s', 'UTC')).toBe(30_000);
+  });
+
+  it('aligns ticks to local wall-clock boundaries and labels date changes', () => {
+    const start = Date.parse('2026-10-06T00:00:00Z');
+    const { ticks, step } = timeTicks(start, start + 6 * HOUR, 600, 'Asia/Kolkata');
+    expect(step).toBe(2 * HOUR);
+    expect(ticks.length).toBeGreaterThan(1);
+    expect(ticks.every((tick) => (tick + 5.5 * HOUR) % step === 0)).toBe(true);
+    const [, firstDate] = tickLabel(ticks[0], null, step, 'UTC');
+    const [, sameDay] = tickLabel(ticks[1], ticks[0], step, 'UTC');
+    expect(firstDate).not.toBeNull();
+    expect(sameDay).toBeNull();
+    expect(countTicks(7)).toEqual([0, 2, 4, 6, 8]);
+  });
+});
 
 describe('HistogramChart', () => {
-  beforeEach(() => vi.clearAllMocks());
+  const start = Date.parse('2026-10-06T08:00:00Z');
+  const range = { start: start + 30_000, end: start + 10 * MINUTE };
+  const data = [
+    { timestamp: start, label: null, count: 4 },
+    { timestamp: start + 5 * MINUTE, label: null, count: 9 },
+  ];
 
-  it('aligns ticks with sorted buckets and leaves half a bucket beyond both edges', () => {
-    const timestamps = [1_791_417_600_000, 1_791_417_660_000, 1_791_417_780_000];
-    const data = [timestamps[2], timestamps[0], timestamps[1]].map((timestamp) => ({ timestamp, count: 1, label: null }));
-    render(<HistogramChart data={data} />);
-    expect(chartMocks.axis.mock.calls[0][0]).toMatchObject({
-      ticks: timestamps,
-      domain: [timestamps[0] - 30_000, timestamps[2] + 30_000],
-      interval: 'preserveStartEnd',
-      padding: { left: 36, right: 36 },
-    });
-    expect(chartMocks.chart.mock.calls[0][0].data.map((bucket: { timestamp: number }) => bucket.timestamp)).toEqual(timestamps);
-    expect(data[0].timestamp).toBe(timestamps[2]);
+  function interaction(container: HTMLElement) {
+    return container.querySelector('.histogram-interaction') as SVGRectElement;
+  }
+
+  it('draws one bar per bucket across the full selected window and marks partial buckets', () => {
+    const { container } = render(<HistogramChart data={data} interval="5m" timeRange={range} now={0} />);
+    expect(screen.getByRole('img', { name: 'Document counts over time' })).toBeInTheDocument();
+    const bars = container.querySelectorAll('.histogram-bar');
+    expect(bars).toHaveLength(2);
+    expect(bars[0]).toHaveClass('partial');
+    expect(bars[1]).not.toHaveClass('partial');
+    expect(container.querySelector('.histogram-now')).toBeNull();
   });
 
-  it('gives a single bucket a nonzero time domain', () => {
-    render(<HistogramChart data={[{ timestamp: 60_000, count: 1, label: null }]} />);
-    expect(chartMocks.axis.mock.calls[0][0].domain).toEqual([30_000, 90_000]);
+  it('shows the current-time marker when now is inside the window', () => {
+    const { container } = render(<HistogramChart data={data} interval="5m" timeRange={range} now={start + 7 * MINUTE} />);
+    expect(container.querySelector('.histogram-now')).not.toBeNull();
   });
 
-  it('shows the full selected week with no matching records', () => {
-    const start = Date.parse('2026-10-01T00:00:00Z');
-    const end = Date.parse('2026-10-08T00:00:00Z');
-    render(<HistogramChart data={[]} timeRange={{ start, end }} />);
-    expect(chartMocks.axis.mock.calls[0][0]).toMatchObject({ domain: [start, end], allowDataOverflow: true, padding: { left: 0, right: 0 } });
-    expect(chartMocks.axis.mock.calls[0][0].ticks).toEqual([start, start + (end - start) / 4, start + (end - start) / 2, start + (end - start) * 3 / 4, end]);
-    expect(chartMocks.chart.mock.calls[0][0].data).toEqual([]);
+  it('shows bucket range, count, breakdown, and partial-data notes on hover', () => {
+    const stacked = data.map((bucket) => ({ ...bucket, breakdown: [{ key: 'api', count: bucket.count - 1 }, { key: '__other__', count: 1 }] }));
+    const { container } = render(<HistogramChart data={stacked} interval="5m" timeRange={range} timeZone="UTC" now={0} />);
+    expect(within(screen.getByRole('list', { name: 'Breakdown legend' })).getAllByRole('listitem').map((item) => item.textContent)).toEqual(['api', 'Other']);
+    expect(container.querySelectorAll('.histogram-bar')[1].querySelectorAll('rect')).toHaveLength(2);
+    fireEvent.pointerMove(interaction(container), { clientX: PLOT_LEFT + 5 });
+    const tooltip = screen.getByRole('tooltip');
+    expect(tooltip).toHaveTextContent('Documents4');
+    expect(tooltip).toHaveTextContent('api3');
+    expect(tooltip).toHaveTextContent('Other1');
+    expect(tooltip).toHaveTextContent('Partial bucket');
+    fireEvent.pointerLeave(interaction(container));
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
   });
 
-  it('keeps a single matching bucket inside the selected week without narrowing the axis', () => {
-    const start = Date.parse('2026-10-01T00:00:00Z');
-    const end = Date.parse('2026-10-08T00:00:00Z');
-    const data = [{ timestamp: start + 2 * 86_400_000, count: 1, label: null }];
-    render(<HistogramChart data={data} timeRange={{ start, end }} />);
-    expect(chartMocks.axis.mock.calls[0][0].domain).toEqual([start, end]);
-    expect(chartMocks.chart.mock.calls[0][0].data).toEqual(data);
+  it('zooms to a dragged selection', () => {
+    const onBrush = vi.fn();
+    const { container } = render(<HistogramChart data={data} interval="5m" timeRange={range} onBrush={onBrush} now={0} />);
+    fireEvent.pointerDown(interaction(container), { clientX: PLOT_LEFT, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(interaction(container), { clientX: PLOT_LEFT + PLOT_WIDTH / 2, pointerId: 1 });
+    expect(container.querySelector('.histogram-brush')).not.toBeNull();
+    fireEvent.pointerUp(interaction(container), { clientX: PLOT_LEFT + PLOT_WIDTH / 2, pointerId: 1 });
+    const middle = range.start + (range.end - range.start) / 2;
+    expect(onBrush).toHaveBeenCalledWith({ start: range.start, end: Math.round(middle) });
+    expect(container.querySelector('.histogram-brush')).toBeNull();
   });
 
-  it('includes seconds when adjacent buckets are less than a minute apart', () => {
-    render(<HistogramChart data={[{ timestamp: 60_000, count: 1, label: null }, { timestamp: 90_000, count: 2, label: null }]} />);
-    const formatter = chartMocks.axis.mock.calls[0][0].tickFormatter;
-    expect(formatter(60_000)).not.toBe(formatter(90_000));
+  it('zooms into a clicked bucket clipped to the selected window', () => {
+    const onBrush = vi.fn();
+    const { container } = render(<HistogramChart data={data} interval="5m" timeRange={range} onBrush={onBrush} now={0} />);
+    fireEvent.pointerDown(interaction(container), { clientX: PLOT_LEFT + 5, button: 0 });
+    fireEvent.pointerUp(interaction(container), { clientX: PLOT_LEFT + 5 });
+    expect(onBrush).toHaveBeenCalledWith({ start: range.start, end: start + 5 * MINUTE - 1 });
   });
 
-  it('formats axis labels and tooltips in UTC rather than the browser timezone', () => {
-    const timestamp = Date.parse('2026-10-06T08:19:20Z');
-    render(<HistogramChart data={[{ timestamp, count: 1, label: null }]} />);
-    expect(chartMocks.axis.mock.calls[0][0].tickFormatter(timestamp)).toBe(new Intl.DateTimeFormat(undefined, {
-      timeZone: 'UTC', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
-    }).format(timestamp));
-    expect(chartMocks.tooltip.mock.calls[0][0].labelFormatter(timestamp)).toBe(new Intl.DateTimeFormat(undefined, {
-      timeZone: 'UTC', dateStyle: 'medium', timeStyle: 'long',
-    }).format(timestamp));
-  });
-
-  it('uses the selected timezone in both ticks and tooltips without changing bucket timestamps', () => {
-    const timestamp = Date.parse('2026-10-06T08:18:00Z');
-    render(<HistogramChart data={[{ timestamp, count: 1, label: null }]} timeZone="Europe/Berlin" />);
-    expect(chartMocks.axis.mock.calls[0][0].tickFormatter(timestamp)).toBe(new Intl.DateTimeFormat(undefined, {
-      timeZone: 'Europe/Berlin', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
-    }).format(timestamp));
-    expect(chartMocks.tooltip.mock.calls[0][0].labelFormatter(timestamp)).toBe(new Intl.DateTimeFormat(undefined, {
-      timeZone: 'Europe/Berlin', dateStyle: 'medium', timeStyle: 'long',
-    }).format(timestamp));
-    expect(chartMocks.chart.mock.calls[0][0].data[0].timestamp).toBe(timestamp);
+  it('infers bucket width from spacing when no interval is supplied and stays read-only without onBrush', () => {
+    const { container } = render(<HistogramChart data={[{ timestamp: 60_000, count: 1, label: null }, { timestamp: 90_000, count: 2, label: null }]} now={0} />);
+    expect(container.querySelectorAll('.histogram-bar')).toHaveLength(2);
+    fireEvent.pointerDown(interaction(container), { clientX: PLOT_LEFT + 5, button: 0 });
+    expect(container.querySelector('.histogram-brush')).toBeNull();
   });
 });

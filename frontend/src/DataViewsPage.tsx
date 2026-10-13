@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { api, type ConnectionSummary, type DataViewSummary, type FieldSummary, type IndexSummary } from './api';
+import SearchableSelect from './SearchableSelect';
 
 type DataViewsPageProps = {
   connections: ConnectionSummary[];
@@ -22,6 +23,7 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
   const [index, setIndex] = useState('');
   const [timeField, setTimeField] = useState('');
   const [indices, setIndices] = useState<IndexSummary[]>([]);
+  const [indicesLoading, setIndicesLoading] = useState(false);
   const [fields, setFields] = useState<FieldSummary[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -34,12 +36,16 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
     }
     const controller = new AbortController();
     setIndices([]);
+    setIndicesLoading(true);
     api.indices(connectionId, controller.signal)
       .then((available) => {
-        if (!controller.signal.aborted) setIndices(available);
+        if (!controller.signal.aborted) setIndices([...available].sort((left, right) => left.name.localeCompare(right.name)));
       })
       .catch((reason: unknown) => {
         if (!controller.signal.aborted) setError(errorMessage(reason));
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setIndicesLoading(false);
       });
     return () => controller.abort();
   }, [connectionId, stage]);
@@ -142,7 +148,21 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
           <div className="form-grid">
             <label>Data view name<input required maxLength={64} value={name} onChange={(event) => setName(event.target.value)} placeholder="Application logs" /></label>
             <label>Connection<select required value={connectionId} onChange={(event) => { setConnectionId(event.target.value); setIndex(''); setTimeField(''); setError(''); }}><option value="">Select a connection</option>{connections.map((connection) => <option key={connection.id} value={connection.id}>{connection.name}</option>)}</select></label>
-            <label>Index / table<select required value={index} disabled={!connectionId} onChange={(event) => { setIndex(event.target.value); setTimeField(''); setError(''); }}><option value="">Select an index or table</option>{indices.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>
+            <div className="form-field"><span className="form-field-label" aria-hidden="true">Index / table</span><SearchableSelect
+              label="Index / table"
+              value={index}
+              disabled={!connectionId}
+              loading={indicesLoading}
+              placeholder="Search indices or tables"
+              emptyLabel={connectionId ? 'Select an index or table' : 'Select a connection first'}
+              options={indices.map((item) => ({
+                value: item.name,
+                description: item.document_count ? `${formatCount(item.document_count)} docs` : undefined,
+                badge: item.health ?? undefined,
+                tone: item.health ? `health-${item.health}` : undefined,
+              }))}
+              onChange={(value) => { setIndex(value); setTimeField(''); setError(''); }}
+            /></div>
             <label>Time series time field<select required value={timeField} disabled={!index || fields.filter(isTimeField).length === 0} onChange={(event) => setTimeField(event.target.value)}><option value="">Select a date/time field</option>{fields.filter(isTimeField).map((field) => <option key={field.name} value={field.name}>{field.name} · {field.field_type}</option>)}</select></label>
           </div>
           {index && fields.length > 0 && fields.filter(isTimeField).length === 0 && <p className="connections-empty">The selected source has no date/time fields; this index/table cannot be used for a time-series data view.</p>}
@@ -154,4 +174,9 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
 
 function errorMessage(reason: unknown): string {
   return reason instanceof Error ? reason.message : 'An unexpected request error occurred';
+}
+
+function formatCount(value: string): string {
+  const count = Number(value);
+  return Number.isFinite(count) ? new Intl.NumberFormat(undefined, { notation: 'compact' }).format(count) : value;
 }

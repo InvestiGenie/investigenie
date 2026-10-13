@@ -58,6 +58,58 @@ describe('Discover', () => {
     expect(search.mock.calls.at(-1)?.[1].time_range).toEqual({ start: Date.parse('2026-10-01T00:00:00Z'), end: Date.parse('2026-10-08T00:00:00Z') });
   });
 
+  it('sends Kibana-style interval and breakdown controls, zooms by clicking a bucket, and hides the chart', async () => {
+    if (!window.PointerEvent) Object.defineProperty(window, 'PointerEvent', { value: MouseEvent, configurable: true });
+    clearPreference('histogram-visible');
+    vi.spyOn(api, 'connections').mockResolvedValue([connectionFixture(elasticsearchIntegration)]);
+    vi.spyOn(api, 'dataViews').mockResolvedValue([{ id: 'view', revision: 'r1', name: 'Events', connection_id: 'source', index: 'events', time_field: '@timestamp' }]);
+    vi.spyOn(api, 'fields').mockResolvedValue([
+      { name: '@timestamp', field_type: 'date' }, { name: 'service', field_type: 'keyword' }, { name: 'message', field_type: 'text' },
+    ]);
+    const start = Date.parse('2026-10-06T08:00:00Z');
+    const search = vi.spyOn(api, 'search').mockImplementation(async (_connection, body) => ({
+      took: 1, timed_out: false, total: 3, total_relation: 'eq', hits: [],
+      histogram_interval: body.histogram_interval ?? null,
+      histogram: [{ timestamp: start, label: null, count: 3, ...(body.histogram_breakdown_field ? { breakdown: [{ key: 'api', count: 2 }, { key: '__other__', count: 1 }] } : {}) }],
+    }));
+    renderExplore();
+    await screen.findByRole('img', { name: 'Document counts over time' });
+    expect(screen.getByLabelText('Histogram interval')).toBeDisabled();
+    expect(search.mock.calls.at(-1)?.[1]).not.toHaveProperty('histogram_interval');
+    fireEvent.click(screen.getByRole('button', { name: 'Edit time window' }));
+    enterDateTime('Start', '2026-10-06T08:00:00');
+    enterDateTime('End', '2026-10-06T09:00:00');
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+    await waitFor(() => expect(search.mock.calls.at(-1)?.[1]).toMatchObject({ histogram_interval: '1m', time_zone: 'UTC' }));
+    expect(await screen.findByRole('option', { name: 'Auto - 1 minute' })).toBeInTheDocument();
+    expect(within(screen.getByLabelText('Break down by')).getAllByRole('option').map((option) => option.textContent)).toEqual(['No breakdown', 'service']);
+
+    fireEvent.change(screen.getByLabelText('Histogram interval'), { target: { value: '1s' } });
+    await waitFor(() => expect(search.mock.calls.at(-1)?.[1]).toMatchObject({ histogram_interval: '1m' }));
+    expect(await screen.findByRole('note')).toHaveTextContent('Scaled to 1 minute');
+    fireEvent.change(screen.getByLabelText('Histogram interval'), { target: { value: '1h' } });
+    await waitFor(() => expect(search.mock.calls.at(-1)?.[1]).toMatchObject({ histogram_interval: '1h' }));
+    expect(screen.queryByRole('note')).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('Break down by'), { target: { value: 'service' } });
+    await waitFor(() => expect(search.mock.calls.at(-1)?.[1]).toMatchObject({ histogram_breakdown_field: 'service' }));
+    expect(await screen.findByRole('list', { name: 'Breakdown legend' })).toHaveTextContent('apiOther');
+
+    const plot = document.querySelector('.histogram-interaction') as SVGRectElement;
+    fireEvent.pointerDown(plot, { clientX: 60, button: 0 });
+    fireEvent.pointerUp(plot, { clientX: 60 });
+    await waitFor(() => expect(search.mock.calls.at(-1)?.[1].time_range).toEqual({ start, end: start + 3_600_000 - 1 }));
+    expect(screen.getByRole('button', { name: 'Edit time window' })).toHaveTextContent(/08:00 - .*08:59/);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Hide chart' }));
+    expect(screen.queryByRole('img', { name: 'Document counts over time' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Histogram interval')).not.toBeInTheDocument();
+    expect(window.localStorage.getItem('investigenie-histogram-visible')).toBe('false');
+    fireEvent.click(screen.getByRole('button', { name: 'Show chart' }));
+    expect(screen.getByRole('img', { name: 'Document counts over time' })).toBeInTheDocument();
+  });
+
   it('pages using the applied query, reuses histograms, caches previous pages, and resets on search', async () => {
     const page = (id: string, cursor: string | null) => ({ took: 2, timed_out: false, total: 101, total_relation: 'eq', hits: [{ index: 'events', id, score: null, source: { message: `${id} message` } }], histogram: [], next_cursor: cursor });
     vi.spyOn(api, 'connections').mockResolvedValue([connectionFixture(elasticsearchIntegration)]);
@@ -483,8 +535,8 @@ describe('Discover', () => {
     fireEvent.click(screen.getByRole('button', { name: /Add data view/ }));
     fireEvent.change(screen.getByLabelText('Data view name'), { target: { value: 'Saved logs' } });
     fireEvent.change(screen.getByLabelText('Connection'), { target: { value: 'source' } });
-    await screen.findByRole('option', { name: 'logs' });
-    fireEvent.change(screen.getByLabelText('Index / table'), { target: { value: 'logs' } });
+    fireEvent.click(screen.getByRole('combobox', { name: 'Index / table' }));
+    fireEvent.click(await screen.findByRole('option', { name: 'logs' }));
     await waitFor(() => expect(screen.getByLabelText('Time series time field')).toHaveValue('created_at'));
     fireEvent.click(screen.getByRole('button', { name: 'Create data view' }));
     await screen.findByText('Data view validated and created.');

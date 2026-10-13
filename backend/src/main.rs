@@ -33,11 +33,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => {}
     }
     let web_origin = settings.web_origin.parse()?;
+    if settings.quickstart {
+        if let storage::PersistenceOptions::Filesystem { path, .. } = &settings.storage {
+            tracing::warn!(
+                directory = %path.display(),
+                "No storage settings found; using local quickstart storage with a generated encryption key. Set CONFIG_ENCRYPTION_KEY and PERSISTENCE_MODE for production"
+            );
+        }
+    }
     let storage = Storage::open(settings.storage).await?;
-    let app = api::router(web_origin, storage.clone()).layer(TraceLayer::new_for_http());
+    let mut app = api::router(web_origin, storage.clone());
+    if let Some(directory) = &settings.web_dir {
+        app = api::with_web(app, directory);
+    }
+    let app = app.layer(TraceLayer::new_for_http());
     let listener = TcpListener::bind(settings.bind).await?;
 
-    tracing::info!(address = %settings.bind, "Discover API listening");
+    tracing::info!(address = %settings.bind, "InvestiGenie API listening");
+    match &settings.web_dir {
+        Some(directory) => tracing::info!(
+            ui = %directory.display(),
+            "Open http://{} in your browser",
+            settings.bind
+        ),
+        None => tracing::info!("No bundled web UI found; serve the frontend separately"),
+    }
     tracing::info!("Datasource connections are managed from the Connections UI");
     tracing::warn!(
         "API authentication is not configured; restrict access through an authenticated gateway"
