@@ -439,7 +439,7 @@ async fn assert_ai_investigation_cursor_batches(multiple_pages: bool) {
                 "message":{"type":"text"}
             }}}
         })))
-        .expect(2)
+        .expect(1)
         .mount(&source)
         .await;
     Mock::given(matchers::method("POST"))
