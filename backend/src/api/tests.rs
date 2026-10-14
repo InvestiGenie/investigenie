@@ -48,6 +48,131 @@ fn model_request(
 }
 
 #[tokio::test]
+async fn filesystem_ai_conversation_routes_read_continue_and_delete_history() {
+    let (_directory, storage) = status_storage().await;
+    let provider = MockServer::start().await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/chat/completions"))
+        .and(|request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            body.get("response_format").is_none()
+                && body["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("checkout errors"))
+                    })
+                })
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices":[{"message":{"content":"Check the database connection pool."},"finish_reason":"stop"}]
+        })))
+        .expect(1)
+        .mount(&provider)
+        .await;
+    let model = storage
+        .create_ai_model(StoredAiModel {
+            id: String::new(),
+            revision: String::new(),
+            name: "History model".to_owned(),
+            api_url: provider.uri(),
+            model: "test-model".to_owned(),
+            api_key: "private-key".to_owned(),
+        })
+        .await
+        .unwrap();
+    let conversation = StoredAiConversation::new(
+        "chat-1".to_owned(),
+        model.id,
+        vec!["view-1".to_owned()],
+        "Why did checkout fail?".to_owned(),
+    );
+    let conversation = storage.create_ai_conversation(conversation).await.unwrap();
+    let conversation = storage
+        .append_ai_conversation_messages(
+            &conversation.id,
+            &conversation.revision,
+            vec![StoredAiConversationMessage {
+                role: "assistant".to_owned(),
+                content: "The investigation found checkout errors.".to_owned(),
+                result: Some(json!({"summary":"checkout errors"})),
+            }],
+        )
+        .await
+        .unwrap();
+    let app = router("http://localhost:5173".parse().unwrap(), storage.clone());
+
+    let stale = app
+        .clone()
+        .oneshot(model_request(
+            Method::POST,
+            "/api/ai/conversations/chat-1/messages",
+            Some(json!({"message":"What next?"})),
+            Some("stale-revision"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+    let continued = app
+        .clone()
+        .oneshot(model_request(
+            Method::POST,
+            "/api/ai/conversations/chat-1/messages",
+            Some(json!({"message":"What should I check next?"})),
+            Some(&conversation.revision),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(continued.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(continued.into_body(), 65_536)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        body["conversation"]["messages"].as_array().unwrap().len(),
+        4
+    );
+    assert_eq!(
+        body["conversation"]["messages"][3]["content"],
+        "Check the database connection pool."
+    );
+    let updated_revision = body["conversation"]["revision"].as_str().unwrap();
+
+    let listed = app
+        .clone()
+        .oneshot(model_request(
+            Method::GET,
+            "/api/ai/conversations",
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    let listed: Value = serde_json::from_slice(
+        &axum::body::to_bytes(listed.into_body(), 65_536)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(listed["conversations"][0]["id"], "chat-1");
+
+    let deleted = app
+        .oneshot(model_request(
+            Method::DELETE,
+            "/api/ai/conversations/chat-1",
+            None,
+            Some(updated_revision),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    provider.verify().await;
+}
+
+#[tokio::test]
 async fn ai_model_api_tests_provider_before_save_and_keeps_keys_private() {
     let (_directory, storage) = status_storage().await;
     let provider = MockServer::start().await;
@@ -1347,9 +1472,12 @@ impl Connector for CapabilityConnector {
     }
     fn fields<'a>(
         &'a self,
-        _: &'a str,
+        index: &'a str,
     ) -> crate::integrations::ConnectorFuture<'a, Vec<crate::integrations::FieldSummary>> {
-        Box::pin(async {
+        Box::pin(async move {
+            if !matches!(index, "events" | "events-*") {
+                return Ok(Vec::new());
+            }
             Ok(vec![
                 crate::integrations::FieldSummary {
                     name: "clock".to_owned(),
@@ -1379,6 +1507,12 @@ impl Connector for CapabilityConnector {
 async fn source_validation_uses_capabilities_not_type_names() {
     assert_eq!(
         validate_source(&CapabilityConnector, "events", "clock")
+            .await
+            .unwrap(),
+        "clock"
+    );
+    assert_eq!(
+        validate_source(&CapabilityConnector, "events-*", "clock")
             .await
             .unwrap(),
         "clock"

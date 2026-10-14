@@ -28,6 +28,7 @@ export const clickhouseIntegration: IntegrationDescriptor = {
   connection_fields: [
     field('url', 'HTTP endpoint', { input_type: 'url', required: true, placeholder: 'http://clickhouse.example.com:8123' }),
     field('database', 'Database', { placeholder: 'default' }),
+    field('max_execution_time', 'Max execution time (seconds, optional)', { placeholder: 'Blank uses the server default (client timeout: 15s)' }),
     field('username', 'Username', { secret: true, group: 'credentials' }),
     field('password', 'Password', { input_type: 'password', secret: true, group: 'credentials' }),
   ],

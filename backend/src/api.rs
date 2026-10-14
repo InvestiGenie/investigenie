@@ -25,8 +25,9 @@ use crate::integrations::{
 };
 use crate::search::SearchRequest;
 use crate::storage::{
-    AiModelSummary, DataView, ResolvedConnection, Storage, StorageError, StoredAiModel,
-    StoredConnection,
+    AiConversationSummary, AiModelSummary, DataView, ResolvedConnection, Storage, StorageError,
+    StoredAiConversation, StoredAiConversationMessage, StoredAiModel, StoredConnection,
+    MAX_AI_CONVERSATION_MESSAGES,
 };
 
 const MAX_CONCURRENT_UPSTREAM_REQUESTS: usize = 64;
@@ -143,6 +144,15 @@ pub fn router(web_origin: HeaderValue, storage: Storage) -> Router {
             "/api/ai/investigations/{id}/decision",
             post(decide_investigation),
         )
+        .route("/api/ai/conversations", get(ai_conversations))
+        .route(
+            "/api/ai/conversations/{id}",
+            get(ai_conversation).delete(remove_ai_conversation),
+        )
+        .route(
+            "/api/ai/conversations/{id}/messages",
+            post(continue_ai_conversation).layer(DefaultBodyLimit::max(65_536)),
+        )
         .route("/api/ai/models", get(ai_models).post(create_ai_model))
         .route(
             "/api/ai/models/{model_id}",
@@ -240,7 +250,27 @@ async fn start_investigation(
         }
         jobs.insert(job.id.clone(), job.clone());
     }
+    let conversation = StoredAiConversation::new(
+        job.id.clone(),
+        request.ai_model_id.clone(),
+        request.data_view_ids.clone(),
+        request.question.clone(),
+    );
+    let conversation = match state.storage.create_ai_conversation(conversation).await {
+        Ok(conversation) => conversation,
+        Err(error) => {
+            state
+                .investigations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&job.id);
+            return Err(error.into());
+        }
+    };
     let task_job = job.clone();
+    let conversation_storage = state.storage.clone();
+    let conversation_id = conversation.id.clone();
+    let conversation_revision = conversation.revision.clone();
     tokio::spawn(async move {
         let _permit = permit;
         let control = ai::Control::for_job(task_job.clone());
@@ -252,6 +282,40 @@ async fn start_investigation(
             &control,
         )
         .await;
+        let message = match &result {
+            Ok(result) => {
+                let result_value = serde_json::to_value(result).unwrap_or(Value::Null);
+                let summary = result_value
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Investigation complete")
+                    .to_owned();
+                StoredAiConversationMessage {
+                    role: "assistant".to_owned(),
+                    content: summary,
+                    result: Some(result_value),
+                }
+            }
+            Err(error) => StoredAiConversationMessage {
+                role: "assistant".to_owned(),
+                content: error.message.clone(),
+                result: None,
+            },
+        };
+        if let Err(error) = conversation_storage
+            .append_ai_conversation_messages(
+                &conversation_id,
+                &conversation_revision,
+                vec![message],
+            )
+            .await
+        {
+            tracing::warn!(
+                conversation_id,
+                ?error,
+                "Could not persist AI investigation result"
+            );
+        }
         task_job.finish(result);
     });
     Ok((
@@ -293,6 +357,91 @@ async fn decide_investigation(
     job.decide(request.action)
         .map_err(ApiError::InvestigationDecision)?;
     Ok(Json(json!({ "investigation": job.snapshot() })))
+}
+
+async fn ai_conversations(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let conversations: Vec<AiConversationSummary> = state.storage.ai_conversations().await?;
+    Ok(Json(json!({ "conversations": conversations })))
+}
+
+async fn ai_conversation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({
+        "conversation": state.storage.ai_conversation(&id).await?
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContinueConversationRequest {
+    message: String,
+}
+
+async fn continue_ai_conversation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<ContinueConversationRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let expected = if_match(&headers)?;
+    let message = request.message.trim();
+    if message.is_empty() || message.len() > 8_000 {
+        return Err(ApiError::InvalidConversationMessage);
+    }
+    let conversation = state.storage.ai_conversation(&id).await?;
+    if conversation.revision != expected {
+        return Err(ApiError::Storage(StorageError::Conflict));
+    }
+    if conversation.messages.len() + 2 > MAX_AI_CONVERSATION_MESSAGES {
+        return Err(ApiError::InvalidConversationMessage);
+    }
+    let model = state.storage.ai_model(&conversation.model_id).await?;
+    let settings = ai::AiSettings {
+        api_url: model.api_url,
+        api_key: model.api_key,
+        model: model.model,
+        timeout: Duration::from_secs(60),
+    };
+    let _permit = state
+        .ai_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::Unavailable)?;
+    let answer = ai::continue_conversation(&settings, &conversation.messages, message)
+        .await
+        .map_err(ApiError::Investigation)?;
+    let updated = state
+        .storage
+        .append_ai_conversation_messages(
+            &id,
+            &expected,
+            vec![
+                StoredAiConversationMessage {
+                    role: "user".to_owned(),
+                    content: message.to_owned(),
+                    result: None,
+                },
+                StoredAiConversationMessage {
+                    role: "assistant".to_owned(),
+                    content: answer,
+                    result: None,
+                },
+            ],
+        )
+        .await?;
+    Ok(Json(json!({ "conversation": updated })))
+}
+
+async fn remove_ai_conversation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let expected = if_match(&headers)?;
+    state.storage.remove_ai_conversation(&id, &expected).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]
@@ -555,10 +704,6 @@ async fn validate_source(
     index_name: &str,
     time_field_name: &str,
 ) -> Result<String, ApiError> {
-    let indices = connector.indices().await?;
-    if !indices.iter().any(|index| index.name == index_name) {
-        return Err(ApiError::InvalidDataView);
-    }
     let fields = connector.fields(index_name).await?;
     let time_field = fields
         .iter()
@@ -602,6 +747,7 @@ enum ApiError {
     AiModelTest(&'static str),
     Investigation(ai::InvestigationError),
     InvestigationNotFound,
+    InvalidConversationMessage,
     InvestigationDecision(&'static str),
 }
 
@@ -627,6 +773,7 @@ impl IntoResponse for ApiError {
             Self::Storage(StorageError::ConnectionNotFound) => (StatusCode::NOT_FOUND, "connection_not_found", "The requested connection does not exist".to_owned()),
             Self::Storage(StorageError::ViewNotFound) => (StatusCode::NOT_FOUND, "data_view_not_found", "The requested data view does not exist".to_owned()),
             Self::Storage(StorageError::AiModelNotFound) => (StatusCode::NOT_FOUND, "ai_model_not_found", "The requested AI model does not exist".to_owned()),
+            Self::Storage(StorageError::AiConversationNotFound) => (StatusCode::NOT_FOUND, "ai_conversation_not_found", "The requested AI conversation does not exist".to_owned()),
             Self::Storage(StorageError::Invalid) => (StatusCode::BAD_REQUEST, "invalid_configuration", "Configuration fields are invalid".to_owned()),
             Self::Storage(_) => (StatusCode::SERVICE_UNAVAILABLE, "configuration_storage_unavailable", "Configuration storage is unavailable".to_owned()),
             Self::InvalidTimeRange => (
@@ -655,6 +802,7 @@ impl IntoResponse for ApiError {
             Self::AiModelTest(message) => (StatusCode::BAD_GATEWAY, "ai_model_test_failed", message.to_owned()),
             Self::Investigation(error) => (error.status, error.code, error.message),
             Self::InvestigationNotFound => (StatusCode::NOT_FOUND, "investigation_not_found", "The investigation does not exist or has expired".to_owned()),
+            Self::InvalidConversationMessage => (StatusCode::BAD_REQUEST, "invalid_ai_message", "A follow-up message must contain 1 to 8000 bytes and the conversation must stay within its message limit".to_owned()),
             Self::InvestigationDecision(message) => (StatusCode::CONFLICT, "investigation_not_paused", message.to_owned()),
         };
 

@@ -18,7 +18,7 @@ flowchart LR
 | Web UI | `frontend/` | Explore, Data Views, Connections, AI Models, InvestiGenie AI. Built to static files. |
 | API server | `backend/` | Routes, storage, AI investigations, and serving the built UI on the same address. |
 | Integrations | `integrations/<id>/` | One folder per datasource. Discovered at build time. |
-| Storage | `backend/src/storage*` | Connections, Data Views, AI model profiles, settings. Encrypted, with revisions. |
+| Storage | `backend/src/storage*` | Connections, Data Views, AI model profiles, settings, and AI conversation history. Encrypted, with revisions. |
 
 ## Core concepts
 
@@ -32,6 +32,8 @@ flowchart LR
 **Explore search:** UI → `POST /api/connections/{id}/search` → the integration runs the query with the time window, sort, and paging → documents plus a histogram (interval, optional breakdown) → UI.
 
 **AI investigation:** UI starts a background job → the AI plans filters for the selected Data Views → the server scans every matching record in 100-record pages → records are compacted and grouped by signal → the AI analyses batches into a rolling set of findings → the UI polls the job and can continue or stop it at check-ins.
+
+**AI history:** each investigation and its result are persisted in encrypted storage. Users can reopen, delete, or continue a conversation; follow-ups receive the saved transcript and findings, not a new source scan.
 
 ## Design rules
 

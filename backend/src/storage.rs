@@ -12,11 +12,19 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions, PgRow},
     ConnectOptions, PgPool, Postgres, Row, Transaction,
 };
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use thiserror::Error;
 use uuid::Uuid;
 
 mod filesystem;
+
+pub const MAX_AI_CONVERSATIONS: usize = 64;
+pub const MAX_AI_CONVERSATION_MESSAGES: usize = 200;
+pub const MAX_AI_CONVERSATION_BYTES: usize = 128 * 1024;
 
 #[derive(Clone)]
 pub enum PersistenceOptions {
@@ -77,6 +85,8 @@ pub enum StorageError {
     ViewNotFound,
     #[error("AI model does not exist")]
     AiModelNotFound,
+    #[error("AI conversation does not exist")]
+    AiConversationNotFound,
     #[error("Configuration changed; reload before editing")]
     Conflict,
     #[error("Record is invalid")]
@@ -275,6 +285,69 @@ pub struct StoredAiModel {
     pub api_key: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredAiConversationMessage {
+    pub role: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredAiConversation {
+    pub id: String,
+    pub revision: String,
+    pub title: String,
+    pub model_id: String,
+    pub data_view_ids: Vec<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub messages: Vec<StoredAiConversationMessage>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AiConversationSummary {
+    pub id: String,
+    pub revision: String,
+    pub title: String,
+    pub updated_at_ms: i64,
+}
+
+impl StoredAiConversation {
+    pub fn new(id: String, model_id: String, data_view_ids: Vec<String>, question: String) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        Self {
+            id,
+            revision: revision(),
+            title: question.trim().chars().take(160).collect(),
+            model_id,
+            data_view_ids,
+            created_at_ms: now,
+            updated_at_ms: now,
+            messages: vec![StoredAiConversationMessage {
+                role: "user".to_owned(),
+                content: question,
+                result: None,
+            }],
+        }
+    }
+
+    pub fn summary(&self) -> AiConversationSummary {
+        AiConversationSummary {
+            id: self.id.clone(),
+            revision: self.revision.clone(),
+            title: self.title.clone(),
+            updated_at_ms: self.updated_at_ms,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct AiModelSummary {
     pub id: String,
@@ -393,6 +466,42 @@ pub fn validate_ai_model(model: &StoredAiModel) -> Result<(), StorageError> {
         return Err(StorageError::Invalid);
     }
     Ok(())
+}
+
+fn validate_ai_conversation(conversation: &StoredAiConversation) -> Result<(), StorageError> {
+    if !valid_id(&conversation.id)
+        || Uuid::parse_str(&conversation.revision).is_err()
+        || !valid_id(&conversation.model_id)
+        || conversation.title.trim().is_empty()
+        || conversation.title.len() > 160
+        || conversation.created_at_ms < 0
+        || conversation.updated_at_ms < conversation.created_at_ms
+        || conversation.data_view_ids.is_empty()
+        || conversation.data_view_ids.len() > 5
+        || conversation.data_view_ids.iter().any(|id| !valid_id(id))
+        || conversation.messages.is_empty()
+        || conversation.messages.len() > MAX_AI_CONVERSATION_MESSAGES
+        || conversation.messages.iter().any(|message| {
+            !matches!(message.role.as_str(), "user" | "assistant")
+                || message.content.trim().is_empty()
+                || message.content.len() > 32_768
+        })
+        || serde_json::to_vec(conversation)
+            .map_err(|_| StorageError::Invalid)?
+            .len()
+            > MAX_AI_CONVERSATION_BYTES
+    {
+        return Err(StorageError::Invalid);
+    }
+    Ok(())
+}
+
+fn conversation_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 fn descriptor(id: &str) -> Result<IntegrationDescriptor, StorageError> {
     registered()
@@ -883,6 +992,36 @@ impl Storage {
         })
     }
 
+    fn decode_ai_conversation(&self, row: PgRow) -> Result<StoredAiConversation, StorageError> {
+        let id: String = row.try_get("id")?;
+        let revision: String = row.try_get("revision")?;
+        let updated_at_ms: i64 = row.try_get("updated_at_ms")?;
+        let encrypted: Vec<u8> = row.try_get("content_encrypted")?;
+        let plaintext = self
+            .encryption
+            .decrypt(&format!("ai-conversation:{id}"), &encrypted)?;
+        let conversation: StoredAiConversation =
+            serde_json::from_slice(&plaintext).map_err(|_| StorageError::Invalid)?;
+        if conversation.id != id
+            || conversation.revision != revision
+            || conversation.updated_at_ms != updated_at_ms
+        {
+            return Err(StorageError::Invalid);
+        }
+        validate_ai_conversation(&conversation)?;
+        Ok(conversation)
+    }
+
+    fn encrypted_ai_conversation(
+        &self,
+        conversation: &StoredAiConversation,
+    ) -> Result<Vec<u8>, StorageError> {
+        validate_ai_conversation(conversation)?;
+        let plaintext = serde_json::to_vec(conversation).map_err(|_| StorageError::Invalid)?;
+        self.encryption
+            .encrypt(&format!("ai-conversation:{}", conversation.id), &plaintext)
+    }
+
     pub async fn ai_models(&self) -> Result<Vec<StoredAiModel>, StorageError> {
         if let Some(file) = &self.file {
             return file
@@ -993,6 +1132,148 @@ impl Storage {
             _ => {}
         }
         sqlx::query("DELETE FROM ai_models WHERE id=$1")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn ai_conversations(&self) -> Result<Vec<AiConversationSummary>, StorageError> {
+        if let Some(file) = &self.file {
+            return file
+                .read(|snapshot| {
+                    let mut summaries = snapshot
+                        .ai_conversations
+                        .values()
+                        .map(StoredAiConversation::summary)
+                        .collect::<Vec<_>>();
+                    summaries.sort_by(|left, right| {
+                        right
+                            .updated_at_ms
+                            .cmp(&left.updated_at_ms)
+                            .then_with(|| left.id.cmp(&right.id))
+                    });
+                    Ok(summaries)
+                })
+                .await;
+        }
+        sqlx::query("SELECT * FROM ai_conversations ORDER BY updated_at_ms DESC, id")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| self.decode_ai_conversation(row).map(|item| item.summary()))
+            .collect()
+    }
+
+    pub async fn ai_conversation(&self, id: &str) -> Result<StoredAiConversation, StorageError> {
+        if let Some(file) = &self.file {
+            let id = id.to_owned();
+            return file
+                .read(move |snapshot| {
+                    snapshot
+                        .ai_conversations
+                        .get(&id)
+                        .cloned()
+                        .ok_or(StorageError::AiConversationNotFound)
+                })
+                .await;
+        }
+        let row = sqlx::query("SELECT * FROM ai_conversations WHERE id=$1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StorageError::AiConversationNotFound)?;
+        self.decode_ai_conversation(row)
+    }
+
+    pub async fn create_ai_conversation(
+        &self,
+        conversation: StoredAiConversation,
+    ) -> Result<StoredAiConversation, StorageError> {
+        validate_ai_conversation(&conversation)?;
+        if let Some(file) = &self.file {
+            file.create_ai_conversation(conversation.clone()).await?;
+            return Ok(conversation);
+        }
+        let encrypted = self.encrypted_ai_conversation(&conversation)?;
+        let mut transaction = self.pool.begin().await?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ai_conversations")
+            .fetch_one(&mut *transaction)
+            .await?;
+        if count >= MAX_AI_CONVERSATIONS as i64 {
+            return Err(StorageError::Invalid);
+        }
+        sqlx::query("INSERT INTO ai_conversations (id, revision, updated_at_ms, content_encrypted) VALUES ($1,$2,$3,$4)")
+            .bind(&conversation.id)
+            .bind(&conversation.revision)
+            .bind(conversation.updated_at_ms)
+            .bind(encrypted)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(conversation)
+    }
+
+    pub async fn append_ai_conversation_messages(
+        &self,
+        id: &str,
+        expected: &str,
+        messages: Vec<StoredAiConversationMessage>,
+    ) -> Result<StoredAiConversation, StorageError> {
+        if let Some(file) = &self.file {
+            return file
+                .append_ai_conversation_messages(id.to_owned(), expected.to_owned(), messages)
+                .await;
+        }
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query("SELECT * FROM ai_conversations WHERE id=$1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(StorageError::AiConversationNotFound)?;
+        let mut conversation = self.decode_ai_conversation(row)?;
+        if conversation.revision != expected {
+            return Err(StorageError::Conflict);
+        }
+        conversation.messages.extend(messages);
+        conversation.revision = revision();
+        conversation.updated_at_ms =
+            conversation_timestamp().max(conversation.updated_at_ms.saturating_add(1));
+        let encrypted = self.encrypted_ai_conversation(&conversation)?;
+        sqlx::query("UPDATE ai_conversations SET revision=$2, updated_at_ms=$3, content_encrypted=$4 WHERE id=$1")
+            .bind(id)
+            .bind(&conversation.revision)
+            .bind(conversation.updated_at_ms)
+            .bind(encrypted)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(conversation)
+    }
+
+    pub async fn remove_ai_conversation(
+        &self,
+        id: &str,
+        expected: &str,
+    ) -> Result<(), StorageError> {
+        if let Some(file) = &self.file {
+            return file
+                .remove_ai_conversation(id.to_owned(), expected.to_owned())
+                .await;
+        }
+        let mut transaction = self.pool.begin().await?;
+        let actual: Option<String> =
+            sqlx::query_scalar("SELECT revision FROM ai_conversations WHERE id=$1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+        match actual {
+            None => return Err(StorageError::AiConversationNotFound),
+            Some(actual) if actual != expected => return Err(StorageError::Conflict),
+            _ => {}
+        }
+        sqlx::query("DELETE FROM ai_conversations WHERE id=$1")
             .bind(id)
             .execute(&mut *transaction)
             .await?;

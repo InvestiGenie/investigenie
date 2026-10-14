@@ -182,6 +182,39 @@ describe('API requests', () => {
       signal: undefined,
     });
   });
+
+  it('lists, reads, continues, and deletes AI conversations with revision preconditions', async () => {
+    const summary = { id: 'chat/one', revision: 'rev-1', title: 'Why did checkout fail?', updated_at_ms: 10 };
+    const conversation = {
+      ...summary,
+      model_id: 'model-one',
+      data_view_ids: ['checkout-view'],
+      created_at_ms: 5,
+      messages: [{ role: 'user', content: 'Why did checkout fail?' }],
+    };
+    const updated = { ...conversation, revision: 'rev-2' };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ conversations: [summary] }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ conversation }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ conversation: updated }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => null });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(api.aiConversations()).resolves.toEqual([summary]);
+    await expect(api.aiConversation('chat/one')).resolves.toEqual(conversation);
+    await expect(api.continueAIConversation('chat/one', 'What next?', 'rev-1')).resolves.toEqual(updated);
+    await api.removeAIConversation('chat/one', 'rev-2');
+    expect(fetchMock.mock.calls.map(([url, init]) => [String(url), init?.method ?? 'GET'])).toEqual([
+      [expect.stringContaining('/api/ai/conversations'), 'GET'],
+      [expect.stringContaining('/api/ai/conversations/chat%2Fone'), 'GET'],
+      [expect.stringContaining('/api/ai/conversations/chat%2Fone/messages'), 'POST'],
+      [expect.stringContaining('/api/ai/conversations/chat%2Fone'), 'DELETE'],
+    ]);
+    expect(fetchMock.mock.calls[2][1]).toMatchObject({
+      headers: { 'Content-Type': 'application/json', 'If-Match': '"rev-1"' },
+      body: JSON.stringify({ message: 'What next?' }),
+    });
+    expect(fetchMock.mock.calls[3][1].headers['If-Match']).toBe('"rev-2"');
+  });
 });
 
 describe('makeSearchRequest', () => {

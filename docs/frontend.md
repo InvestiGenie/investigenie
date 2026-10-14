@@ -7,7 +7,7 @@ React 19 + TypeScript + Vite in `frontend/`. No router and no state library: `Ap
 | File | What it does |
 |---|---|
 | `App.tsx` | Shell and navigation. **Explore**: Data View picker, query, time window, histogram controls, results table, paging, fields sidebar. |
-| `InvestiGenieAIPage.tsx` | Ask a question over 1–5 Data Views; timeout and check-in settings; live progress; continue/stop; findings. |
+| `InvestiGenieAIPage.tsx` | Ask a question over 1–5 Data Views; saved conversation history; follow-ups; timeout/check-in settings; live progress and findings. |
 | `AIModelsPage.tsx` | Add, edit, and remove AI provider profiles. |
 | `ConnectionsPage.tsx`, `ConnectionStatus.tsx` | Connection forms built from integration metadata; live status badges. |
 | `DataViewsPage.tsx` | Create and edit Data Views (searchable index/table picker, time field). |
@@ -25,7 +25,7 @@ React 19 + TypeScript + Vite in `frontend/`. No router and no state library: `Ap
 - **Time:** the UI keeps UTC values and sends epoch milliseconds. The chosen timezone only changes how times are displayed; it never re-queries.
 - **Explore paging:** 50 documents per page. The histogram comes from the first page and is reused while paging.
 - **Histogram:** Auto targets about 50 bars; a fixed interval that would exceed 100 bars is scaled up. Drag or click to zoom (this updates the time window and searches). Interval and breakdown need a time window.
-- **AI page:** starts a job, polls every second (every 5 s while paused), and shows partial findings at check-ins.
+- **AI page:** starts a job, polls every second (every 5 s while paused), and shows partial findings at check-ins. Completed conversations are persisted; selecting one restores its transcript, Data Views, and model, and follow-ups use saved findings without rescanning sources.
 - **API address:** production builds call the same origin. The dev server calls `http://127.0.0.1:3000` (override with `VITE_API_BASE_URL`).
 
 ## Develop and test

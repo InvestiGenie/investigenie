@@ -138,6 +138,25 @@ export type InvestigationJob = {
   error: { code: string; message: string } | null;
 };
 
+export type AIConversationMessage = {
+  role: 'user' | 'assistant';
+  content: string;
+  result?: InvestigationResult;
+};
+
+export type AIConversation = {
+  id: string;
+  revision: string;
+  title: string;
+  model_id: string;
+  data_view_ids: string[];
+  created_at_ms: number;
+  updated_at_ms: number;
+  messages: AIConversationMessage[];
+};
+
+export type AIConversationSummary = Pick<AIConversation, 'id' | 'revision' | 'title' | 'updated_at_ms'>;
+
 export type CreateDataViewRequest = Omit<DataViewSummary, 'id' | 'revision'>;
 
 export type AddConnectionRequest = ConnectionConfiguration & {
@@ -308,6 +327,28 @@ export const api = {
       body: JSON.stringify({ action }),
     });
     return response.investigation;
+  },
+  async aiConversations(signal?: AbortSignal): Promise<AIConversationSummary[]> {
+    const response = await request<{ conversations: AIConversationSummary[] }>('/api/ai/conversations', { signal });
+    return response.conversations;
+  },
+  async aiConversation(id: string, signal?: AbortSignal): Promise<AIConversation> {
+    const response = await request<{ conversation: AIConversation }>(`/api/ai/conversations/${encodeURIComponent(id)}`, { signal });
+    return response.conversation;
+  },
+  async continueAIConversation(id: string, message: string, revision: string): Promise<AIConversation> {
+    const response = await request<{ conversation: AIConversation }>(`/api/ai/conversations/${encodeURIComponent(id)}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'If-Match': `"${revision}"` },
+      body: JSON.stringify({ message }),
+    });
+    return response.conversation;
+  },
+  async removeAIConversation(id: string, revision: string): Promise<void> {
+    await request(`/api/ai/conversations/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: { 'If-Match': `"${revision}"` },
+    });
   },
   async addDataView(body: CreateDataViewRequest): Promise<void> {
     await request('/api/data-views', {

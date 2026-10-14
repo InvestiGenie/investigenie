@@ -328,7 +328,7 @@ impl ElasticsearchClient {
                     "query": request.query,
                     "default_field": "*",
                     "allow_leading_wildcard": false,
-                    "lenient": false
+                    "lenient": true
                 }
             })
         };
@@ -1169,7 +1169,7 @@ mod tests {
                         "query": "service.name:gateway",
                         "default_field": "*",
                         "allow_leading_wildcard": false,
-                        "lenient": false
+                        "lenient": true
                     }
                 },
                 "from": 0,

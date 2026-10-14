@@ -6,6 +6,7 @@ export type SearchableOption = {
   description?: string;
   badge?: string;
   tone?: string;
+  custom?: boolean;
 };
 
 type SearchableSelectProps = {
@@ -18,9 +19,11 @@ type SearchableSelectProps = {
   placeholder?: string;
   emptyLabel?: string;
   maxRendered?: number;
+  allowCustom?: boolean;
+  customLabel?: string;
 };
 
-export default function SearchableSelect({ label, value, options, onChange, disabled = false, loading = false, placeholder = 'Search…', emptyLabel = 'Select an option', maxRendered = 200 }: SearchableSelectProps) {
+export default function SearchableSelect({ label, value, options, onChange, disabled = false, loading = false, placeholder = 'Search…', emptyLabel = 'Select an option', maxRendered = 200, allowCustom = false, customLabel = 'Use custom value' }: SearchableSelectProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
@@ -43,7 +46,11 @@ export default function SearchableSelect({ label, value, options, onChange, disa
       return leftPrefix - rightPrefix || left.value.localeCompare(right.value);
     }) : filtered;
   }, [options, query]);
-  const visible = matches.slice(0, maxRendered);
+  const customValue = query.trim();
+  const customOption: SearchableOption | null = allowCustom && /[*?,]/.test(customValue) && !options.some((option) => option.value === customValue)
+    ? { value: customValue, custom: true }
+    : null;
+  const visible = [...matches.slice(0, maxRendered), ...(customOption ? [customOption] : [])];
 
   useEffect(() => {
     if (!open) return;
@@ -138,7 +145,7 @@ export default function SearchableSelect({ label, value, options, onChange, disa
           id={`${listId}-option-${index}`}
           data-index={index}
           role="option"
-          aria-label={option.value}
+          aria-label={option.custom ? `${customLabel}: ${option.value}` : option.value}
           aria-selected={option.value === value}
           className={`${index === active ? 'active' : ''}${option.value === value ? ' selected' : ''}`}
           onMouseDown={(event) => event.preventDefault()}
@@ -147,7 +154,7 @@ export default function SearchableSelect({ label, value, options, onChange, disa
           title={option.value}
         >
           <span className="searchable-select-check" aria-hidden="true">{option.value === value && <Check size={12} />}</span>
-          <span className="searchable-select-name">{option.value}</span>
+          <span className="searchable-select-name">{option.custom ? `${customLabel}: ${option.value}` : option.value}</span>
           {option.description && <small aria-hidden="true">{option.description}</small>}
           {option.badge && <span className={`searchable-select-badge ${option.tone ?? ''}`} aria-hidden="true">{option.badge}</span>}
         </li>)}

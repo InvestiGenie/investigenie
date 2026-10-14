@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import InvestiGenieAIPage from './InvestiGenieAIPage';
-import { api, type InvestigationJob, type InvestigationResult } from './api';
+import { api, type AIConversation, type InvestigationJob, type InvestigationResult } from './api';
 import { clearPreference, getPreference } from './preferences';
 
 const dataViews = [
@@ -50,6 +50,8 @@ describe('InvestiGenieAIPage', () => {
     clearPreference('ai-model');
     clearPreference('ai-timeout');
     clearPreference('ai-check-in');
+    vi.spyOn(api, 'aiConversations').mockResolvedValue([]);
+    vi.spyOn(api, 'aiConversation').mockRejectedValue(new Error('Conversation not found'));
     vi.spyOn(api, 'aiModels').mockResolvedValue([{
       id: 'model-primary', revision: 'rev-1', name: 'Primary', api_url: 'https://provider.example/v1', model: 'model-x', has_api_key: true,
     }]);
@@ -68,6 +70,44 @@ describe('InvestiGenieAIPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
     await waitFor(() => expect(investigate).toHaveBeenCalledWith('What is impacting the services?', ['service-one', 'service-two'], 'model-primary', { start: expect.any(Number), end: expect.any(Number) }, defaultControls));
     expect(await screen.findByText(result.summary)).toBeInTheDocument();
+  });
+
+  it('reopens a saved investigation and continues with its transcript', async () => {
+    const summary = { id: 'chat-1', revision: 'revision-1', title: 'Why did checkout fail?', updated_at_ms: 10 };
+    const conversation: AIConversation = {
+      ...summary,
+      model_id: 'model-primary',
+      data_view_ids: ['service-one'],
+      created_at_ms: 5,
+      messages: [
+        { role: 'user', content: 'Why did checkout fail?' },
+        { role: 'assistant', content: result.summary, result },
+      ],
+    };
+    const updated: AIConversation = {
+      ...conversation,
+      revision: 'revision-2',
+      messages: [...conversation.messages, { role: 'user', content: 'What next?' }, { role: 'assistant', content: 'Check the database pool.' }],
+    };
+    vi.mocked(api.aiConversations).mockResolvedValue([summary]);
+    vi.mocked(api.aiConversation).mockResolvedValue(conversation);
+    const followUp = vi.spyOn(api, 'continueAIConversation').mockResolvedValue(updated);
+    const remove = vi.spyOn(api, 'removeAIConversation').mockResolvedValue(undefined);
+    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    const history = await screen.findByRole('combobox', { name: 'AI conversation history' });
+    await screen.findByRole('option', { name: 'Why did checkout fail?' });
+    fireEvent.change(history, { target: { value: 'chat-1' } });
+    expect(await screen.findByText(result.summary)).toBeInTheDocument();
+    expect(screen.getAllByText('Why did checkout fail?')).toHaveLength(2);
+    expect(screen.getByRole('button', { name: 'Delete conversation' })).toBeEnabled();
+    fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'What next?' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send follow-up' }));
+    expect(await screen.findByText('Check the database pool.')).toBeInTheDocument();
+    expect(followUp).toHaveBeenCalledWith('chat-1', 'What next?', 'revision-1');
+    fireEvent.click(screen.getByRole('button', { name: 'Delete conversation' }));
+    expect(remove).toHaveBeenCalledWith('chat-1', 'revision-2');
+    expect(await screen.findByRole('heading', { name: 'Start a new investigation' })).toBeInTheDocument();
+    expect(screen.queryByText('Check the database pool.')).not.toBeInTheDocument();
   });
 
   it('renders findings, confidence, evidence and bounded sources', async () => {

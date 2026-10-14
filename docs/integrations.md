@@ -4,6 +4,8 @@ An integration adds a datasource type, such as Elasticsearch or ClickHouse. It i
 
 Built in: `elasticsearch` (Query DSL / Lucene), `clickhouse` (SQL `WHERE` clauses, read-only).
 
+ClickHouse connections have an optional **Max execution time (seconds)** setting (1–600). Leave it blank to omit ClickHouse's server-side `max_execution_time`; the HTTP client still bounds each request to 15 seconds when unset. A configured limit extends the client timeout by five seconds. SQL `LIMIT` clauses bound returned rows; configure server-side memory limits in the ClickHouse user profile, since the connector does not override them per request.
+
 ## Create one with the AI skill (recommended)
 
 The repo includes the agent skill [`build-integration`](../.github/skills/build-integration/SKILL.md). It is a step-by-step workflow and checklist covering the contract, credentials, read-only access, paging, histograms, AI support, and tests.
@@ -35,6 +37,8 @@ The skill also works as a checklist when you write an integration by hand.
 The full field-by-field contract and response examples are in [integrations/README.md](../integrations/README.md). Start from the closest existing integration ([ClickHouse](../integrations/clickhouse/mod.rs) is the smallest).
 
 ## Check
+
+Elasticsearch Data Views accept comma-separated index names and wildcard patterns such as `logs-*`; the API validates fields against the pattern's mappings. ClickHouse Data Views use an exact table name.
 
 ```sh
 cargo test -p investigenie-api

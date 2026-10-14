@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
-import { ArrowUp, BrainCircuit, Check, CircleAlert, CirclePause, Database, Play, Search, Square, X } from 'lucide-react';
-import { api, type AIModelSummary, type DataViewSummary, type InvestigationJob } from './api';
+import { ArrowUp, BrainCircuit, Check, CircleAlert, CirclePause, Database, Play, Search, Square, Trash2, X } from 'lucide-react';
+import { api, type AIConversation, type AIConversationSummary, type AIModelSummary, type DataViewSummary, type InvestigationJob } from './api';
 import TimeRangePicker from './TimeRangePicker';
 import { getPreference, setPreference, type PreferenceName } from './preferences';
 
@@ -41,6 +41,11 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
   const [dataViewPickerOpen, setDataViewPickerOpen] = useState(false);
   const [question, setQuestion] = useState('');
   const [job, setJob] = useState<InvestigationJob | null>(null);
+  const [conversations, setConversations] = useState<AIConversationSummary[]>([]);
+  const [activeConversation, setActiveConversation] = useState<AIConversation | null>(null);
+  const [conversationLoading, setConversationLoading] = useState(false);
+  const [conversationBusy, setConversationBusy] = useState(false);
+  const [conversationError, setConversationError] = useState('');
   const [submittedQuestion, setSubmittedQuestion] = useState('');
   const [starting, setStarting] = useState(false);
   const [deciding, setDeciding] = useState(false);
@@ -54,6 +59,16 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
   const pickerRef = useRef<HTMLDivElement>(null);
   const pickerSearchRef = useRef<HTMLInputElement>(null);
   const pickerTriggerRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    api.aiConversations(controller.signal)
+      .then((items) => { if (!controller.signal.aborted) setConversations(items); })
+      .catch((reason: unknown) => {
+        if (!controller.signal.aborted) setConversationError(reason instanceof Error ? reason.message : 'Could not load AI history');
+      });
+    return () => controller.abort();
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -135,10 +150,78 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
   const busy = starting || (job !== null && activeStatuses.has(job.status));
   const result = job?.result ?? null;
 
+  async function refreshConversations() {
+    try {
+      setConversations(await api.aiConversations());
+      setConversationError('');
+    } catch (reason) {
+      setConversationError(reason instanceof Error ? reason.message : 'Could not refresh AI history');
+    }
+  }
+
+  async function openConversation(id: string) {
+    if (!id) {
+      setActiveConversation(null);
+      setJob(null);
+      setSubmittedQuestion('');
+      setQuestion('');
+      return;
+    }
+    setConversationLoading(true);
+    setConversationError('');
+    setError('');
+    try {
+      const conversation = await api.aiConversation(id);
+      setActiveConversation(conversation);
+      setJob(null);
+      setSubmittedQuestion('');
+      setSelectedIds(conversation.data_view_ids);
+      setSelectedModelId(conversation.model_id);
+      setQuestion('');
+    } catch (reason) {
+      setConversationError(reason instanceof Error ? reason.message : 'Could not load this conversation');
+    } finally {
+      setConversationLoading(false);
+    }
+  }
+
+  async function removeConversation() {
+    if (!activeConversation || busy || conversationBusy) return;
+    setConversationBusy(true);
+    setConversationError('');
+    try {
+      await api.removeAIConversation(activeConversation.id, activeConversation.revision);
+      setConversations((current) => current.filter((item) => item.id !== activeConversation.id));
+      setActiveConversation(null);
+      setJob(null);
+      setSubmittedQuestion('');
+      setError('');
+    } catch (reason) {
+      setConversationError(reason instanceof Error ? reason.message : 'Could not delete this conversation');
+    } finally {
+      setConversationBusy(false);
+    }
+  }
+
   async function investigate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const prompt = question.trim();
-    if (!prompt || !selectedIds.length || !selectedModelId || busy) return;
+    if (!prompt || busy || conversationBusy || (!activeConversation && (!selectedIds.length || !selectedModelId))) return;
+    if (activeConversation) {
+      setConversationBusy(true);
+      setConversationError('');
+      try {
+        const updated = await api.continueAIConversation(activeConversation.id, prompt, activeConversation.revision);
+        setActiveConversation(updated);
+        setQuestion('');
+        await refreshConversations();
+      } catch (reason) {
+        setConversationError(reason instanceof Error ? reason.message : 'Could not continue this conversation');
+      } finally {
+        setConversationBusy(false);
+      }
+      return;
+    }
     setStarting(true);
     setError('');
     setJob(null);
@@ -148,6 +231,8 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
       const started = await api.startInvestigation(prompt, selectedIds, selectedModelId, timeRange, { ai_timeout_seconds: aiTimeout, time_budget_seconds: checkIn });
       setJob(started);
       setQuestion('');
+      setActiveConversation(null);
+      await refreshConversations();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'The investigation could not be started.');
     } finally {
@@ -169,6 +254,18 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
     }
   }
 
+  useEffect(() => {
+    if (!job || activeStatuses.has(job.status)) return;
+    let active = true;
+    api.aiConversation(job.id)
+      .then((conversation) => {
+        if (active) setActiveConversation(conversation);
+        return refreshConversations();
+      })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, [job?.id, job?.status]);
+
   function updateTimeout(seconds: number) {
     setAiTimeout(seconds);
     setPreference('ai-timeout', String(seconds));
@@ -188,6 +285,16 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
 
   return <main className="ai-page">
     <section className="ai-workspace" aria-label="InvestiGenie AI investigation">
+      <div className="ai-history-row">
+        <label htmlFor="ai-conversation-history">AI history</label>
+        <select id="ai-conversation-history" aria-label="AI conversation history" value={activeConversation?.id ?? ''} disabled={conversationLoading || busy || conversationBusy} onChange={(event) => void openConversation(event.target.value)}>
+          <option value="">New investigation</option>
+          {conversations.map((conversation) => <option key={conversation.id} value={conversation.id}>{conversation.title}</option>)}
+        </select>
+        {activeConversation && <button type="button" className="quiet-button" aria-label="Delete conversation" title="Delete conversation" disabled={busy || conversationBusy} onClick={() => void removeConversation()}><Trash2 size={14} aria-hidden="true" /></button>}
+        {conversationLoading && <span role="status">Loading history…</span>}
+      </div>
+      {conversationError && <div className="alert" role="alert"><span>{conversationError}</span><button type="button" aria-label="Dismiss history error" onClick={() => setConversationError('')}>×</button></div>}
       <div className="ai-controls-row">
       <div className="ai-dataview-picker" ref={pickerRef}>
         <button ref={pickerTriggerRef} type="button" className={`ai-dataview-trigger${dataViewPickerOpen ? ' open' : ''}`} aria-label="Choose Data Views" aria-expanded={dataViewPickerOpen} aria-controls="ai-dataview-menu" disabled={dataViews.length === 0} onClick={() => setDataViewPickerOpen((open) => !open)}>
@@ -212,8 +319,14 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
       {dataViews.length === 0 && <p className="ai-empty-sources">Create a Data View before starting an investigation.</p>}
 
       <section className="ai-transcript" aria-live="polite" aria-label="Investigation result">
-        {!submittedQuestion && !busy && <div className="ai-welcome"><h2>Start a new investigation</h2>{modelStatus === 'empty' && <button className="sample-query" onClick={() => onManageModels?.()}>Open AI model management</button>}</div>}
-        {submittedQuestion && <div className="ai-user-message"><span>You</span><p>{submittedQuestion}</p></div>}
+        {!submittedQuestion && !activeConversation && !busy && <div className="ai-welcome"><h2>Start a new investigation</h2>{modelStatus === 'empty' && <button className="sample-query" onClick={() => onManageModels?.()}>Open AI model management</button>}</div>}
+        {activeConversation
+          ? activeConversation.messages.map((message, index) => message.role === 'user'
+            ? <div className="ai-user-message" key={`${index}-user`}><span>You</span><p>{message.content}</p></div>
+            : message.result
+              ? <article className="ai-result" key={`${index}-result`}><div className="ai-result-label"><BrainCircuit size={15} aria-hidden="true" /> Investigation</div><p className="ai-summary">{message.result.summary}</p>{message.result.findings.map((finding, findingIndex) => <article className="ai-finding" key={`${finding.title}-${findingIndex}`}><div className="ai-finding-heading"><h4>{finding.title}</h4><span className={`ai-severity severity-${finding.severity}`}>{finding.severity}</span></div><p>{finding.detail}</p></article>)}</article>
+              : <div className="ai-assistant-message" key={`${index}-assistant`}><span>InvestiGenie AI</span><p>{message.content}</p></div>)
+          : submittedQuestion && <div className="ai-user-message"><span>You</span><p>{submittedQuestion}</p></div>}
         {starting && <div className="ai-thinking" role="status"><span className="spinner dark" /> Starting investigation…</div>}
         {job && (job.status === 'running' || job.status === 'stopping') && <div className="ai-progress" role="status">
           <span className="spinner dark" />
@@ -260,7 +373,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
 
       <form className="ai-composer" onSubmit={(event) => void investigate(event)}>
         <label className="sr-only" htmlFor="ai-question">Ask InvestiGenie AI</label>
-        <textarea id="ai-question" value={question} maxLength={2000} rows={3} placeholder="Describe what you’re investigating…" onChange={(event) => setQuestion(event.target.value)} onKeyDown={handleComposerKeyDown} disabled={busy || dataViews.length === 0 || !selectedModelId} />
+        <textarea id="ai-question" value={question} maxLength={8000} rows={3} placeholder={activeConversation ? 'Ask a follow-up about this investigation…' : 'Describe what you’re investigating…'} onChange={(event) => setQuestion(event.target.value)} onKeyDown={handleComposerKeyDown} disabled={busy || conversationBusy || (!activeConversation && (dataViews.length === 0 || !selectedModelId))} />
         <div className="ai-composer-footer">
           <div className="ai-model-picker">
             {modelStatus === 'loading' && <span role="status">Loading AI models...</span>}
@@ -270,7 +383,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
             <label className="ai-run-setting" title="How long to wait for each AI provider response"><span>Timeout</span><select aria-label="AI response timeout" value={aiTimeout} disabled={busy} onChange={(event) => updateTimeout(Number(event.target.value))}>{TIMEOUT_OPTIONS.map((seconds) => <option key={seconds} value={seconds}>{durationLabel(seconds)}</option>)}</select></label>
             <label className="ai-run-setting" title="Ask whether to continue after the investigation runs this long"><span>Ask after</span><select aria-label="Ask to continue after" value={checkIn} disabled={busy} onChange={(event) => updateCheckIn(Number(event.target.value))}>{CHECK_IN_OPTIONS.map((seconds) => <option key={seconds} value={seconds}>{durationLabel(seconds)}</option>)}</select></label>
           </div>
-          <button className="ai-send" type="submit" aria-label="Run investigation" title="Run investigation" disabled={busy || !question.trim() || selectedIds.length === 0 || !selectedModelId}><ArrowUp size={17} aria-hidden="true" /></button>
+          <button className="ai-send" type="submit" aria-label={activeConversation ? 'Send follow-up' : 'Run investigation'} title={activeConversation ? 'Send follow-up' : 'Run investigation'} disabled={busy || conversationBusy || !question.trim() || (!activeConversation && (selectedIds.length === 0 || !selectedModelId))}>{conversationBusy ? <span className="spinner" /> : <ArrowUp size={17} aria-hidden="true" />}</button>
         </div>
       </form>
       <p className="ai-privacy-note">Connection credentials remain in InvestiGenie. Selected evidence is sent to the configured AI provider for analysis.</p>

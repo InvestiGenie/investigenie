@@ -489,6 +489,67 @@ async fn concurrent_writers_have_one_winner_and_revision_checks_are_serialized()
 }
 
 #[tokio::test]
+async fn ai_conversations_survive_reopen_and_are_encrypted_revisioned_and_deletable() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(options(directory.path())).await.unwrap();
+    let question = "Why did the checkout service fail?";
+    let conversation = StoredAiConversation::new(
+        "conversation-1".to_owned(),
+        "model-1".to_owned(),
+        vec!["view-1".to_owned()],
+        question.to_owned(),
+    );
+    let created = storage.create_ai_conversation(conversation).await.unwrap();
+    let bytes = fs::read(directory.path().join(SNAPSHOT_NAME)).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains(question));
+    assert_eq!(storage.ai_conversations().await.unwrap()[0].id, created.id);
+
+    let updated = storage
+        .append_ai_conversation_messages(
+            &created.id,
+            &created.revision,
+            vec![StoredAiConversationMessage {
+                role: "assistant".to_owned(),
+                content: "The evidence points to a dependency timeout.".to_owned(),
+                result: Some(json!({"summary":"A dependency timed out"})),
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        storage
+            .append_ai_conversation_messages(
+                &created.id,
+                &created.revision,
+                vec![StoredAiConversationMessage {
+                    role: "assistant".to_owned(),
+                    content: "stale update".to_owned(),
+                    result: None,
+                }],
+            )
+            .await,
+        Err(StorageError::Conflict)
+    ));
+
+    drop(storage);
+    let storage = Storage::open(options(directory.path())).await.unwrap();
+    let reopened = storage.ai_conversation(&created.id).await.unwrap();
+    assert_eq!(reopened.messages.len(), 2);
+    assert_eq!(
+        reopened.messages[1].result.as_ref().unwrap()["summary"],
+        "A dependency timed out"
+    );
+    storage
+        .remove_ai_conversation(&created.id, &updated.revision)
+        .await
+        .unwrap();
+    assert!(matches!(
+        storage.ai_conversation(&created.id).await,
+        Err(StorageError::AiConversationNotFound)
+    ));
+}
+
+#[tokio::test]
 async fn connection_type_changes_and_invalid_views_do_not_commit() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::open(options(directory.path())).await.unwrap();

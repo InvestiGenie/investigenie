@@ -44,6 +44,7 @@ pub fn descriptor() -> IntegrationDescriptor {
         connection_fields: vec![
             serde_json::json!({"name":"url","label":"URL","input_type":"url","required":true,"secret":false,"editable":true,"placeholder":"http://localhost:8123"}),
             serde_json::json!({"name":"database","label":"Database","input_type":"text","required":false,"secret":false,"editable":true,"placeholder":"default"}),
+            serde_json::json!({"name":"max_execution_time","label":"Max execution time (seconds, optional)","input_type":"text","required":false,"secret":false,"editable":true,"placeholder":"Blank uses the server default (client timeout: 15s)"}),
             serde_json::json!({"name":"username","label":"Username","input_type":"text","required":false,"secret":true,"editable":true,"group":"credentials","placeholder":""}),
             serde_json::json!({"name":"password","label":"Password","input_type":"password","required":false,"secret":true,"editable":true,"group":"credentials","placeholder":""}),
         ],
@@ -58,6 +59,7 @@ pub struct ClickHouseClient {
     database: Option<String>,
     username: Option<String>,
     password: Option<String>,
+    max_execution_time: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -70,6 +72,8 @@ pub enum ClickHouseError {
     InvalidQuery,
     #[error("Could not configure the ClickHouse HTTP client")]
     ClientConfiguration,
+    #[error("ClickHouse max execution time must be a whole number from 1 to 600 seconds")]
+    InvalidExecutionTime,
     #[error("ClickHouse request could not be completed")]
     Request,
     #[error("ClickHouse returned HTTP {status}: {detail}")]
@@ -125,11 +129,22 @@ struct BreakdownRow {
 }
 
 impl ClickHouseClient {
+    #[cfg(test)]
     pub fn new(
         raw_url: &str,
         database: Option<String>,
         username: Option<String>,
         password: Option<String>,
+    ) -> Result<Self, ClickHouseError> {
+        Self::with_execution_limit(raw_url, database, username, password, None)
+    }
+
+    pub(super) fn with_execution_limit(
+        raw_url: &str,
+        database: Option<String>,
+        username: Option<String>,
+        password: Option<String>,
+        max_execution_time: Option<&str>,
     ) -> Result<Self, ClickHouseError> {
         let url = Url::parse(raw_url).map_err(|_| ClickHouseError::InvalidUrl)?;
         if !matches!(url.scheme(), "http" | "https")
@@ -151,8 +166,12 @@ impl ClickHouseClient {
         if username.is_none() && password.as_deref().is_some_and(|value| !value.is_empty()) {
             return Err(ClickHouseError::ClientConfiguration);
         }
+        let max_execution_time = parse_max_execution_time(max_execution_time)?;
+        let request_timeout = max_execution_time
+            .map(|seconds| Duration::from_secs(seconds.saturating_add(5)))
+            .unwrap_or(REQUEST_TIMEOUT);
         let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(request_timeout)
             .build()
             .map_err(|_| ClickHouseError::ClientConfiguration)?;
 
@@ -162,6 +181,7 @@ impl ClickHouseClient {
             database,
             username,
             password,
+            max_execution_time,
         })
     }
 
@@ -213,46 +233,6 @@ impl ClickHouseClient {
                 ))
             })
             .collect())
-    }
-
-    pub async fn search(
-        &self,
-        query: &str,
-        from: usize,
-        size: usize,
-        time_field: Option<ClickHouseTimeField<'_>>,
-        sort_by: Option<&str>,
-        sort_order: Option<&str>,
-    ) -> Result<ClickHouseSearchResult, ClickHouseError> {
-        self.search_page(
-            query, from, size, time_field, sort_by, sort_order, None, None,
-        )
-        .await
-    }
-
-    pub async fn search_page(
-        &self,
-        query: &str,
-        from: usize,
-        size: usize,
-        time_field: Option<ClickHouseTimeField<'_>>,
-        sort_by: Option<&str>,
-        sort_order: Option<&str>,
-        cursor: Option<&str>,
-        include_histogram: Option<bool>,
-    ) -> Result<ClickHouseSearchResult, ClickHouseError> {
-        self.search_page_with_histogram(
-            query,
-            from,
-            size,
-            time_field,
-            sort_by,
-            sort_order,
-            cursor,
-            include_histogram,
-            &HistogramOptions::default(),
-        )
-        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -309,13 +289,9 @@ impl ClickHouseClient {
         } else {
             String::new()
         };
-        let bounded_query = format!(
-            "SELECT * FROM ({filtered_query}){ordering} LIMIT {size} OFFSET {offset} FORMAT JSON"
-        );
+        let bounded_query = format!("SELECT * FROM ({filtered_query}){ordering} LIMIT {size} OFFSET {offset} FORMAT JSON");
         let started = Instant::now();
-        let response = self
-            .execute_with_limits(&bounded_query, cursor.is_some())
-            .await?;
+        let response = self.execute(&bounded_query).await?;
         let parsed: JsonResponse =
             serde_json::from_value(response).map_err(|_| ClickHouseError::InvalidResponse)?;
         let mut histogram = Vec::new();
@@ -325,7 +301,7 @@ impl ClickHouseClient {
             .filter(|_| include_histogram.unwrap_or(true) && cursor.is_none_or(str::is_empty))
         {
             if parsed.meta.iter().any(|column| column.name == field) {
-                histogram = match histogram_options.interval {
+                let result = match histogram_options.interval {
                     Some(_) => {
                         let breakdown = histogram_options
                             .breakdown_field
@@ -335,11 +311,28 @@ impl ClickHouseClient {
                             .interval
                             .map(|interval| format!("{}{}", interval.count, interval.suffix()));
                         self.interval_histogram(&filtered_query, field, breakdown, histogram_options)
-                            .await?
+                            .await
                     }
-                    None => {
-                        self.histogram(&filtered_query, field, cursor.is_some())
-                            .await?
+                    None => self.histogram(&filtered_query, field).await,
+                };
+                match result {
+                    Ok(buckets) => histogram = buckets,
+                    Err(ClickHouseError::Rejected { status, .. }) => {
+                        tracing::warn!(
+                            upstream_status = status,
+                            "ClickHouse histogram query failed; returning rows without a histogram"
+                        );
+                        histogram_unavailable_reason = Some(
+                            "ClickHouse could not calculate the histogram; document results are still available.",
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "ClickHouse histogram query failed; returning rows without a histogram"
+                        );
+                        histogram_unavailable_reason = Some(
+                            "ClickHouse could not calculate the histogram; document results are still available.",
+                        );
                     }
                 };
             } else {
@@ -393,9 +386,7 @@ impl ClickHouseClient {
             "SELECT toString({bucket}) AS timestamp, toString(count()) AS count {source} \
              GROUP BY timestamp ORDER BY toInt64(timestamp) LIMIT 1001 FORMAT JSON"
         );
-        let response: JsonResponse = serde_json::from_value(
-            self.execute_limited(&totals_query, true, "1001").await?,
-        )
+        let response: JsonResponse = serde_json::from_value(self.execute(&totals_query).await?)
         .map_err(|_| ClickHouseError::InvalidResponse)?;
         let mut buckets = response
             .data
@@ -421,9 +412,7 @@ impl ClickHouseClient {
              SELECT toString(bucket_ms) AS timestamp, breakdown_key AS key, toString(count()) AS count FROM breakdown_source \
              WHERE breakdown_key IN (SELECT breakdown_key FROM top_keys) GROUP BY bucket_ms, breakdown_key ORDER BY bucket_ms LIMIT 4004 FORMAT JSON"
         );
-        let response: JsonResponse = serde_json::from_value(
-            self.execute_limited(&breakdown_query, true, "4004").await?,
-        )
+        let response: JsonResponse = serde_json::from_value(self.execute(&breakdown_query).await?)
         .map_err(|_| ClickHouseError::InvalidResponse)?;
         let mut rows = Vec::with_capacity(response.data.len());
         let mut key_totals = Vec::<(String, u64)>::new();
@@ -465,7 +454,6 @@ impl ClickHouseClient {
         &self,
         query: &str,
         field: &str,
-        paginated: bool,
     ) -> Result<Vec<ClickHouseHistogramBucket>, ClickHouseError> {
         if field.is_empty() || field.len() > 255 {
             return Err(ClickHouseError::InvalidIdentifier);
@@ -478,10 +466,7 @@ impl ClickHouseClient {
              FROM histogram_source CROSS JOIN histogram_bounds GROUP BY intDiv(time_ms, interval_ms) * interval_ms \
              ORDER BY intDiv(time_ms, interval_ms) * interval_ms LIMIT 61 FORMAT JSON"
         );
-        let response: JsonResponse = serde_json::from_value(
-            self.execute_with_limits(&histogram_query, paginated)
-                .await?,
-        )
+        let response: JsonResponse = serde_json::from_value(self.execute(&histogram_query).await?)
         .map_err(|_| ClickHouseError::InvalidResponse)?;
         response
             .data
@@ -506,36 +491,13 @@ impl ClickHouseClient {
     }
 
     async fn execute(&self, query: &str) -> Result<Value, ClickHouseError> {
-        self.execute_with_limits(query, false).await
-    }
-
-    async fn execute_with_limits(
-        &self,
-        query: &str,
-        paginated: bool,
-    ) -> Result<Value, ClickHouseError> {
-        self.execute_limited(query, paginated, "100").await
-    }
-
-    async fn execute_limited(
-        &self,
-        query: &str,
-        paginated: bool,
-        max_result_rows: &str,
-    ) -> Result<Value, ClickHouseError> {
         let mut request = self
             .client
             .post(self.url.clone())
             .query(&[("default_format", "JSON"), ("readonly", "1")])
             .body(query.to_owned());
-        if paginated {
-            request = request.query(&[
-                ("max_execution_time", "10"),
-                ("timeout_overflow_mode", "throw"),
-                ("max_memory_usage", "268435456"),
-                ("max_result_rows", max_result_rows),
-                ("result_overflow_mode", "throw"),
-            ]);
+        if let Some(max_execution_time) = self.max_execution_time {
+            request = request.query(&[("max_execution_time", max_execution_time)]);
         }
         if let Some(database) = self.database.as_deref() {
             request = request.query(&[("database", database)]);
@@ -563,6 +525,19 @@ fn validate_read_query(query: &str) -> Result<(), ClickHouseError> {
         return Err(ClickHouseError::InvalidQuery);
     }
     Ok(())
+}
+
+fn parse_max_execution_time(value: Option<&str>) -> Result<Option<u64>, ClickHouseError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| ClickHouseError::InvalidExecutionTime)?;
+    if !(1..=600).contains(&seconds) {
+        return Err(ClickHouseError::InvalidExecutionTime);
+    }
+    Ok(Some(seconds))
 }
 
 fn valid_identifier(value: &str) -> bool {
@@ -594,8 +569,177 @@ async fn decode(response: Response) -> Result<Value, ClickHouseError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_read_query, ClickHouseClient, ClickHouseError};
+    use super::{
+        validate_read_query, ClickHouseClient, ClickHouseError, ClickHouseSearchResult,
+        ClickHouseTimeField, HistogramOptions,
+    };
     use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+    trait SearchTestHelpers {
+        async fn search(
+            &self,
+            query: &str,
+            from: usize,
+            size: usize,
+            time_field: Option<ClickHouseTimeField<'_>>,
+            sort_by: Option<&str>,
+            sort_order: Option<&str>,
+        ) -> Result<ClickHouseSearchResult, ClickHouseError>;
+
+        async fn search_page(
+            &self,
+            query: &str,
+            from: usize,
+            size: usize,
+            time_field: Option<ClickHouseTimeField<'_>>,
+            sort_by: Option<&str>,
+            sort_order: Option<&str>,
+            cursor: Option<&str>,
+            include_histogram: Option<bool>,
+        ) -> Result<ClickHouseSearchResult, ClickHouseError>;
+    }
+
+    impl SearchTestHelpers for ClickHouseClient {
+        async fn search(
+            &self,
+            query: &str,
+            from: usize,
+            size: usize,
+            time_field: Option<ClickHouseTimeField<'_>>,
+            sort_by: Option<&str>,
+            sort_order: Option<&str>,
+        ) -> Result<ClickHouseSearchResult, ClickHouseError> {
+            self.search_page_with_histogram(
+                query,
+                from,
+                size,
+                time_field,
+                sort_by,
+                sort_order,
+                None,
+                None,
+                &HistogramOptions::default(),
+            )
+            .await
+        }
+
+        async fn search_page(
+            &self,
+            query: &str,
+            from: usize,
+            size: usize,
+            time_field: Option<ClickHouseTimeField<'_>>,
+            sort_by: Option<&str>,
+            sort_order: Option<&str>,
+            cursor: Option<&str>,
+            include_histogram: Option<bool>,
+        ) -> Result<ClickHouseSearchResult, ClickHouseError> {
+            self.search_page_with_histogram(
+                query,
+                from,
+                size,
+                time_field,
+                sort_by,
+                sort_order,
+                cursor,
+                include_histogram,
+                &HistogramOptions::default(),
+            )
+            .await
+        }
+    }
+
+    #[test]
+    fn max_execution_time_is_optional_and_bounded() {
+        assert_eq!(super::parse_max_execution_time(None).unwrap(), None);
+        assert_eq!(super::parse_max_execution_time(Some(" ")).unwrap(), None);
+        for value in ["1", "10", "600"] {
+            assert!(super::parse_max_execution_time(Some(value)).is_ok());
+        }
+        for value in ["0", "601", "1.5", "invalid"] {
+            assert!(matches!(
+                super::parse_max_execution_time(Some(value)),
+                Err(ClickHouseError::InvalidExecutionTime)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn max_execution_time_is_sent_only_when_configured() {
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_string("SELECT 1 FORMAT JSON"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [], "data": [], "rows": 0
+            })))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        for limit in [None, Some(""), Some("7")] {
+            let client = ClickHouseClient::with_execution_limit(
+                &server.uri(),
+                None,
+                None,
+                None,
+                limit,
+            )
+            .unwrap();
+            client.test_connection().await.unwrap();
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(!requests[0].url.as_str().contains("max_execution_time"));
+        assert!(!requests[1].url.as_str().contains("max_execution_time"));
+        assert!(requests[2].url.as_str().contains("max_execution_time=7"));
+    }
+
+    #[tokio::test]
+    async fn paginated_requests_do_not_override_readonly_profile_limits() {
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::query_param("readonly", "1"))
+            .and(matchers::body_string(
+                "SELECT * FROM (SELECT 1 AS value) ORDER BY ALL LIMIT 10 OFFSET 0 FORMAT JSON",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name":"value"}], "data": [{"value":1}], "rows": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = ClickHouseClient::with_execution_limit(
+            &server.uri(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        client
+            .search_page_with_histogram(
+                "SELECT 1 AS value",
+                0,
+                10,
+                None,
+                None,
+                None,
+                Some(""),
+                Some(false),
+                &HistogramOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let query_keys = requests[0]
+            .url
+            .query_pairs()
+            .map(|(key, _)| key.into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(query_keys, ["default_format", "readonly"]);
+    }
 
     #[test]
     fn numeric_cursor_offsets_are_checked_without_the_legacy_ceiling() {
@@ -630,9 +774,6 @@ mod tests {
             Mock::given(matchers::method("POST"))
                 .and(matchers::query_param("readonly", "1"))
                 .and(matchers::query_param("max_execution_time", "10"))
-                .and(matchers::query_param("timeout_overflow_mode", "throw"))
-                .and(matchers::query_param("max_result_rows", "100"))
-                .and(matchers::query_param("result_overflow_mode", "throw"))
                 .and(matchers::body_string(format!("SELECT * FROM (SELECT created_at FROM events) ORDER BY `created_at` ASC, tuple(*) ASC LIMIT 2 OFFSET {offset} FORMAT JSON")))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "meta":[{"name":"created_at"}],"data":data,"rows":rows
@@ -640,7 +781,6 @@ mod tests {
         }
         Mock::given(matchers::method("POST"))
             .and(matchers::query_param("max_execution_time", "10"))
-            .and(matchers::query_param("max_memory_usage", "268435456"))
             .and(|request: &wiremock::Request| {
                 String::from_utf8_lossy(&request.body).starts_with("WITH histogram_source")
             })
@@ -650,7 +790,14 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let client = ClickHouseClient::new(&server.uri(), None, None, None).unwrap();
+        let client = ClickHouseClient::with_execution_limit(
+            &server.uri(),
+            None,
+            None,
+            None,
+            Some("10"),
+        )
+        .unwrap();
         let request = |token: &str| {
             serde_json::from_value(json!({
             "index":"events","query":"SELECT created_at FROM events","from":99999,"size":2,
@@ -689,7 +836,6 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(matchers::method("POST"))
-            .and(matchers::query_param("max_result_rows", "1001"))
             .and(|request: &wiremock::Request| {
                 let body = String::from_utf8_lossy(&request.body);
                 body.starts_with("SELECT toString(toUnixTimestamp64Milli(")
@@ -703,7 +849,6 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(matchers::method("POST"))
-            .and(matchers::query_param("max_result_rows", "4004"))
             .and(|request: &wiremock::Request| {
                 let body = String::from_utf8_lossy(&request.body);
                 body.starts_with("WITH breakdown_source") && body.contains("toString(`service`)")
@@ -918,6 +1063,57 @@ mod tests {
         assert!(result.histogram.is_empty());
         assert!(result.histogram_unavailable_reason.is_some());
         assert_eq!(result.rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn histogram_server_error_does_not_discard_successful_rows() {
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::body_string(
+                "SELECT * FROM (SELECT * FROM actors) ORDER BY ALL LIMIT 50 OFFSET 0 FORMAT JSON",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name":"created_at","type":"DateTime"},{"name":"name","type":"String"}],
+                "data": [{"created_at":"2026-10-14 12:00:00","name":"Ada"}],
+                "rows": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(|request: &wiremock::Request| {
+                String::from_utf8_lossy(&request.body).starts_with("WITH histogram_source")
+            })
+            .respond_with(ResponseTemplate::new(500).set_body_string("histogram conversion failed"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ClickHouseClient::new(&server.uri(), None, None, None).unwrap();
+        let result = client
+            .search_page_with_histogram(
+                "SELECT * FROM actors",
+                0,
+                50,
+                Some(super::ClickHouseTimeField {
+                    name: "created_at",
+                    range: None,
+                }),
+                None,
+                None,
+                Some(""),
+                Some(true),
+                &super::HistogramOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert!(result.histogram.is_empty());
+        assert!(result
+            .histogram_unavailable_reason
+            .unwrap()
+            .contains("document results are still available"));
     }
 
     #[tokio::test]

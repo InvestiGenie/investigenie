@@ -272,6 +272,7 @@ describe('ConnectionsPage', () => {
     fireEvent.change(screen.getByLabelText('Connection name'), { target: { value: 'Warehouse' } });
     fireEvent.change(screen.getByLabelText('HTTP endpoint'), { target: { value: 'http://localhost:8123' } });
     fireEvent.change(screen.getByLabelText('Database'), { target: { value: 'analytics' } });
+    fireEvent.change(screen.getByLabelText('Max execution time (seconds, optional)'), { target: { value: '7' } });
     fireEvent.change(screen.getByLabelText('Username'), { target: { value: 'reader' } });
     fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'secret' } });
     fireEvent.click(screen.getByRole('button', { name: 'Test and add' }));
@@ -284,6 +285,7 @@ describe('ConnectionsPage', () => {
       connection_type: 'clickhouse',
       url: 'http://localhost:8123',
       database: 'analytics',
+      max_execution_time: '7',
       username: 'reader',
       password: 'secret',
     });
@@ -302,7 +304,9 @@ describe('ConnectionsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Test and add' }));
     await screen.findByText('Connection tested and added.');
     const addCall = vi.mocked(fetch).mock.calls.find(([, init]) => init?.method === 'POST');
-    expect(JSON.parse(String(addCall?.[1]?.body))).toMatchObject({ username: 'explorer', password: '' });
+    const request = JSON.parse(String(addCall?.[1]?.body));
+    expect(request).toMatchObject({ username: 'explorer', password: '' });
+    expect(request).not.toHaveProperty('max_execution_time');
   });
 
   it.each(['none', 'basic', 'api_key'])('retains the Elasticsearch %s authentication workflow through metadata', async (authType) => {
@@ -455,7 +459,7 @@ describe('ConnectionsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
     await screen.findByText('Connection updated and tested.');
     expect(JSON.parse(String(vi.mocked(fetch).mock.calls[0][1]?.body))).toEqual({
-      name: 'Source', url: 'http://localhost:9200', database: null, username,
+      name: 'Source', url: 'http://localhost:9200', database: null, max_execution_time: null, username,
     });
   });
 
@@ -468,7 +472,7 @@ describe('ConnectionsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
     await screen.findByText('Connection updated and tested.');
     expect(JSON.parse(String(vi.mocked(fetch).mock.calls[0][1]?.body))).toEqual({
-      name: 'Source', url: 'http://localhost:9200', database: null, password,
+      name: 'Source', url: 'http://localhost:9200', database: null, max_execution_time: null, password,
     });
   });
 
@@ -612,7 +616,7 @@ describe('ConnectionsPage', () => {
     const updateCall = vi.mocked(fetch).mock.calls.find(([url, init]) => String(url).endsWith('/api/connections/warehouse') && init?.method === 'PUT');
     const request = JSON.parse(String(updateCall?.[1]?.body));
     expect(updateCall?.[1]).toMatchObject({ headers: { 'If-Match': '"source-revision"' } });
-    expect(request).toEqual({ name: 'Warehouse', url: 'http://warehouse.internal:8123', database: 'analytics' });
+    expect(request).toEqual({ name: 'Warehouse', url: 'http://warehouse.internal:8123', database: 'analytics', max_execution_time: null });
     expect(request).not.toHaveProperty('password');
     expect(request).not.toHaveProperty('username');
     expect(await screen.findByText('Connection updated and tested.')).toBeInTheDocument();

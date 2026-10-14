@@ -21,6 +21,8 @@ pub(super) struct Snapshot {
     pub views: BTreeMap<String, DataView>,
     #[serde(default)]
     pub ai_models: BTreeMap<String, StoredAiModel>,
+    #[serde(default)]
+    pub ai_conversations: BTreeMap<String, StoredAiConversation>,
     pub settings: PublicSettings,
 }
 
@@ -32,6 +34,7 @@ impl Snapshot {
             connections: BTreeMap::new(),
             views: BTreeMap::new(),
             ai_models: BTreeMap::new(),
+            ai_conversations: BTreeMap::new(),
             settings: PublicSettings {
                 settings: json!({"theme":"system", "default_timezone":"UTC"}),
                 revision: revision(),
@@ -73,6 +76,12 @@ impl Snapshot {
                 || Uuid::parse_str(&model.revision).is_err()
                 || !model_names.insert(model.name.to_lowercase())
             {
+                return Err(StorageError::Invalid);
+            }
+        }
+        for (id, conversation) in &self.ai_conversations {
+            validate_ai_conversation(conversation)?;
+            if id != &conversation.id {
                 return Err(StorageError::Invalid);
             }
         }
@@ -496,6 +505,70 @@ impl FileStorage {
                 return Err(StorageError::Conflict);
             }
             snapshot.ai_models.remove(&id);
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn create_ai_conversation(
+        self: &Arc<Self>,
+        conversation: StoredAiConversation,
+    ) -> Result<(), StorageError> {
+        self.mutate(move |snapshot| {
+            validate_ai_conversation(&conversation)?;
+            if snapshot.ai_conversations.len() >= MAX_AI_CONVERSATIONS {
+                return Err(StorageError::Invalid);
+            }
+            if snapshot.ai_conversations.contains_key(&conversation.id) {
+                return Err(StorageError::Duplicate);
+            }
+            snapshot
+                .ai_conversations
+                .insert(conversation.id.clone(), conversation);
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn append_ai_conversation_messages(
+        self: &Arc<Self>,
+        id: String,
+        expected: String,
+        messages: Vec<StoredAiConversationMessage>,
+    ) -> Result<StoredAiConversation, StorageError> {
+        self.mutate(move |snapshot| {
+            let current = snapshot
+                .ai_conversations
+                .get(&id)
+                .ok_or(StorageError::AiConversationNotFound)?;
+            if current.revision != expected {
+                return Err(StorageError::Conflict);
+            }
+            let mut updated = current.clone();
+            updated.messages.extend(messages);
+            updated.revision = revision();
+            updated.updated_at_ms = conversation_timestamp();
+            validate_ai_conversation(&updated)?;
+            snapshot.ai_conversations.insert(id, updated.clone());
+            Ok(updated)
+        })
+        .await
+    }
+
+    pub async fn remove_ai_conversation(
+        self: &Arc<Self>,
+        id: String,
+        expected: String,
+    ) -> Result<(), StorageError> {
+        self.mutate(move |snapshot| {
+            let current = snapshot
+                .ai_conversations
+                .get(&id)
+                .ok_or(StorageError::AiConversationNotFound)?;
+            if current.revision != expected {
+                return Err(StorageError::Conflict);
+            }
+            snapshot.ai_conversations.remove(&id);
             Ok(())
         })
         .await

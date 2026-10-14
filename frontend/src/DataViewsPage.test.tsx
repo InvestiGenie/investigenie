@@ -148,6 +148,25 @@ describe('DataViewsPage', () => {
     expect(picker).toHaveValue('logs-app-051');
   });
 
+  it('allows a custom multi-index pattern and validates its fields before saving', async () => {
+    render(<DataViewsPage connections={connections} dataViews={[]} onDataViewsChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /Add data view/ }));
+    fireEvent.change(screen.getByLabelText('Data view name'), { target: { value: 'Daily logs' } });
+    fireEvent.change(screen.getByLabelText('Connection'), { target: { value: 'logs-source' } });
+    const picker = screen.getByRole('combobox', { name: 'Index / table' });
+    fireEvent.click(picker);
+    fireEvent.change(picker, { target: { value: 'logs-*,metrics-*' } });
+    fireEvent.click(await screen.findByRole('option', { name: 'Use index pattern or table: logs-*,metrics-*' }));
+    await waitFor(() => expect(screen.getByLabelText('Time series time field')).toHaveValue('timestamp'));
+    expect(screen.getByRole('button', { name: 'Create data view' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Create data view' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('Data view validated and created.');
+    const createCall = vi.mocked(fetch).mock.calls.find(([, init]) => init?.method === 'POST');
+    expect(JSON.parse(String(createCall?.[1]?.body))).toEqual({
+      name: 'Daily logs', connection_id: 'logs-source', index: 'logs-*,metrics-*', time_field: 'timestamp',
+    });
+  });
+
   it('refreshes saved views only after successful server validation', async () => {
     const refresh = vi.fn().mockResolvedValue(undefined);
     render(<DataViewsPage connections={connections} dataViews={[]} onDataViewsChange={refresh} />);

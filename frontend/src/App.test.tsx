@@ -33,6 +33,7 @@ describe('Discover', () => {
     clearPreference('timezone');
     document.documentElement.dataset.theme = 'light';
     vi.spyOn(api, 'aiModels').mockResolvedValue([]);
+    vi.spyOn(api, 'aiConversations').mockResolvedValue([]);
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       if (String(input).endsWith('/status')) return jsonResponse({ status: 'connected' });
       throw new Error(`Unexpected request: ${String(input)}`);

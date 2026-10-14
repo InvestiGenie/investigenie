@@ -153,8 +153,10 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
               value={index}
               disabled={!connectionId}
               loading={indicesLoading}
-              placeholder="Search indices or tables"
+              placeholder="Search or enter an index pattern"
               emptyLabel={connectionId ? 'Select an index or table' : 'Select a connection first'}
+              allowCustom
+              customLabel="Use index pattern or table"
               options={indices.map((item) => ({
                 value: item.name,
                 description: item.document_count ? `${formatCount(item.document_count)} docs` : undefined,
@@ -166,7 +168,7 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
             <label>Time series time field<select required value={timeField} disabled={!index || fields.filter(isTimeField).length === 0} onChange={(event) => setTimeField(event.target.value)}><option value="">Select a date/time field</option>{fields.filter(isTimeField).map((field) => <option key={field.name} value={field.name}>{field.name} · {field.field_type}</option>)}</select></label>
           </div>
           {index && fields.length > 0 && fields.filter(isTimeField).length === 0 && <p className="connections-empty">The selected source has no date/time fields; this index/table cannot be used for a time-series data view.</p>}
-          <div className="connection-form-footer"><span>InvestiGenie data views</span><button className="search-button" type="submit" disabled={busy || !connectionId || !indices.some((item) => item.name === index) || !fields.some((field) => field.name === timeField && isTimeField(field))}>{busy ? <span className="spinner" /> : <span aria-hidden="true">＋</span>}{busy ? 'Validating' : editingViewId ? 'Save changes' : 'Create data view'}</button></div>
+          <div className="connection-form-footer"><span>InvestiGenie data views</span><button className="search-button" type="submit" disabled={busy || !connectionId || !fields.some((field) => field.name === timeField && isTimeField(field))}>{busy ? <span className="spinner" /> : <span aria-hidden="true">＋</span>}{busy ? 'Validating' : editingViewId ? 'Save changes' : 'Create data view'}</button></div>
         </form>}
     </section>}
   </main>;
