@@ -1,6 +1,8 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { api, type ConnectionSummary, type DataViewSummary, type FieldSummary, type IndexSummary } from './api';
 import SearchableSelect from './SearchableSelect';
+import { errorMessage, formatCount } from './format';
+import { ErrorAlert, StatusNotice } from './PageFeedback';
 
 type DataViewsPageProps = {
   connections: ConnectionSummary[];
@@ -122,8 +124,8 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
       {stage === 'list' && <button className="search-button add-connection-button" onClick={() => configureDataView()}><span aria-hidden="true">＋</span> Add data view</button>}
     </div>
 
-    {error && <div className="alert" role="alert"><span className="alert-symbol">!</span><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError('')}>×</button></div>}
-    {notice && <div className="connection-notice" role="status">{notice}</div>}
+    {error && <ErrorAlert message={error} onDismiss={() => setError('')} />}
+    {notice && <StatusNotice message={notice} />}
 
     {stage === 'list' && <section className="connections-section" aria-labelledby="saved-data-views-title">
       <div className="section-heading"><div><h2 id="saved-data-views-title">Saved data views</h2><p>Only validated data views are available in Discover.</p></div><span className="field-count">{dataViews.length}</span></div>
@@ -159,7 +161,7 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
               customLabel="Use index pattern or table"
               options={indices.map((item) => ({
                 value: item.name,
-                description: item.document_count ? `${formatCount(item.document_count)} docs` : undefined,
+                description: item.document_count ? `${formatCount(item.document_count, { notation: 'compact' })} docs` : undefined,
                 badge: item.health ?? undefined,
                 tone: item.health ? `health-${item.health}` : undefined,
               }))}
@@ -172,13 +174,4 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
         </form>}
     </section>}
   </main>;
-}
-
-function errorMessage(reason: unknown): string {
-  return reason instanceof Error ? reason.message : 'An unexpected request error occurred';
-}
-
-function formatCount(value: string): string {
-  const count = Number(value);
-  return Number.isFinite(count) ? new Intl.NumberFormat(undefined, { notation: 'compact' }).format(count) : value;
 }

@@ -6,6 +6,7 @@ import DataViewsPage from './DataViewsPage';
 import TimeRangePicker from './TimeRangePicker';
 import { getPreference, setPreference } from './preferences';
 import { formatTimestamp, initialTimeZone, isDateField } from './time';
+import { errorMessage, formatCount } from './format';
 import { applyQueryTemplate, resolveSearchQuery } from './query';
 import { describeInterval, INTERVAL_CHOICES, resolveInterval, type IntervalChoice } from './histogram';
 import investigenieSpark from './investigenie-spark.svg';
@@ -29,12 +30,6 @@ function displayValue(value: unknown): string {
   if (typeof value === 'string') return value;
   if (typeof value === 'object') return JSON.stringify(value);
   return String(value);
-}
-
-function formatCount(value: string | null | undefined): string {
-  if (!value) return '—';
-  const count = Number(value);
-  return Number.isFinite(count) ? new Intl.NumberFormat().format(count) : value;
 }
 
 function flattenSource(value: unknown, prefix = ''): Array<[string, unknown]> {
@@ -88,8 +83,9 @@ export default function App() {
   const [fieldFilter, setFieldFilter] = useState('');
   const [selectedFieldsByView, setSelectedFieldsByView] = useState<Record<string, string[]>>({});
   const [query, setQuery] = useState('');
-  const [startDate, setStartDate] = useState('');
-  const [endDate, setEndDate] = useState('');
+  const [initialTime] = useState(() => Date.now());
+  const [startDate, setStartDate] = useState(() => utcInput(initialTime - 15 * 60_000));
+  const [endDate, setEndDate] = useState(() => utcInput(initialTime));
   const [sortBy, setSortBy] = useState('');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
   const [results, setResults] = useState<SearchResult | null>(null);
@@ -112,8 +108,9 @@ export default function App() {
     return {
       ...body,
       cursor: '',
-      ...(resolved ? { histogram_interval: resolved.interval, time_zone: timeZone } : {}),
-      ...(resolved && breakdown ? { histogram_breakdown_field: breakdown } : {}),
+      time_zone: timeZone,
+      ...(resolved ? { histogram_interval: resolved.interval } : {}),
+      ...(breakdown ? { histogram_breakdown_field: breakdown } : {}),
     };
   }
 
@@ -477,7 +474,7 @@ export default function App() {
 
             {histogramField && results && <section className={`histogram-panel${histogramVisible ? '' : ' collapsed'}`} aria-labelledby="histogram-title">
               <div className="histogram-heading">
-                <div><h2 id="histogram-title">Documents over time</h2><p>{histogramField} · {formatCount(String(queryMetadata?.histogram_total_from_buckets ? results.histogram.reduce((count, bucket) => count + bucket.count, 0) : results.total))} matching documents</p></div>
+                <div><h2 id="histogram-title">Documents over time</h2><p>{histogramField} · {formatCount(String(queryMetadata?.histogram_total_from_buckets ? results.histogram.reduce((count, bucket) => count + bucket.count, 0) : results.total))}{!queryMetadata?.histogram_total_from_buckets && results.total_relation === 'gte' ? '+' : ''} matching documents</p></div>
                 <div className="histogram-controls">
                   {histogramVisible && <>
                     <label className="histogram-control" title={histogramTimeRange ? 'Histogram bucket size' : 'Choose a time window to set the interval'}>
@@ -487,11 +484,11 @@ export default function App() {
                       </select>
                     </label>
                     {resolvedInterval?.scaled && <span className="histogram-scaled" role="note" title={`The ${histogramInterval} interval creates too many buckets for this time range, so it was scaled up.`}>Scaled to {describeInterval(resolvedInterval.interval)}</span>}
-                    <label className="histogram-control" title={histogramTimeRange ? 'Stack bars by the top values of a field' : 'Choose a time window to break down by a field'}>
+                    <label className="histogram-control" title="Stack bars by the top values of a field">
                       <span>Break down by</span>
-                      <select aria-label="Break down by" value={breakdownField} disabled={!histogramTimeRange || loading || breakdownFields.length === 0} onChange={(event) => changeBreakdown(event.target.value)}>
+                      <select aria-label="Break down by" value={breakdownField} disabled={loading || breakdownFields.length === 0} onChange={(event) => changeBreakdown(event.target.value)}>
                         <option value="">No breakdown</option>
-                        {histogramTimeRange && breakdownFields.map((field) => <option key={field.name} value={field.name}>{field.name}</option>)}
+                        {breakdownFields.map((field) => <option key={field.name} value={field.name}>{field.name}</option>)}
                       </select>
                     </label>
                   </>}
@@ -580,8 +577,4 @@ export default function App() {
       </div>}
     </div>
   );
-}
-
-function errorMessage(reason: unknown): string {
-  return reason instanceof Error ? reason.message : 'An unexpected request error occurred';
 }

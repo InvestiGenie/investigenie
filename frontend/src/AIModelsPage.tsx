@@ -1,5 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { api, type AIModelRequest, type AIModelSummary } from './api';
+import { errorMessage } from './format';
+import { ErrorAlert, StatusNotice } from './PageFeedback';
 
 export default function AIModelsPage() {
   const [models, setModels] = useState<AIModelSummary[]>([]);
@@ -96,9 +98,9 @@ export default function AIModelsPage() {
     <div className="connections-heading">
       {!formOpen && models.length > 0 && <button className="search-button add-connection-button" onClick={() => configure()}><span aria-hidden="true">＋</span> Add AI model</button>}
     </div>
-    {error && <div className="alert" role="alert"><span className="alert-symbol">!</span><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError('')}>×</button></div>}
+    {error && <ErrorAlert message={error} onDismiss={() => setError('')} />}
     {loadError && <div className="alert" role="alert"><span className="alert-symbol">!</span><span>{loadError}</span><button className="icon-button" aria-label="Retry loading AI models" title="Retry loading AI models" onClick={() => setRefreshAttempt((attempt) => attempt + 1)}>↻</button></div>}
-    {notice && <div className="connection-notice" role="status">{notice}</div>}
+    {notice && <StatusNotice message={notice} />}
 
     {!editingModel && <section className="connections-section" aria-labelledby="saved-ai-models-title">
       <div className="section-heading"><div><h2 id="saved-ai-models-title">Saved AI models</h2><p>Provider connections are tested by the server before they are saved.</p></div><span className="field-count">{models.length}</span></div>
@@ -128,8 +130,4 @@ export default function AIModelsPage() {
       </form>
     </section>}
   </main>;
-}
-
-function errorMessage(reason: unknown): string {
-  return reason instanceof Error ? reason.message : 'An unexpected request error occurred';
 }

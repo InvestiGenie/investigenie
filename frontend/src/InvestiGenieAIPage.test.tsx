@@ -98,6 +98,11 @@ describe('InvestiGenieAIPage', () => {
     await screen.findByRole('option', { name: 'Why did checkout fail?' });
     fireEvent.change(history, { target: { value: 'chat-1' } });
     expect(await screen.findByText(result.summary)).toBeInTheDocument();
+    expect(screen.getAllByText(result.summary)).toHaveLength(1);
+    expect(screen.getByText('medium confidence')).toBeInTheDocument();
+    expect(screen.getByText('analysis: 360 total (300 prompt + 60 completion)')).toBeInTheDocument();
+    expect(screen.getByText(result.caveats[0])).toBeInTheDocument();
+    expect(screen.getByText('Sources and query scope')).toBeInTheDocument();
     expect(screen.getAllByText('Why did checkout fail?')).toHaveLength(2);
     expect(screen.getByRole('button', { name: 'Delete conversation' })).toBeEnabled();
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'What next?' } });

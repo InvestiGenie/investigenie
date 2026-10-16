@@ -1,21 +1,23 @@
-# Create an integration
+# Connector contracts
+
+Concrete data connectors live in `data_connectors/<source_id>/`; concrete AI transports live in `ai_connectors/<transport_id>/`. Shared contracts and registration live in the backend: [data_connectors.rs](../backend/src/data_connectors.rs) and [ai_connectors.rs](../backend/src/ai_connectors.rs). Data connector IDs, public APIs, and saved configurations remain unchanged by this layout.
 
 For the complete implementation workflow, security restrictions, paging contract, AI compatibility requirements, and test checklist, use the [build-integration skill](../.github/skills/build-integration/SKILL.md).
 
-Your connector converts native datasource responses into InvestiGenie's shared JSON shape. Start from [ClickHouse](clickhouse/mod.rs) and its [connector](clickhouse/connector.rs), or the [Elasticsearch connector](elasticsearch/connector.rs).
+Your data connector converts native datasource responses into InvestiGenie's shared JSON shape. Start from [ClickHouse](data_connectors/clickhouse/mod.rs) and its [connector](data_connectors/clickhouse/connector.rs), or the [Elasticsearch connector](data_connectors/elasticsearch/connector.rs).
 
 ## 1. Make it visible
 
-Create `integrations/<source_id>/mod.rs`. Use a unique, non-keyword Rust identifier, such as `my_source`; the descriptor ID must match the folder name. Export these functions with real implementations:
+Create `integrations/data_connectors/<source_id>/mod.rs`. Use a unique, non-keyword Rust identifier, such as `my_source`; the descriptor ID must match the folder name. Export these functions with real implementations:
 
 ```rust
-pub fn descriptor() -> crate::integrations::IntegrationDescriptor;
+pub fn descriptor() -> crate::data_connectors::IntegrationDescriptor;
 pub fn connect(
-        config: &crate::integrations::ConnectionConfig,
-) -> Result<std::sync::Arc<dyn crate::integrations::Connector>, crate::integrations::ConnectorError>;
+    config: &crate::data_connectors::ConnectionConfig,
+) -> Result<std::sync::Arc<dyn crate::data_connectors::Connector>, crate::data_connectors::ConnectorError>;
 ```
 
-Keep code and tests in your folder. Cargo automatically discovers immediate folders containing `mod.rs`; rebuild and restart the API to register it. No manual registry edit or runtime plugin installation is needed.
+Keep code and tests in your folder. `backend/build.rs` discovers immediate folders under `data_connectors/` containing `mod.rs`; rebuild and restart the API to register them. AI connector folders are not datasources. No manual datasource registry edit or runtime plugin installation is needed.
 
 ## 2. Describe the UI
 
@@ -33,7 +35,7 @@ The app supplies the connection name; settings arrive as a flat `ConnectionConfi
 
 ## 3. Implement the connector
 
-Implement the [shared Connector](../backend/src/integrations.rs): `Send + Sync`, with boxed `Send` futures through `ConnectorFuture`.
+Implement the [shared Connector](../backend/src/data_connectors.rs): `Send + Sync`, with boxed `Send` futures through `ConnectorFuture`.
 
 | Method | Required behavior |
 | --- | --- |
@@ -44,6 +46,8 @@ Implement the [shared Connector](../backend/src/integrations.rs): `Send + Sync`,
 | `document` | For `lookup`: return `index`, `id`, `found`, `source`; missing documents use `found: false`, `source: null`. For `inline`: the UI inspects the returned hit; this method may reject lookup. |
 
 Honor `index`, `query`, `from`, `size`, optional `sort_by`/`sort_order` (`asc`/`desc`), `histogram_field`, and `time_range`. Time bounds are inclusive UTC epoch milliseconds. Filter and sort **before pagination**; aggregate the histogram across all matching records with the same filters, not just the page.
+
+For the current built-in adapters, see [integration behavior](../docs/integrations.md): Elasticsearch accepts wildcard/comma-separated index patterns with exact totals and unmapped time-field sorting. ClickHouse's optional execution limit must be omitted when blank, without fixed memory/result/overflow URL settings. Histogram-only failures preserve valid ClickHouse rows. Both adapters share `HistogramInterval::automatic` for All time breakdown intervals; keep the same interval for totals and top-value series.
 
 ## 4. Return the Discover shape
 
@@ -81,4 +85,12 @@ npm run build:web
 
 Follow the [app startup instructions](../README.md). Check `GET /api/integrations` and **Connections > Add connection**; add your source, create a Data View with a valid time field, then test Discover's table, fields, sorting, time window, graph, and JSON inspector. Verify edits retain credentials and saved objects survive restart in both persistence modes. Configuration changes use revision-based `If-Match` headers; test stale edits as well.
 
+Keep the relevant user docs, integration skill, agent instructions, and context references synchronized with every behavior or contract change. Prefer existing shared functions for repeated behavior; do not duplicate interval policies or UI result renderers in new adapters.
+
 **Limits:** folder-only contributions use existing dependencies and UI capabilities. New Rust libraries require `backend/Cargo.toml` and lockfile changes; integration-local Cargo manifests are not loaded. New UI semantics require extending the shared contract.
+
+## AI connector contract
+
+[backend/src/ai_connectors.rs](../backend/src/ai_connectors.rs) owns `AiConnector::complete(settings, messages, json_mode, max_tokens)`, its boxed Send future, `AiSettings`, `ProviderReply`, `ModelUsage`, `AiConnectorError`, and `default_connector()`. [openai/mod.rs](ai_connectors/openai/mod.rs) implements the default OpenAI-compatible Chat Completions transport. New transports are explicitly declared/registered in the backend AI contract, not discovered by the datasource build script.
+
+Transport code owns authentication, HTTP timeouts, payload-size caps, protocol parsing, actual usage, and protocol-specific fallback. It must not depend on backend investigation/storage modules or log provider secrets. Orchestration owns prompts, schema repair, evidence checks, source scans, pause/stop, and saved chat context. Preserve current errors, timeouts, body limits, cancellation, and OpenAI model/profile compatibility. No runtime transport selector or claim of full OpenAI API coverage is introduced.

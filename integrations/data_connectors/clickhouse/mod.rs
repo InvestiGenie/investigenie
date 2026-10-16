@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::integrations::IntegrationDescriptor;
+use crate::data_connectors::IntegrationDescriptor;
 use crate::search::{BreakdownCount, HistogramOptions, BREAKDOWN_OTHER_KEY, MAX_BREAKDOWN_VALUES};
 mod connector;
 pub use connector::connect;
@@ -119,6 +119,21 @@ pub struct ClickHouseHistogramBucket {
 struct HistogramRow {
     timestamp: String,
     count: String,
+}
+
+fn decode_histogram_rows(rows: Vec<Value>) -> Result<Vec<ClickHouseHistogramBucket>, ClickHouseError> {
+    rows.into_iter()
+        .map(|row| {
+            let row: HistogramRow =
+                serde_json::from_value(row).map_err(|_| ClickHouseError::InvalidResponse)?;
+            Ok(ClickHouseHistogramBucket {
+                timestamp: row.timestamp.parse().map_err(|_| ClickHouseError::InvalidResponse)?,
+                label: None,
+                count: row.count.parse().map_err(|_| ClickHouseError::InvalidResponse)?,
+                breakdown: None,
+            })
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -313,21 +328,32 @@ impl ClickHouseClient {
                         self.interval_histogram(&filtered_query, field, breakdown, histogram_options)
                             .await
                     }
-                    None => self.histogram(&filtered_query, field).await,
+                    None => {
+                        let buckets = self.histogram(&filtered_query, field).await;
+                        match (buckets, histogram_options.breakdown_field.as_deref()) {
+                            (Ok(buckets), Some(breakdown)) if !buckets.is_empty()
+                                && parsed.meta.iter().any(|column| column.name == breakdown) => {
+                                let first = buckets.first().unwrap().timestamp;
+                                let last = buckets.last().unwrap().timestamp;
+                                let span = last.saturating_sub(first).max(1);
+                                let mut options = histogram_options.clone();
+                                options.interval = crate::search::HistogramInterval::automatic(span as f64);
+                                histogram_interval = options.interval.map(|interval| format!("{}{}", interval.count, interval.suffix()));
+                                self.interval_histogram(&filtered_query, field, Some(breakdown), &options).await
+                            }
+                            (result, _) => result,
+                        }
+                    }
                 };
                 match result {
                     Ok(buckets) => histogram = buckets,
-                    Err(ClickHouseError::Rejected { status, .. }) => {
+                    Err(error) => {
+                        let upstream_status = match error {
+                            ClickHouseError::Rejected { status, .. } => Some(status),
+                            _ => None,
+                        };
                         tracing::warn!(
-                            upstream_status = status,
-                            "ClickHouse histogram query failed; returning rows without a histogram"
-                        );
-                        histogram_unavailable_reason = Some(
-                            "ClickHouse could not calculate the histogram; document results are still available.",
-                        );
-                    }
-                    Err(_) => {
-                        tracing::warn!(
+                            upstream_status,
                             "ClickHouse histogram query failed; returning rows without a histogram"
                         );
                         histogram_unavailable_reason = Some(
@@ -388,20 +414,7 @@ impl ClickHouseClient {
         );
         let response: JsonResponse = serde_json::from_value(self.execute(&totals_query).await?)
         .map_err(|_| ClickHouseError::InvalidResponse)?;
-        let mut buckets = response
-            .data
-            .into_iter()
-            .map(|row| {
-                let row: HistogramRow =
-                    serde_json::from_value(row).map_err(|_| ClickHouseError::InvalidResponse)?;
-                Ok(ClickHouseHistogramBucket {
-                    timestamp: row.timestamp.parse().map_err(|_| ClickHouseError::InvalidResponse)?,
-                    label: None,
-                    count: row.count.parse().map_err(|_| ClickHouseError::InvalidResponse)?,
-                    breakdown: None,
-                })
-            })
-            .collect::<Result<Vec<_>, ClickHouseError>>()?;
+        let mut buckets = decode_histogram_rows(response.data)?;
         let Some(breakdown_field) = breakdown_field else {
             return Ok(buckets);
         };
@@ -468,26 +481,7 @@ impl ClickHouseClient {
         );
         let response: JsonResponse = serde_json::from_value(self.execute(&histogram_query).await?)
         .map_err(|_| ClickHouseError::InvalidResponse)?;
-        response
-            .data
-            .into_iter()
-            .map(|row| {
-                let row: HistogramRow =
-                    serde_json::from_value(row).map_err(|_| ClickHouseError::InvalidResponse)?;
-                Ok(ClickHouseHistogramBucket {
-                    timestamp: row
-                        .timestamp
-                        .parse()
-                        .map_err(|_| ClickHouseError::InvalidResponse)?,
-                    label: None,
-                    count: row
-                        .count
-                        .parse()
-                        .map_err(|_| ClickHouseError::InvalidResponse)?,
-                    breakdown: None,
-                })
-            })
-            .collect()
+        decode_histogram_rows(response.data)
     }
 
     async fn execute(&self, query: &str) -> Result<Value, ClickHouseError> {
@@ -763,7 +757,7 @@ mod tests {
 
     #[tokio::test]
     async fn cursor_connector_advances_offsets_and_skips_subsequent_histograms() {
-        use crate::integrations::Connector;
+        use crate::data_connectors::Connector;
         use serde_json::{json, Value};
         let server = MockServer::start().await;
         for (offset, data) in [
@@ -820,8 +814,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_time_breakdown_resolves_one_interval_for_every_series() {
+        use crate::data_connectors::Connector;
+        use serde_json::json;
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(|request: &wiremock::Request| String::from_utf8_lossy(&request.body).starts_with("SELECT * FROM ("))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta":[{"name":"created_at"},{"name":"service"}],
+                "data":[{"created_at":"2026-10-16","service":"api"}],"rows":1
+            }))).expect(1).mount(&server).await;
+        Mock::given(matchers::method("POST"))
+            .and(|request: &wiremock::Request| String::from_utf8_lossy(&request.body).starts_with("WITH histogram_source"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta":[],"data":[{"timestamp":"0","count":"4"},{"timestamp":"60000","count":"2"}],"rows":2
+            }))).expect(1).mount(&server).await;
+        Mock::given(matchers::method("POST"))
+            .and(|request: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&request.body);
+                body.starts_with("SELECT toString(") && body.contains("INTERVAL 5 SECOND")
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta":[],"data":[{"timestamp":"0","count":"4"},{"timestamp":"60000","count":"2"}],"rows":2
+            }))).expect(1).mount(&server).await;
+        Mock::given(matchers::method("POST"))
+            .and(|request: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&request.body);
+                body.starts_with("WITH breakdown_source") && body.contains("INTERVAL 5 SECOND")
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta":[],"data":[{"timestamp":"0","key":"api","count":"3"},{"timestamp":"60000","key":"api","count":"2"}],"rows":2
+            }))).expect(1).mount(&server).await;
+        let client = ClickHouseClient::new(&server.uri(), None, None, None).unwrap();
+        let request = serde_json::from_value(json!({
+            "index":"events","query":"SELECT created_at, service FROM events",
+            "histogram_field":"created_at","histogram_breakdown_field":"service","cursor":""
+        })).unwrap();
+        let result = Connector::search(&client, request).await.unwrap();
+        assert_eq!(result["histogram_interval"], "5s");
+        assert_eq!(result["histogram"][0]["breakdown"], json!([
+            {"key":"api","count":3},{"key":"__other__","count":1}
+        ]));
+    }
+
+    #[tokio::test]
     async fn interval_histograms_bucket_in_timezone_and_break_down_top_values() {
-        use crate::integrations::Connector;
+        use crate::data_connectors::Connector;
         use serde_json::{json, Value};
         let server = MockServer::start().await;
         Mock::given(matchers::method("POST"))

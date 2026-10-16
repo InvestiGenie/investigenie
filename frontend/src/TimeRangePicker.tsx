@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { CalendarDays, ChevronDown, X } from 'lucide-react';
 import { inputToUtc, timeZoneOptions, utcToInput } from './time';
 import DateTimeInput from './DateTimeInput';
+import { errorMessage } from './format';
 
 type TimeRangePickerProps = {
   start: string;
@@ -70,7 +71,7 @@ export default function TimeRangePicker({ start, end, onChange, timeZone = 'UTC'
       utcStart = inputToUtc(draftStart, timeZone);
       utcEnd = inputToUtc(draftEnd, timeZone);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Invalid dates');
+      setError(errorMessage(reason, 'Invalid dates'));
       return;
     }
     const startTime = Date.parse(`${utcStart}Z`);
@@ -92,7 +93,7 @@ export default function TimeRangePicker({ start, end, onChange, timeZone = 'UTC'
       onTimeZoneChange?.(zone);
       setError('');
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Invalid dates');
+      setError(errorMessage(reason, 'Invalid dates'));
     }
   }
 

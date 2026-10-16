@@ -6,8 +6,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 
-use crate::integrations::IntegrationDescriptor;
-pub use crate::integrations::{FieldSummary, IndexSummary};
+use crate::data_connectors::IntegrationDescriptor;
+pub use crate::data_connectors::{FieldSummary, IndexSummary};
 pub use crate::search::SearchRequest;
 use crate::search::{BreakdownCount, HistogramOptions, BREAKDOWN_OTHER_KEY, MAX_BREAKDOWN_VALUES};
 mod connector;
@@ -316,7 +316,7 @@ impl ElasticsearchClient {
     pub async fn search(&self, request: SearchRequest) -> Result<SearchResult, ElasticsearchError> {
         validate_index(&request.index)?;
         validate_search(&request)?;
-        let histogram_options = request
+        let mut histogram_options = request
             .histogram_options()
             .map_err(|_| ElasticsearchError::InvalidIndex)?;
 
@@ -348,7 +348,13 @@ impl ElasticsearchClient {
 
         let sort = request.sort_by.as_ref().map_or_else(
             || json!([{"_score": {"order": "desc"}}]),
-            |field| json!([{(field): {"order": request.sort_order.as_deref().unwrap_or("asc")}}]),
+            |field| {
+                let mut options = json!({"order": request.sort_order.as_deref().unwrap_or("asc")});
+                if request.histogram_field.as_ref() == Some(field) {
+                    options["unmapped_type"] = json!("date");
+                }
+                json!([{(field): options}])
+            },
         );
         let body = json!({
             "query": query,
@@ -356,7 +362,7 @@ impl ElasticsearchClient {
             "size": request.size,
             "sort": sort,
             "timeout": SEARCH_TIMEOUT,
-            "track_total_hits": 10000
+            "track_total_hits": true
         });
         let mut body = body;
         if let Some(field) = request.histogram_field.as_deref().filter(|_| {
@@ -410,6 +416,56 @@ impl ElasticsearchClient {
         } else {
             self.url_for(&[request.index.as_str(), "_search"])?
         };
+        if histogram_options.breakdown_field.is_some()
+            && histogram_options.interval.is_none()
+            && body.get("aggs").is_some()
+        {
+            let field = request.histogram_field.as_deref().unwrap();
+            let mut bounds_body = json!({
+                "size":0,"track_total_hits":false,"timeout":SEARCH_TIMEOUT,
+                "query":body["query"],
+                "aggs":{"first_timestamp":{"min":{"field":field}},"last_timestamp":{"max":{"field":field}}}
+            });
+            if let Some(pit) = body.get("pit") {
+                bounds_body["pit"] = pit.clone();
+            }
+            let bounds = match self.client.post(url.clone())
+                .query(&[("allow_partial_search_results", "false")])
+                .json(&bounds_body).send().await
+            {
+                Ok(response) => decode::<Value>(response).await,
+                Err(_) => Err(ElasticsearchError::Request),
+            };
+            let bounds = match bounds {
+                Ok(bounds) => bounds,
+                Err(error) => {
+                    if let Some(id) = pit_id.as_deref() {
+                        self.close_pit(id).await;
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(id) = bounds.get("pit_id").and_then(Value::as_str) {
+                pit_id = Some(id.to_owned());
+                body["pit"]["id"] = json!(id);
+            }
+            if bounds.get("timed_out").and_then(Value::as_bool) != Some(false)
+                || bounds.pointer("/_shards/failed").and_then(Value::as_u64) != Some(0)
+            {
+                if let Some(id) = pit_id.as_deref() {
+                    self.close_pit(id).await;
+                }
+                return Err(ElasticsearchError::InvalidResponse);
+            }
+            if let (Some(first), Some(last)) = (
+                bounds.pointer("/aggregations/first_timestamp/value").and_then(Value::as_f64),
+                bounds.pointer("/aggregations/last_timestamp/value").and_then(Value::as_f64),
+            ) {
+                let span = (last - first).max(1.0);
+                histogram_options.interval = crate::search::HistogramInterval::automatic(span);
+                body["aggs"] = histogram_aggregations(field, &request, &histogram_options);
+            }
+        }
         let search_request = self.client.post(url).json(&body);
         let search_request = if pit_id.is_some() {
             search_request.query(&[("allow_partial_search_results", "false")])
@@ -527,16 +583,19 @@ impl ElasticsearchClient {
 }
 
 fn histogram_aggregations(field: &str, request: &SearchRequest, options: &HistogramOptions) -> Value {
-    let over_time = match (options.interval, request.time_range) {
-        (Some(interval), Some(range)) => {
+    let over_time = match options.interval {
+        Some(interval) => {
             let kind = if interval.is_calendar() { "calendar_interval" } else { "fixed_interval" };
-            json!({ "date_histogram": {
+            let mut histogram = json!({ "date_histogram": {
                 "field": field,
                 (kind): format!("{}{}", interval.count, interval.suffix()),
                 "time_zone": options.time_zone,
-                "min_doc_count": 0,
-                "extended_bounds": { "min": range.start, "max": range.end }
-            } })
+                "min_doc_count": 0
+            } });
+            if let Some(range) = request.time_range {
+                histogram["date_histogram"]["extended_bounds"] = json!({"min": range.start, "max": range.end});
+            }
+            histogram
         }
         _ if options.time_zone != "UTC" => {
             json!({ "auto_date_histogram": { "field": field, "buckets": 40, "time_zone": options.time_zone } })
@@ -642,13 +701,7 @@ fn validate_search(request: &SearchRequest) -> Result<(), ElasticsearchError> {
     if let Some(token) = request.cursor.as_deref().filter(|token| !token.is_empty()) {
         SearchCursor::decode(token)?;
     }
-    if request.sort_by.as_deref().is_some_and(|field| {
-        field.is_empty()
-            || field.len() > 256
-            || !field
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || "._@-".contains(byte as char))
-    }) {
+    if request.sort_by.as_deref().is_some_and(|field| !crate::search::safe_field_name(field)) {
         return Err(ElasticsearchError::InvalidIndex);
     }
     if request
@@ -658,13 +711,7 @@ fn validate_search(request: &SearchRequest) -> Result<(), ElasticsearchError> {
     {
         return Err(ElasticsearchError::InvalidIndex);
     }
-    if request.histogram_field.as_deref().is_some_and(|field| {
-        field.is_empty()
-            || field.len() > 256
-            || !field
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || "._@-".contains(byte as char))
-    }) {
+    if request.histogram_field.as_deref().is_some_and(|field| !crate::search::safe_field_name(field)) {
         return Err(ElasticsearchError::InvalidIndex);
     }
     Ok(())
@@ -747,6 +794,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_time_pattern_breakdown_counts_every_match_on_one_pit() {
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/logs-*/_pit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"initial"})))
+            .expect(1).mount(&server).await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/_search"))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                body["size"] == 0 && body["pit"]["id"] == "initial"
+                    && body["aggs"]["first_timestamp"]["min"]["field"] == "created_at"
+                    && body["query"] == json!({"match_all":{}})
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "timed_out":false,"_shards":{"failed":0},"pit_id":"rotated",
+                "aggregations":{"first_timestamp":{"value":0},"last_timestamp":{"value":120000}}
+            })))
+            .expect(1).mount(&server).await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/_search"))
+            .and(matchers::query_param("allow_partial_search_results", "false"))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                body["track_total_hits"] == true && body["pit"]["id"] == "rotated"
+                    && body["aggs"]["documents_over_time"]["date_histogram"]["fixed_interval"] == "5s"
+                    && body["aggs"]["breakdown_values"]["terms"]["field"] == "service"
+                    && body["aggs"]["documents_over_time"] == body["aggs"]["breakdown_values"]["aggs"]["over_time"]
+                    && body["query"] == json!({"match_all":{}})
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "timed_out":false,"_shards":{"failed":0},"pit_id":"finished",
+                "hits":{"total":{"value":24000,"relation":"eq"},"hits":[]},
+                "aggregations":{
+                    "documents_over_time":{"buckets":[{"key":0,"doc_count":24000}]},
+                    "breakdown_values":{"buckets":[{"key":"api","over_time":{"buckets":[{"key":0,"doc_count":20000}]}}]}
+                }
+            })))
+            .expect(1).mount(&server).await;
+        Mock::given(matchers::method("DELETE"))
+            .and(matchers::path("/_pit"))
+            .and(matchers::body_json(json!({"id":"finished"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"succeeded":true})))
+            .expect(1).mount(&server).await;
+        let client = ElasticsearchClient::new(ElasticsearchSettings {
+            url: Url::parse(&server.uri()).unwrap(), authentication: None, tls_insecure: false,
+        }).unwrap();
+        let mut request = cursor_request("");
+        request.index = "logs-*".to_owned();
+        request.histogram_breakdown_field = Some("service".to_owned());
+        let result = client.search(request).await.unwrap();
+        assert_eq!(result.total, 24000);
+        assert_eq!(result.total_relation, "eq");
+        assert_eq!(result.histogram_interval.as_deref(), Some("5s"));
+        assert_eq!(serde_json::to_value(&result.histogram[0]).unwrap()["breakdown"],
+            json!([{"key":"api","count":20000},{"key":"__other__","count":4000}]));
+    }
+
+    #[tokio::test]
+    async fn pattern_cursor_search_tolerates_unmapped_time_fields() {
+        for pattern in ["logs-*", "logs-2026.10.15,logs-2026.10.16"] {
+            let server = MockServer::start().await;
+            Mock::given(matchers::method("POST"))
+                .and(matchers::path(format!("/{pattern}/_pit")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"pattern-pit"})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(matchers::method("POST"))
+                .and(matchers::path("/_search"))
+                .and(matchers::query_param("allow_partial_search_results", "false"))
+                .and(|request: &wiremock::Request| {
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    body["sort"][0]["created_at"]["unmapped_type"] == "date"
+                        && body["sort"][1] == json!({"_shard_doc":"asc"})
+                })
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "timed_out":false,"_shards":{"failed":0},
+                    "hits":{"total":0,"hits":[]}
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(matchers::method("DELETE"))
+                .and(matchers::path("/_pit"))
+                .and(matchers::body_json(json!({"id":"pattern-pit"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"succeeded":true})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = ElasticsearchClient::new(ElasticsearchSettings {
+                url: Url::parse(&server.uri()).unwrap(),
+                authentication: None,
+                tls_insecure: false,
+            })
+            .unwrap();
+            let mut request = cursor_request("");
+            request.index = pattern.to_owned();
+            assert!(client.search(request).await.unwrap().next_cursor.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn cursor_search_opens_pit_rotates_id_and_closes_on_exhaustion() {
         let server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
@@ -768,7 +918,7 @@ mod tests {
                     && body.get("search_after").is_none()
                     && body["size"] == 2
                     && body["pit"] == json!({"id":"pit-start","keep_alive":"1m"})
-                    && body["sort"] == json!([{"created_at":{"order":"asc"}}, {"_shard_doc":"asc"}])
+                    && body["sort"] == json!([{"created_at":{"order":"asc","unmapped_type":"date"}}, {"_shard_doc":"asc"}])
                     && body.get("aggs").is_some()
             })
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1176,7 +1326,7 @@ mod tests {
                 "size": 50,
                 "sort": [{"_score": {"order": "desc"}}],
                 "timeout": "10s",
-                "track_total_hits": 10000,
+                "track_total_hits": true,
                 "aggs": {
                     "documents_over_time": {
                         "auto_date_histogram": {

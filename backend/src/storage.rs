@@ -1,4 +1,4 @@
-use crate::integrations::{
+use crate::data_connectors::{
     connect, registered, ConnectionConfig, Connector, IntegrationDescriptor,
 };
 use aes_gcm::{
@@ -317,11 +317,7 @@ pub struct AiConversationSummary {
 
 impl StoredAiConversation {
     pub fn new(id: String, model_id: String, data_view_ids: Vec<String>, question: String) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(i64::MAX as u128) as i64;
+        let now = conversation_timestamp();
         Self {
             id,
             revision: revision(),

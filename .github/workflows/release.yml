@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name to release (e.g. 0.1.2-alpha)'
+        description: 'Tag name to release (e.g. 0.1.3-alpha)'
         required: true
-        default: '0.1.2-alpha'
+        default: '0.1.3-alpha'
 
 permissions:
   contents: write
@@ -44,19 +44,29 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Create release if missing
+      - name: Checkout release notes
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ steps.vars.outputs.tag }}
+
+      - name: Publish approved release notes
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.vars.outputs.tag }}
         run: |
+          notes_file=".github/release-notes/$TAG.md"
+          if [ ! -s "$notes_file" ]; then
+            echo "Missing approved release notes: $notes_file" >&2
+            exit 1
+          fi
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            echo "Release $TAG already exists"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes_file"
             exit 0
           fi
           flags=()
           case "$TAG" in *alpha*|*beta*|*rc*) flags+=(--prerelease) ;; esac
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes "" "${flags[@]}"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-file "$notes_file" "${flags[@]}"
 
   build:
     name: Build (${{ matrix.platform }}-${{ matrix.arch }})

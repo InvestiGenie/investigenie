@@ -1,6 +1,8 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { api, type ConnectionConfiguration, type ConnectionField, type ConnectionSummary, type IntegrationDescriptor } from './api';
 import ConnectionStatus from './ConnectionStatus';
+import { errorMessage } from './format';
+import { ErrorAlert, StatusNotice } from './PageFeedback';
 
 type ConnectionsPageProps = {
   connections: ConnectionSummary[];
@@ -39,7 +41,7 @@ export default function ConnectionsPage({ connections, onConnectionsChange }: Co
       })
       .catch((reason: unknown) => {
         if (!controller.signal.aborted) {
-          setIntegrationError(reason instanceof Error ? reason.message : 'Could not load data sources');
+          setIntegrationError(errorMessage(reason, 'Could not load data sources'));
           setIntegrationStatus('failed');
         }
       });
@@ -84,7 +86,7 @@ export default function ConnectionsPage({ connections, onConnectionsChange }: Co
       setStage('list');
       setNotice(wasEditing ? 'Connection updated and tested.' : 'Connection tested and added.');
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Could not add connection');
+      setError(errorMessage(reason, 'Could not add connection'));
     } finally {
       setBusy(false);
     }
@@ -154,7 +156,7 @@ export default function ConnectionsPage({ connections, onConnectionsChange }: Co
       await onConnectionsChange();
       setNotice(`${connection.name} removed.`);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Could not remove connection');
+      setError(errorMessage(reason, 'Could not remove connection'));
     }
   }
 
@@ -163,8 +165,8 @@ export default function ConnectionsPage({ connections, onConnectionsChange }: Co
       {stage === 'list' && <button className="search-button add-connection-button" onClick={() => { setError(''); setNotice(''); setStage('choose-source'); }}><span aria-hidden="true">＋</span> Add connection</button>}
     </div>
 
-    {error && <div className="alert" role="alert"><span className="alert-symbol">!</span><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError('')}>×</button></div>}
-    {notice && <div className="connection-notice" role="status">{notice}</div>}
+    {error && <ErrorAlert message={error} onDismiss={() => setError('')} />}
+    {notice && <StatusNotice message={notice} />}
 
     {stage === 'list' && <section className="connections-section" aria-labelledby="configured-connections-title">
       <div className="section-heading"><div><h2 id="configured-connections-title">Saved connections</h2><p>Endpoints are tested before they are added.</p></div><span className="field-count">{connections.length}</span></div>

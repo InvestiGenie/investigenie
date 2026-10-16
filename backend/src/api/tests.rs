@@ -1456,14 +1456,14 @@ fn names_endpoints_catalog_and_time_ranges_preserve_validation() {
 }
 struct CapabilityConnector;
 impl Connector for CapabilityConnector {
-    fn test_connection(&self) -> crate::integrations::ConnectorFuture<'_, ()> {
+    fn test_connection(&self) -> crate::data_connectors::ConnectorFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
     fn indices(
         &self,
-    ) -> crate::integrations::ConnectorFuture<'_, Vec<crate::integrations::IndexSummary>> {
+    ) -> crate::data_connectors::ConnectorFuture<'_, Vec<crate::data_connectors::IndexSummary>> {
         Box::pin(async {
-            Ok(vec![crate::integrations::IndexSummary {
+            Ok(vec![crate::data_connectors::IndexSummary {
                 name: "events".to_owned(),
                 document_count: None,
                 health: None,
@@ -1473,18 +1473,18 @@ impl Connector for CapabilityConnector {
     fn fields<'a>(
         &'a self,
         index: &'a str,
-    ) -> crate::integrations::ConnectorFuture<'a, Vec<crate::integrations::FieldSummary>> {
+    ) -> crate::data_connectors::ConnectorFuture<'a, Vec<crate::data_connectors::FieldSummary>> {
         Box::pin(async move {
             if !matches!(index, "events" | "events-*") {
                 return Ok(Vec::new());
             }
             Ok(vec![
-                crate::integrations::FieldSummary {
+                crate::data_connectors::FieldSummary {
                     name: "clock".to_owned(),
                     field_type: "source_specific_clock".to_owned(),
                     is_time_field: true,
                 },
-                crate::integrations::FieldSummary {
+                crate::data_connectors::FieldSummary {
                     name: "not_clock".to_owned(),
                     field_type: "date".to_owned(),
                     is_time_field: false,
@@ -1492,14 +1492,14 @@ impl Connector for CapabilityConnector {
             ])
         })
     }
-    fn search(&self, request: SearchRequest) -> crate::integrations::ConnectorFuture<'_, Value> {
+    fn search(&self, request: SearchRequest) -> crate::data_connectors::ConnectorFuture<'_, Value> {
         Box::pin(async move { Ok(json!({"query":request.query,"from":request.from})) })
     }
     fn document<'a>(
         &'a self,
         index: &'a str,
         id: &'a str,
-    ) -> crate::integrations::ConnectorFuture<'a, Value> {
+    ) -> crate::data_connectors::ConnectorFuture<'a, Value> {
         Box::pin(async move { Ok(json!({"index":index,"id":id,"found":true})) })
     }
 }

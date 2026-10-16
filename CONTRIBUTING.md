@@ -29,6 +29,9 @@ npm run build:web
 
 ## Conventions
 
+- Shared connector contracts and registration belong in `backend/src/data_connectors.rs` and `backend/src/ai_connectors.rs`; keep concrete implementations under `integrations/data_connectors/<id>/` and `integrations/ai_connectors/<id>/`.
+- Data connectors import `crate::data_connectors` and are auto-discovered by `backend/build.rs`. AI transports implement `crate::ai_connectors::AiConnector` and are explicitly registered in the backend AI contract; do not mix the two registries.
+
 - **Security first:** datasources stay read-only. Never return or log secrets. Every limit (size, time, concurrency) stays bounded.
 - **No datasource special-casing in shared code:** add the capability to the integration descriptor instead.
 - **Errors:** `{"error":{"code","message"}}` with a stable `code`, and no upstream bodies or credentials.
@@ -38,16 +41,18 @@ npm run build:web
 
 ## Where to start
 
-- [Architecture](architecture.md): how the parts fit.
-- [Backend](backend.md) and [Frontend](frontend.md): code maps.
-- [Integrations](integrations.md): add a datasource (good first contribution).
+- [Architecture](docs/architecture.md): how the parts fit.
+- [Backend](docs/backend.md) and [Frontend](docs/frontend.md): code maps.
+- [Integrations](docs/integrations.md): add a datasource (good first contribution).
 
 ## Releases (maintainers)
 
-1. Bump the version in `Cargo.toml`, `package.json`, `frontend/package.json`, and the lockfiles.
-2. Commit, then publish a GitHub release with tag `X.Y.Z` or `X.Y.Z-alpha` (mark pre-releases).
-3. `.github/workflows/release.yml` builds Linux, Windows, and macOS archives and pushes `ghcr.io/investigenie/investigenie:<tag>` (`latest` for stable releases).
+1. Bump the Cargo workspace and frontend package versions and matching lock entries; update the workflow's manual tag default.
+2. Obtain approval for a short commit message and user-facing release notes. Save the approved notes in `.github/release-notes/<tag>.md` with What's Changed and a Full Changelog link; omit test-count boilerplate.
+3. Validate, commit, and push the approved annotated tag (`X.Y.Z` or `X.Y.Z-alpha`). Never move an existing release tag or launch duplicate runs.
+4. `.github/workflows/release.yml` checks out the tag, requires a non-empty notes file, and publishes that body when creating/updating the release. It builds Linux, Windows, and macOS archives and pushes `ghcr.io/investigenie/investigenie:<tag>` (`latest` for stable releases).
+5. Verify the public notes, all three platform archives, and workflow status before declaring the release complete.
 
 ## License
 
-By contributing, you agree that your contributions are licensed under the repository [LICENSE](../LICENSE).
+By contributing, you agree that your contributions are licensed under the repository [LICENSE](LICENSE).

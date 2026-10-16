@@ -19,7 +19,8 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::ai::{self, InvestigationRequest};
-use crate::integrations::{
+use crate::ai_connectors::AiSettings;
+use crate::data_connectors::{
     connect, editable_configuration, public_configuration, registered, validate_registry,
     ConnectionConfig, Connector, ConnectorError, IntegrationDescriptor,
 };
@@ -185,23 +186,45 @@ pub fn with_web(router: Router, directory: &FilePath) -> Router {
     })
 }
 
+fn model_settings(model: &StoredAiModel, timeout: Duration) -> AiSettings {
+    AiSettings {
+        api_url: model.api_url.clone(),
+        api_key: model.api_key.clone(),
+        model: model.model.clone(),
+        timeout,
+    }
+}
+
+async fn prepare_ai_call(
+    state: &AppState,
+    model_id: &str,
+    timeout: Duration,
+) -> Result<(AiSettings, OwnedSemaphorePermit), ApiError> {
+    let model = state.storage.ai_model(model_id).await?;
+    let settings = model_settings(&model, timeout);
+    let permit = state.ai_slots.clone().try_acquire_owned().map_err(|_| ApiError::Unavailable)?;
+    Ok((settings, permit))
+}
+
+async fn probe_ai_model(model: &StoredAiModel) -> Result<(), ApiError> {
+    ai::test_model(&model_settings(model, ai::AI_TIMEOUT))
+        .await
+        .map_err(ApiError::AiModelTest)
+}
+
+fn ai_model_save_error(error: StorageError) -> ApiError {
+    match error {
+        StorageError::Duplicate => ApiError::DuplicateAiModel,
+        error => ApiError::Storage(error),
+    }
+}
+
 async fn investigate(
     State(state): State<AppState>,
     Json(request): Json<InvestigationRequest>,
 ) -> Result<Json<ai::InvestigationResponse>, ApiError> {
     let timeout = ai::provider_timeout(&request).map_err(ApiError::Investigation)?;
-    let model = state.storage.ai_model(&request.ai_model_id).await?;
-    let settings = ai::AiSettings {
-        api_url: model.api_url,
-        api_key: model.api_key,
-        model: model.model,
-        timeout,
-    };
-    let permit = state
-        .ai_slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ApiError::Unavailable)?;
+    let (settings, permit) = prepare_ai_call(&state, &request.ai_model_id, timeout).await?;
     let result = ai::investigate(
         &state.storage,
         &settings,
@@ -220,18 +243,7 @@ async fn start_investigation(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let timeout = ai::provider_timeout(&request).map_err(ApiError::Investigation)?;
     let budget = ai::time_budget(&request).map_err(ApiError::Investigation)?;
-    let model = state.storage.ai_model(&request.ai_model_id).await?;
-    let settings = ai::AiSettings {
-        api_url: model.api_url,
-        api_key: model.api_key,
-        model: model.model,
-        timeout,
-    };
-    let permit = state
-        .ai_slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ApiError::Unavailable)?;
+    let (settings, permit) = prepare_ai_call(&state, &request.ai_model_id, timeout).await?;
     let job = ai::InvestigationJob::new(uuid::Uuid::new_v4().to_string(), budget);
     {
         let mut jobs = state
@@ -397,18 +409,7 @@ async fn continue_ai_conversation(
     if conversation.messages.len() + 2 > MAX_AI_CONVERSATION_MESSAGES {
         return Err(ApiError::InvalidConversationMessage);
     }
-    let model = state.storage.ai_model(&conversation.model_id).await?;
-    let settings = ai::AiSettings {
-        api_url: model.api_url,
-        api_key: model.api_key,
-        model: model.model,
-        timeout: Duration::from_secs(60),
-    };
-    let _permit = state
-        .ai_slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ApiError::Unavailable)?;
+    let (settings, _permit) = prepare_ai_call(&state, &conversation.model_id, Duration::from_secs(60)).await?;
     let answer = ai::continue_conversation(&settings, &conversation.messages, message)
         .await
         .map_err(ApiError::Investigation)?;
@@ -501,25 +502,12 @@ async fn create_ai_model(
         request.model,
         request.api_key,
     )?;
-    ai::test_model(&ai::AiSettings {
-        api_url: model.api_url.clone(),
-        api_key: model.api_key.clone(),
-        model: model.model.clone(),
-        timeout: ai::AI_TIMEOUT,
-    })
-    .await
-    .map_err(ApiError::AiModelTest)?;
+    probe_ai_model(&model).await?;
     let saved = state
         .storage
         .create_ai_model(model)
         .await
-        .map_err(|error| {
-            if matches!(error, StorageError::Duplicate) {
-                ApiError::DuplicateAiModel
-            } else {
-                ApiError::Storage(error)
-            }
-        })?;
+        .map_err(ai_model_save_error)?;
     Ok(Json(json!({"model":AiModelSummary::from(&saved)})))
 }
 
@@ -537,25 +525,12 @@ async fn update_ai_model(
     let api_key = request.api_key.unwrap_or(current.api_key);
     let mut model = provider_settings(request.name, request.api_url, request.model, api_key)?;
     model.id = id.clone();
-    ai::test_model(&ai::AiSettings {
-        api_url: model.api_url.clone(),
-        api_key: model.api_key.clone(),
-        model: model.model.clone(),
-        timeout: ai::AI_TIMEOUT,
-    })
-    .await
-    .map_err(ApiError::AiModelTest)?;
+    probe_ai_model(&model).await?;
     let saved = state
         .storage
         .update_ai_model(&id, &expected, model)
         .await
-        .map_err(|error| {
-            if matches!(error, StorageError::Duplicate) {
-                ApiError::DuplicateAiModel
-            } else {
-                ApiError::Storage(error)
-            }
-        })?;
+        .map_err(ai_model_save_error)?;
     Ok(Json(json!({"model":AiModelSummary::from(&saved)})))
 }
 

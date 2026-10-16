@@ -15,6 +15,8 @@ React 19 + TypeScript + Vite in `frontend/`. No router and no state library: `Ap
 | `SearchableSelect.tsx` | Accessible searchable dropdown for long lists. |
 | `TimeRangePicker.tsx`, `DateTimeInput.tsx`, `time.ts` | Time window editor and timezone conversions. |
 | `api.ts` | Every API call and type. The only place that talks HTTP. |
+| `format.ts` | Shared error-message fallbacks and normal/compact count formatting. |
+| `PageFeedback.tsx` | Shared dismissible error alerts and management-page status notices. |
 | `query.ts` | Default and field query templates per integration. |
 | `preferences.ts` | Browser preferences (theme, timezone, AI settings, chart visibility). |
 | `styles.css` | All styles, including the dark theme (`:root[data-theme="dark"]`). |
@@ -22,11 +24,15 @@ React 19 + TypeScript + Vite in `frontend/`. No router and no state library: `Ap
 ## Key behaviours
 
 - **Metadata-driven:** connection forms, query placeholders, sorting rules, and document lookup come from each integration's descriptor. Avoid `if (integration === "x")` in UI code.
-- **Time:** the UI keeps UTC values and sends epoch milliseconds. The chosen timezone only changes how times are displayed; it never re-queries.
+- **Time:** Explore initially selects the last 15 minutes. The UI keeps UTC values and sends epoch milliseconds. The chosen timezone only changes how times are displayed; it never re-queries.
 - **Explore paging:** 50 documents per page. The histogram comes from the first page and is reused while paging.
-- **Histogram:** Auto targets about 50 bars; a fixed interval that would exceed 100 bars is scaled up. Drag or click to zoom (this updates the time window and searches). Interval and breakdown need a time window.
+- **Histogram:** Auto targets about 50 bars; a fixed interval that would exceed 100 bars is scaled up. Drag or click to zoom (this updates the time window and searches). Manual intervals need a time window; breakdown works for bounded windows and All time, where the server resolves a shared interval. Elasticsearch requests exact matching totals; any lower-bound response is marked with `+`.
 - **AI page:** starts a job, polls every second (every 5 s while paused), and shows partial findings at check-ins. Completed conversations are persisted; selecting one restores its transcript, Data Views, and model, and follow-ups use saved findings without rescanning sources.
+- **AI results:** the local `InvestigationResultView` component renders both live and saved results with usage, confidence/evidence, source scope, caveats, and partial labels. A saved result replaces its live duplicate instead of showing both.
+- **AI composer:** model selector, Timeout, and Ask after share one desktop row. The model can flex; duration selects are 76px wide. On small screens the model spans a row above two compact duration controls, without horizontal overflow.
+- **Data Views:** the searchable picker accepts wildcard/comma-separated Elasticsearch patterns and validates fields through the API. ClickHouse tables remain exact names. Connection controls come from integration metadata, including optional ClickHouse execution time; blank creation omits it, clearing on edit sends null.
 - **API address:** production builds call the same origin. The dev server calls `http://127.0.0.1:3000` (override with `VITE_API_BASE_URL`).
+- **Shared behavior:** `jsonMutation` in `api.ts` constructs JSON mutation bodies and quoted If-Match headers while routes remain explicit. Reuse `errorMessage`/`formatCount` from `format.ts` and `ErrorAlert`/`StatusNotice` from `PageFeedback.tsx`; keep specialized polling/decision flows separate.
 
 ## Develop and test
 

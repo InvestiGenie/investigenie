@@ -49,7 +49,7 @@ pub struct FieldSummary {
     pub is_time_field: bool,
 }
 
-include!(concat!(env!("OUT_DIR"), "/integrations.rs"));
+include!(concat!(env!("OUT_DIR"), "/data_connectors.rs"));
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IntegrationDescriptor {
@@ -133,6 +133,15 @@ mod tests {
     #[test]
     fn registry_ids_are_unique_and_match_folders() {
         validate_registry();
+    }
+
+    #[test]
+    fn data_registry_preserves_source_ids_and_excludes_ai_transports() {
+        let ids = registered().into_iter().map(|item| item.id).collect::<Vec<_>>();
+        assert!(ids.contains(&"elasticsearch"));
+        assert!(ids.contains(&"clickhouse"));
+        assert!(!ids.contains(&"openai"));
+        assert!(connect("openai", &ConnectionConfig::new()).is_err());
     }
 
     #[test]

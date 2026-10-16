@@ -1,7 +1,8 @@
 mod ai;
+mod ai_connectors;
 mod api;
 mod config;
-mod integrations;
+mod data_connectors;
 mod search;
 mod storage;
 

@@ -1,7 +1,8 @@
 use std::{env, fs, path::PathBuf};
 
 fn main() {
-    let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../integrations");
+    let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
+        .join("../integrations/data_connectors");
     println!("cargo:rerun-if-changed={}", root.display());
     let mut integrations = Vec::new();
     for entry in fs::read_dir(&root).expect("Cannot read integrations directory") {
@@ -46,6 +47,6 @@ fn main() {
         generated.push_str(&format!("{name:?} => {name}::connect(config),\n"));
     }
     generated.push_str("_ => Err(ConnectorError::invalid_connection()), } }\n");
-    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("integrations.rs");
+    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("data_connectors.rs");
     fs::write(output, generated).expect("Cannot write integration registry");
 }

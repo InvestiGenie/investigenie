@@ -17,7 +17,9 @@ flowchart LR
 |---|---|---|
 | Web UI | `frontend/` | Explore, Data Views, Connections, AI Models, InvestiGenie AI. Built to static files. |
 | API server | `backend/` | Routes, storage, AI investigations, and serving the built UI on the same address. |
-| Integrations | `integrations/<id>/` | One folder per datasource. Discovered at build time. |
+| Data connectors | `integrations/data_connectors/<id>/` | One folder per datasource. Discovered at build time; existing IDs remain unchanged. |
+| AI connectors | `integrations/ai_connectors/` | Concrete transports only. `openai/` implements OpenAI-compatible Chat Completions. |
+| Connector contracts | `backend/src/data_connectors.rs`, `backend/src/ai_connectors.rs` | Shared interfaces, types, and registration owned by the backend. |
 | Storage | `backend/src/storage*` | Connections, Data Views, AI model profiles, settings, and AI conversation history. Encrypted, with revisions. |
 
 ## Core concepts
@@ -25,7 +27,10 @@ flowchart LR
 - **Connection:** how to reach one datasource (URL plus credentials). Secrets never leave the server.
 - **Data View:** a named connection + index/table + time field. Explore and AI work only on Data Views.
 - **Integration:** the code that talks to a datasource type and describes its UI (form fields, query language, capabilities).
+- **AI connector:** provider transport only: authentication, HTTP limits, completion decoding, usage, and protocol-specific fallbacks. Investigation planning, record scanning, JSON repair, evidence validation, job control, and history remain in the backend.
 - **AI model profile:** an OpenAI-compatible endpoint, model, and key, chosen per investigation.
+
+`backend/src/data_connectors.rs` owns the datasource `Connector` contract, metadata/configuration helpers, and generated registry; implementations import `crate::data_connectors`. `backend/src/ai_connectors.rs` owns `AiConnector`, `AiSettings`, `ProviderReply`, `ModelUsage`, sanitized `AiConnectorError`, and `default_connector()`, and declares concrete transport modules with explicit paths. The default is OpenAI-compatible; saved model/connection schemas and API payloads have not changed. New harness transports implement the shared completion interface and are registered explicitly in the backend contract module. There is no runtime plugin loader or AI connector selector yet. "OpenAI-compatible" describes the supported Chat Completions protocol, not every endpoint in OpenAI's API.
 
 ## Request flows
 

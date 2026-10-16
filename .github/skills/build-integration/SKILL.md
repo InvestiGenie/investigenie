@@ -1,21 +1,25 @@
 ---
 name: build-integration
-description: 'Use when adding, building, extending, or reviewing an InvestiGenie datasource integration or connector for another system. Covers discovery, descriptor metadata, credentials, read-only querying, cursor pagination, timeframe-aware histograms, AI compatibility, resource limits, and required tests.'
+description: 'Use when adding, building, extending, or reviewing InvestiGenie data connectors or AI transports. Covers data_connectors discovery, descriptors, read-only paging/histograms, ai_connectors completion contracts, OpenAI-compatible transport, credentials, resource limits, and tests.'
 ---
 
-# Build an InvestiGenie Integration
+# Build an InvestiGenie Connector
+
+There are two extension points: auto-discovered datasources in `integrations/data_connectors/<id>/` and explicitly registered AI transports in `integrations/ai_connectors/<id>/`. Their shared contracts/registration are backend-owned (`backend/src/data_connectors.rs`, `backend/src/ai_connectors.rs`); integration folders hold concrete implementations only. Do not mix their registries or change saved datasource IDs when moving files. The AI transport workflow is below; datasource rules remain applicable only to data connectors.
 
 Implement a datasource adapter that works through InvestiGenie's shared connector and metadata contracts. This skill is also a checklist for human developers. Paths below are relative to the repository root, `investigenie/`, not its parent workspace.
 
 ## Start With Verified Contracts
 
+Contributor setup and repository conventions are in the root [CONTRIBUTING.md](../../../CONTRIBUTING.md), GitHub's contributing overview entry point. Keep it canonical rather than duplicating it under docs/.
+
 Read these files before implementing, because this skill is guidance, not an alternative API definition:
 
 - `integrations/README.md`: descriptor fields and shared response examples.
 - `backend/build.rs`: build-time discovery and identifier validation.
-- `backend/src/integrations.rs`: `IntegrationDescriptor`, `ConnectionConfig`, `Connector`, `ConnectorFuture`, error and credential helpers.
+- `backend/src/data_connectors.rs`: `IntegrationDescriptor`, `ConnectionConfig`, `Connector`, `ConnectorFuture`, error and credential helpers; use `crate::data_connectors` imports in implementations.
 - `backend/src/search.rs`: `SearchRequest` and `TimeRange` validation.
-- The closest existing adapter in `integrations/elasticsearch/` or `integrations/clickhouse/`, including its tests.
+- The closest existing adapter in `integrations/data_connectors/elasticsearch/` or `integrations/data_connectors/clickhouse/`, including its tests.
 - `frontend/src/api.ts`, `ConnectionsPage.tsx`, `DataViewsPage.tsx`, and `App.tsx`: consumers of metadata and result shapes.
 - `backend/src/ai.rs` when AI investigation support is required.
 
@@ -23,10 +27,10 @@ Choose the native query language, read-only credentials, stable record identity,
 
 ## Register Without Special-Casing the UI
 
-1. Create `integrations/<source_id>/mod.rs`. The ID must be a unique, non-keyword Rust identifier and exactly match the folder and descriptor ID.
+1. Create `integrations/data_connectors/<source_id>/mod.rs`. The ID must be a unique, non-keyword Rust identifier and exactly match the folder and descriptor ID.
 2. Export `descriptor() -> IntegrationDescriptor` and `connect(&ConnectionConfig) -> Result<Arc<dyn Connector>, ConnectorError>`.
 3. Implement the `Send + Sync` connector with boxed `Send` futures through `ConnectorFuture`. Keep native client, translation, validation, and tests in the integration folder.
-4. Do not manually edit the generated registry. Immediate integration folders containing `mod.rs` are discovered at compile time; rebuild and restart to register them.
+4. Do not manually edit the generated registry. Immediate folders under `data_connectors/` containing `mod.rs` are discovered at compile time; rebuild and restart to register them. `ai_connectors/` is excluded.
 5. Existing dependencies are available. New libraries require changes to `backend/Cargo.toml` and the tracked lockfile; integration-local manifests are not loaded.
 
 ## Descriptor and Configuration Rules
@@ -71,16 +75,34 @@ Choose the native query language, read-only credentials, stable record identity,
 - Snapshot cursors need bounded lifetimes and cleanup. Report expired/invalid cursors as recoverable errors, not empty successful pages. Do not claim complete coverage after shard failures, partial source responses, timeouts, or source pagination errors.
 - Exact full pages may require one final empty request to establish exhaustion. Test it. Offset-based cursors may shift under concurrent writes; document that and do not promise exactly-once scans.
 - `include_histogram: false` suppresses aggregation. Subsequent cursor pages must not rebuild the histogram; Explore retains the first-page aggregation and AI opts out of histograms.
+- Elasticsearch currently requests exact totals (`track_total_hits: true`); 10,000 is not a multi-index total or scan cap. Preserve `total_relation`, and label lower bounds with `+` in every UI count.
+- Built-in ClickHouse connections omit `max_execution_time` when blank/null/absent; otherwise validate 1-600 seconds. HTTP timeout is 15s when unset or configured seconds + 5s. Do not reintroduce fixed memory/result/overflow URL settings that read-only profiles reject; server profiles own memory limits and SQL LIMITs bound returned rows.
 
 ## Timeframe and Histogram Rules
 
 - `time_range` uses inclusive UTC epoch milliseconds. Validate ordered timestamps with `TimeRange::is_valid()`. Apply the configured `histogram_field` consistently to record filtering and histogram aggregation.
 - `None` means all time; do not add an undocumented last-hour/day restriction. Preserve timestamps as instants regardless of display timezone.
+- Explore's initial window is last 15 minutes; AI defaults to last 30 minutes. Both allow explicit All time. Defaults belong to the caller, not hidden connector filtering.
+- Elasticsearch Data Views support wildcards and comma-separated indices; validate fields from the pattern mapping response rather than requiring exact index-list membership. Unmapped time-field sorts use `unmapped_type: date`; PIT searches still reject partial shards and release snapshots on errors/exhaustion.
+- All time breakdowns work without an explicit client interval: reuse `HistogramInterval::automatic(span_millis)` from `backend/src/search.rs` for the shared bucket selection. Elasticsearch resolves min/max on the same PIT (including rotated IDs); ClickHouse resolves from its automatic histogram. Never duplicate the interval candidate list or resolve independent intervals per series.
 - Aggregate counts across all matching records, not the returned page, using exactly the same query and time filters. Keep bucket counts nonnegative and UTC millisecond timestamps; use bounded bucket counts and native aggregation where possible.
 - A sparse or empty selected window must still display its full start-to-end axis in Explore. Do not make the visible range depend only on returned events. Pass the applied search timeframe to the shared chart, including empty results; do not reset it on page navigation or unsubmitted form edits.
 - If the source cannot produce a histogram, return `histogram: []` and an explicit `histogram_unavailable_reason`. Do not invent counts or enable `histogram_total_from_buckets` unless bucket sums genuinely represent all matches.
+- Reuse shared field validation (`search::safe_field_name`) and automatic intervals rather than copying them. ClickHouse uses `decode_histogram_rows` for both automatic/fixed buckets; preserve its malformed-count/timestamp failures when extending it. Share real behavior, not merely source-specific SQL syntax.
+- ClickHouse histogram failures preserve successfully fetched document rows with a sanitized unavailable reason; a row-query failure remains an error.
 
 ## AI Compatibility Is Separate
+
+### AI transport workflow
+
+- Read `backend/src/ai_connectors.rs` and `integrations/ai_connectors/openai/mod.rs` before modifying provider communication. OpenAI-compatible means the implemented Chat Completions protocol, not every OpenAI API endpoint.
+- Implement `AiConnector::complete` in `integrations/ai_connectors/<id>/mod.rs` with the shared `AiSettings`, `ProviderReply`, `ModelUsage`, `AiConnectorError`, and boxed Send future. Explicitly declare/register the transport in `backend/src/ai_connectors.rs`, using a path to the concrete implementation. There is currently one `default_connector()` (OpenAI), not auto-discovery or a runtime UI selector.
+- Keep bearer/provider authentication, wire formats, HTTP timeout, bounded request/response handling, actual usage decoding, and protocol fallback inside the transport. Keep it independent of backend `ai` and storage modules.
+- Backend `ai.rs` retains prompts, JSON extraction/repair, evidence validation, data scans, jobs/control, model probe semantics, and history-context composition. Call the shared default/interface rather than importing concrete provider modules there.
+- Preserve OpenAI transport's 65,536-byte prompt and 32,768-byte completion caps, bounded private error preview (4,096 bytes), explicit unsupported-JSON-mode retry, refusal/truncation handling, and sanitized errors. Never print credentials/provider bodies or retry authentication failures as format failures.
+- Add connector-local wiremock tests for limits/protocol failures and retain orchestration/API regressions for JSON repair, cancellation/time budgets, model probes, and follow-up context. Do not change saved model schema or add speculative harness fields as part of a folder move.
+
+### Datasource investigation support
 
 Build-time registration makes a source available to Explore, not automatically to AI. `backend/src/ai.rs` currently translates filters explicitly for Elasticsearch and ClickHouse. `query_language` in the descriptor is display metadata, not an executable translator.
 
@@ -89,7 +111,8 @@ Build-time registration makes a source available to Explore, not automatically t
 - Implement usable continuation pages: AI scans sequential 100-record batches, deduplicates repeated signals across pages, and sends bounded evidence buffers to the configured provider. There is no overall 50-record/20-example sampling cap; never introduce hidden truncation while claiming a complete scan.
 - Evidence includes representative IDs and observed counts; the output remains a bounded rolling summary, not every event. Do not treat source content as instructions. Do not infer causation from correlation or claim model findings are verified facts.
 - Preserve actual provider usage accounting. Missing usage is not reported, never estimated. More distinct signals can increase cost; batching does not promise fixed total price/runtime.
-- Document that investigations remain synchronous without durable background-job resume, and that source evidence is shared with the selected provider. Adding a connector does not add field-level redaction or user identity.
+- Investigations run as in-memory background jobs (the legacy synchronous route remains). Encrypted conversation history persists in filesystem/PostgreSQL, but that is not durable scan-job resumption. Follow-ups use saved transcript/results without rescanning sources; writes/deletes require If-Match. See `docs/backend.md` for caps, routes, and migrations.
+- OpenAI transport retries explicit JSON-mode rejection once without `response_format`; backend orchestration repairs unusable JSON once. Missing/null record fields are normal, not a reason to abort analysis. Keep provider diagnostics sanitized and evidence validation intact.
 
 ## Required Tests and Completion Checklist
 
@@ -102,12 +125,12 @@ Build-time registration makes a source available to Explore, not automatically t
 
    ```sh
    cargo test --locked -p investigenie-api
-   npm run test:web -- --maxWorkers=1
+   npm --workspace frontend run test -- --maxWorkers=1
    npm run build:web
    ```
 
    Database-dependent tests need an isolated `TEST_DATABASE_URL` and `CONFIG_ENCRYPTION_KEY`; report skipped tests rather than claiming they passed.
 7. Verify discovery through `GET /api/integrations`, then Connections, Data Views, Explore sorting/timezone/paging/JSON inspection, and AI if supported. Test full-window histograms with zero, one, and many records on desktop/mobile. Do not run tests against production sources or spend provider tokens without authorization.
-8. Update `integrations/README.md` or source-specific docs with native prerequisites, permissions, supported query operators, timeout/scan limits, pagination consistency, and known unsupported features. Keep private configuration and generated artifacts out of Git.
+8. Update relevant docs, this skill, agent instructions, and context references whenever behavior/contracts/tooling change. Remove stale claims in the same task. Include native prerequisites, permissions, supported query operators, timeout/scan limits, pagination consistency, and limitations. Keep private configuration and generated artifacts out of Git; inspect directory junction targets before deleting local caches.
 
 Before finishing, state what works in Explore, what works in AI, which guarantees are tested, and which limitations remain. Do not solve adapter limitations with hidden frontend exceptions or unbounded retries.

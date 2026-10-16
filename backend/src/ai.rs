@@ -11,24 +11,15 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
+    ai_connectors::{default_connector, AiConnectorError, AiSettings, ModelUsage},
     search::{SearchRequest, TimeRange},
     storage::{DataView, Storage, StorageError, StoredAiConversationMessage},
 };
-
-#[derive(Clone)]
-pub struct AiSettings {
-    pub api_url: String,
-    pub api_key: String,
-    pub model: String,
-    pub timeout: Duration,
-}
 
 const MAX_DATA_VIEWS: usize = 5;
 const MAX_SOURCE_RECORDS: usize = 100;
 const MAX_FINDINGS: usize = 8;
 const MAX_EVIDENCE_IDS: usize = 5;
-const MAX_PROMPT_BYTES: usize = 65_536;
-const MAX_COMPLETION_BYTES: usize = 32_768;
 const MAX_REPAIR_ATTEMPTS: usize = 1;
 pub const AI_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 60;
@@ -114,13 +105,6 @@ pub struct InvestigationResponse {
 #[derive(Clone, Debug, Serialize)]
 pub struct ProviderCallUsage {
     stage: String,
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
-    total_tokens: Option<u64>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct ModelUsage {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
@@ -280,6 +264,12 @@ pub struct InvestigationError {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
+}
+
+impl From<AiConnectorError> for InvestigationError {
+    fn from(error: AiConnectorError) -> Self {
+        Self { status: error.status, code: error.code, message: error.message }
+    }
 }
 
 impl InvestigationError {
@@ -1822,7 +1812,7 @@ mod tests {
             .mount(&server)
             .await;
         let messages = [json!({"role":"user","content":"probe"})];
-        let reply = request_completion(&provider_settings(&server).await, &messages, true, None)
+        let reply = default_connector().complete(&provider_settings(&server).await, &messages, true, None)
             .await
             .unwrap();
         assert_eq!(reply.content, "{\"ok\":true}");
@@ -2156,12 +2146,6 @@ mod tests {
     }
 }
 
-struct ProviderReply {
-    content: String,
-    usage: ModelUsage,
-    truncated: bool,
-}
-
 /// Returns the JSON object inside a model reply, tolerating code fences, reasoning blocks, and surrounding prose.
 fn extract_json_object(content: &str) -> Option<&str> {
     let mut text = content.trim();
@@ -2190,7 +2174,7 @@ async fn call_model<T: for<'de> Deserialize<'de>>(
     ];
     let mut usage: Option<ModelUsage> = None;
     for attempt in 0..=MAX_REPAIR_ATTEMPTS {
-        let reply = request_completion(settings, &messages, true, None).await?;
+        let reply = default_connector().complete(settings, &messages, true, None).await?;
         merge_usage(&mut usage, reply.usage);
         if reply.truncated {
             return Err(InvestigationError::upstream(
@@ -2224,165 +2208,6 @@ async fn call_model<T: for<'de> Deserialize<'de>>(
     ))
 }
 
-async fn request_completion(
-    settings: &AiSettings,
-    messages: &[Value],
-    json_mode: bool,
-    max_tokens: Option<u64>,
-) -> Result<ProviderReply, InvestigationError> {
-    let client = reqwest::Client::builder()
-        .timeout(settings.timeout)
-        .build()
-        .map_err(|_| {
-            InvestigationError::upstream(
-                "ai_unavailable",
-                "Could not initialize the AI provider request",
-            )
-        })?;
-    let mut body = json!({
-        "model": settings.model,
-        "messages": messages
-    });
-    if json_mode {
-        body["response_format"] = json!({"type":"json_object"});
-    }
-    if let Some(max_tokens) = max_tokens {
-        body["max_tokens"] = json!(max_tokens);
-    }
-    let serialized = serde_json::to_vec(&body).map_err(|_| {
-        InvestigationError::upstream(
-            "ai_request_too_large",
-            "Investigation input exceeds the supported size limit",
-        )
-    })?;
-    if serialized.len() > MAX_PROMPT_BYTES {
-        return Err(InvestigationError::upstream(
-            "ai_request_too_large",
-            "Investigation input exceeds the supported size limit",
-        ));
-    }
-    let endpoint = format!("{}/chat/completions", settings.api_url);
-    let mut response = send_completion(&client, &endpoint, &settings.api_key, &body).await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_preview = response_error_preview(response).await;
-        if !json_mode || !response_format_unsupported(status, &error_preview) {
-            return Err(InvestigationError::upstream(
-                "ai_provider_error",
-                "The AI provider returned an unusable response",
-            ));
-        }
-        body.as_object_mut()
-            .expect("completion request is an object")
-            .remove("response_format");
-        response = send_completion(&client, &endpoint, &settings.api_key, &body).await?;
-        if !response.status().is_success() {
-            return Err(InvestigationError::upstream(
-                "ai_provider_error",
-                "The AI provider returned an unusable response",
-            ));
-        }
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_COMPLETION_BYTES as u64)
-    {
-        return Err(InvestigationError::upstream(
-            "ai_provider_error",
-            "The AI provider returned an unusable response",
-        ));
-    }
-    let mut response = response;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| {
-        if error.is_timeout() {
-            InvestigationError::upstream(
-                "ai_timeout",
-                "The AI provider did not respond before the configured timeout",
-            )
-        } else {
-            InvestigationError::upstream(
-                "ai_provider_error",
-                "The AI provider returned an unusable response",
-            )
-        }
-    })? {
-        if bytes.len() + chunk.len() > MAX_COMPLETION_BYTES {
-            return Err(InvestigationError::upstream(
-                "ai_provider_error",
-                "The AI provider response exceeds the supported size limit",
-            ));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| {
-        InvestigationError::upstream(
-            "ai_provider_error",
-            "The AI provider returned an unusable response",
-        )
-    })?;
-    let message = envelope.pointer("/choices/0/message");
-    let content = match message.and_then(|message| message.get("content")) {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect(),
-        _ => String::new(),
-    };
-    let truncated = envelope
-        .pointer("/choices/0/finish_reason")
-        .and_then(Value::as_str)
-        .is_some_and(|reason| reason == "length" || reason == "max_tokens");
-    if content.trim().is_empty() && !truncated {
-        let refused = message
-            .and_then(|message| message.get("refusal"))
-            .is_some_and(|refusal| !refusal.is_null());
-        return Err(if refused {
-            InvestigationError::upstream(
-                "ai_refused",
-                "The AI provider declined to answer this request",
-            )
-        } else {
-            InvestigationError::upstream(
-                "ai_provider_error",
-                "The AI provider returned an empty response",
-            )
-        });
-    }
-    let usage = envelope
-        .get("usage")
-        .map(|usage| {
-            let prompt_tokens = usage
-                .get("prompt_tokens")
-                .and_then(Value::as_u64)
-                .or_else(|| usage.get("input_tokens").and_then(Value::as_u64));
-            let completion_tokens = usage
-                .get("completion_tokens")
-                .and_then(Value::as_u64)
-                .or_else(|| usage.get("output_tokens").and_then(Value::as_u64));
-            let total_tokens = usage
-                .get("total_tokens")
-                .and_then(Value::as_u64)
-                .or_else(|| {
-                    prompt_tokens
-                        .zip(completion_tokens)
-                        .map(|(input, output)| input.saturating_add(output))
-                });
-            ModelUsage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-            }
-        })
-        .unwrap_or_default();
-    Ok(ProviderReply {
-        content,
-        usage,
-        truncated,
-    })
-}
-
 pub async fn continue_conversation(
     settings: &AiSettings,
     history: &[StoredAiConversationMessage],
@@ -2403,7 +2228,7 @@ pub async fn continue_conversation(
         messages.push(json!({"role":message.role,"content":content}));
     }
     messages.push(json!({"role":"user","content":question}));
-    let reply = request_completion(settings, &messages, false, Some(1024)).await?;
+    let reply = default_connector().complete(settings, &messages, false, Some(1024)).await?;
     if reply.truncated {
         return Err(InvestigationError::upstream(
             "ai_response_truncated",
@@ -2413,72 +2238,6 @@ pub async fn continue_conversation(
     Ok(reply.content.trim().to_owned())
 }
 
-async fn send_completion(
-    client: &reqwest::Client,
-    endpoint: &str,
-    api_key: &str,
-    body: &Value,
-) -> Result<reqwest::Response, InvestigationError> {
-    client
-        .post(endpoint)
-        .bearer_auth(api_key)
-        .json(body)
-        .send()
-        .await
-        .map_err(|error| {
-            if error.is_timeout() {
-                InvestigationError::upstream(
-                    "ai_timeout",
-                    "The AI provider did not respond before the configured timeout",
-                )
-            } else {
-                InvestigationError::upstream(
-                    "ai_unavailable",
-                    "The AI provider request failed or timed out",
-                )
-            }
-        })
-}
-
-async fn response_error_preview(mut response: reqwest::Response) -> String {
-    const MAX_ERROR_PREVIEW_BYTES: usize = 4_096;
-    let mut bytes = Vec::with_capacity(MAX_ERROR_PREVIEW_BYTES);
-    while bytes.len() < MAX_ERROR_PREVIEW_BYTES {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                let remaining = MAX_ERROR_PREVIEW_BYTES - bytes.len();
-                bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-            }
-            _ => break,
-        }
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-fn response_format_unsupported(status: StatusCode, error_preview: &str) -> bool {
-    if !matches!(
-        status,
-        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
-    ) {
-        return false;
-    }
-    let message = error_preview.to_ascii_lowercase();
-    let mentions_format = ["response_format", "json_object", "structured output"]
-        .iter()
-        .any(|term| message.contains(term));
-    let rejects_format = [
-        "not supported",
-        "unsupported",
-        "unknown parameter",
-        "unrecognized",
-        "not implemented",
-        "invalid parameter",
-    ]
-    .iter()
-    .any(|term| message.contains(term));
-    mentions_format && rejects_format
-}
-
 pub async fn test_model(settings: &AiSettings) -> Result<(), &'static str> {
     let mut probe_settings = settings.clone();
     probe_settings.timeout = AI_TIMEOUT;
@@ -2486,7 +2245,7 @@ pub async fn test_model(settings: &AiSettings) -> Result<(), &'static str> {
         json!({"role":"system","content":"Return exactly a JSON object with the boolean field ok set to true."}),
         json!({"role":"user","content":"{\"probe\":true}"}),
     ];
-    let response = request_completion(&probe_settings, &messages, true, Some(32))
+    let response = default_connector().complete(&probe_settings, &messages, true, Some(32))
         .await
         .map_err(|_| "The provider test returned an unusable response")?;
     let content: Value = parse_model_json(&response.content)

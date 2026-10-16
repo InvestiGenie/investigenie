@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import { ArrowUp, BrainCircuit, Check, CircleAlert, CirclePause, Database, Play, Search, Square, Trash2, X } from 'lucide-react';
-import { api, type AIConversation, type AIConversationSummary, type AIModelSummary, type DataViewSummary, type InvestigationJob } from './api';
+import { api, type AIConversation, type AIConversationSummary, type AIModelSummary, type DataViewSummary, type InvestigationJob, type InvestigationResult } from './api';
 import TimeRangePicker from './TimeRangePicker';
 import { getPreference, setPreference, type PreferenceName } from './preferences';
+import { errorMessage } from './format';
 
 const TIMEOUT_OPTIONS = [15, 30, 60, 120, 300, 600];
 const CHECK_IN_OPTIONS = [60, 120, 300, 600, 1800, 3600];
@@ -24,6 +25,31 @@ function storedSeconds(name: PreferenceName, options: number[], fallback: number
 }
 
 const activeStatuses = new Set<InvestigationJob['status']>(['running', 'stopping', 'awaiting_decision']);
+
+function InvestigationResultView({ result, label }: { result: InvestigationResult; label: string }) {
+  return <article className="ai-result">
+    <div className="ai-result-label"><BrainCircuit size={15} aria-hidden="true" /> {label}</div>
+    <p className="ai-summary">{result.summary}</p>
+    <section className="ai-token-usage" aria-label="Token usage">
+      <strong>Provider token usage</strong>
+      {result.token_usage.some((call) => call.total_tokens !== null)
+        ? <div>{result.token_usage.map((call) => <span key={call.stage}>{call.stage}: {call.total_tokens === null ? 'not reported' : `${call.total_tokens.toLocaleString()} total (${call.prompt_tokens?.toLocaleString() ?? '—'} prompt + ${call.completion_tokens?.toLocaleString() ?? '—'} completion)`}</span>)}</div>
+        : <span>Provider did not report token usage.</span>}
+    </section>
+    {result.findings.length > 0 && <section className="ai-findings" aria-label="Findings">
+      <h3>Findings</h3>
+      {result.findings.map((finding, index) => <article className="ai-finding" key={`${finding.title}-${index}`}>
+        <div className="ai-finding-heading"><h4>{finding.title}</h4><span className={`ai-severity severity-${finding.severity}`}>{finding.severity}</span></div>
+        <p>{finding.detail}</p>
+        <div className="ai-finding-meta"><span>{finding.confidence} confidence</span>{finding.evidence.map((evidence) => <span key={`${evidence.data_view_id}-${evidence.record_ids.join('-')}`}>{evidence.data_view_name}: {evidence.count.toLocaleString()} records{evidence.record_ids.length ? ` · ${evidence.record_ids.join(', ')}` : ''}</span>)}</div>
+      </article>)}
+    </section>}
+    <details className="ai-sources-used"><summary>Sources and query scope</summary>
+      {result.sources.map((source) => <div className="ai-source-used" key={source.data_view_id}><strong>{source.name}</strong><span>{source.index} · {source.records_examined.toLocaleString()} records examined{source.batches_processed !== undefined ? ` · ${source.batches_processed.toLocaleString()} batches` : ''}</span><small>{source.query_summary}</small></div>)}
+    </details>
+    {result.caveats.length > 0 && <div className="ai-caveats"><strong>Limits</strong>{result.caveats.map((caveat, index) => <p key={index}>{caveat}</p>)}</div>}
+  </article>;
+}
 
 type InvestiGenieAIPageProps = {
   dataViews: DataViewSummary[];
@@ -65,7 +91,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
     api.aiConversations(controller.signal)
       .then((items) => { if (!controller.signal.aborted) setConversations(items); })
       .catch((reason: unknown) => {
-        if (!controller.signal.aborted) setConversationError(reason instanceof Error ? reason.message : 'Could not load AI history');
+        if (!controller.signal.aborted) setConversationError(errorMessage(reason, 'Could not load AI history'));
       });
     return () => controller.abort();
   }, []);
@@ -88,7 +114,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
       })
       .catch((reason: unknown) => {
         if (controller.signal.aborted) return;
-        setModelError(reason instanceof Error ? reason.message : 'Could not load AI models');
+        setModelError(errorMessage(reason, 'Could not load AI models'));
         setModelStatus('failed');
       });
     return () => controller.abort();
@@ -116,7 +142,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
         })
         .catch((reason: unknown) => {
           if (controller.signal.aborted) return;
-          setError(reason instanceof Error ? reason.message : 'Lost track of the investigation.');
+          setError(errorMessage(reason, 'Lost track of the investigation.'));
           setJob((current) => current && { ...current, status: 'failed' });
         });
     }, job.status === 'awaiting_decision' ? PAUSED_POLL_MS : ACTIVE_POLL_MS);
@@ -155,7 +181,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
       setConversations(await api.aiConversations());
       setConversationError('');
     } catch (reason) {
-      setConversationError(reason instanceof Error ? reason.message : 'Could not refresh AI history');
+      setConversationError(errorMessage(reason, 'Could not refresh AI history'));
     }
   }
 
@@ -179,7 +205,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
       setSelectedModelId(conversation.model_id);
       setQuestion('');
     } catch (reason) {
-      setConversationError(reason instanceof Error ? reason.message : 'Could not load this conversation');
+      setConversationError(errorMessage(reason, 'Could not load this conversation'));
     } finally {
       setConversationLoading(false);
     }
@@ -197,7 +223,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
       setSubmittedQuestion('');
       setError('');
     } catch (reason) {
-      setConversationError(reason instanceof Error ? reason.message : 'Could not delete this conversation');
+      setConversationError(errorMessage(reason, 'Could not delete this conversation'));
     } finally {
       setConversationBusy(false);
     }
@@ -216,7 +242,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
         setQuestion('');
         await refreshConversations();
       } catch (reason) {
-        setConversationError(reason instanceof Error ? reason.message : 'Could not continue this conversation');
+        setConversationError(errorMessage(reason, 'Could not continue this conversation'));
       } finally {
         setConversationBusy(false);
       }
@@ -234,7 +260,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
       setActiveConversation(null);
       await refreshConversations();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'The investigation could not be started.');
+      setError(errorMessage(reason, 'The investigation could not be started.'));
     } finally {
       setStarting(false);
     }
@@ -247,7 +273,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
     try {
       setJob(await api.decideInvestigation(job.id, action));
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'The decision could not be sent.');
+      setError(errorMessage(reason, 'The decision could not be sent.'));
       api.investigation(job.id).then(setJob).catch(() => undefined);
     } finally {
       setDeciding(false);
@@ -324,7 +350,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
           ? activeConversation.messages.map((message, index) => message.role === 'user'
             ? <div className="ai-user-message" key={`${index}-user`}><span>You</span><p>{message.content}</p></div>
             : message.result
-              ? <article className="ai-result" key={`${index}-result`}><div className="ai-result-label"><BrainCircuit size={15} aria-hidden="true" /> Investigation</div><p className="ai-summary">{message.result.summary}</p>{message.result.findings.map((finding, findingIndex) => <article className="ai-finding" key={`${finding.title}-${findingIndex}`}><div className="ai-finding-heading"><h4>{finding.title}</h4><span className={`ai-severity severity-${finding.severity}`}>{finding.severity}</span></div><p>{finding.detail}</p></article>)}</article>
+              ? <InvestigationResultView key={`${index}-result`} result={message.result} label={message.result.complete === false ? 'Partial investigation' : 'Investigation'} />
               : <div className="ai-assistant-message" key={`${index}-assistant`}><span>InvestiGenie AI</span><p>{message.content}</p></div>)
           : submittedQuestion && <div className="ai-user-message"><span>You</span><p>{submittedQuestion}</p></div>}
         {starting && <div className="ai-thinking" role="status"><span className="spinner dark" /> Starting investigation…</div>}
@@ -347,28 +373,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
         </section>}
         {error && <div className="alert ai-error" role="alert"><CircleAlert size={16} aria-hidden="true" /><span>{error}</span></div>}
         {job?.status === 'terminated' && !result && <p className="ai-empty-sources">The investigation was stopped before any findings were produced.</p>}
-        {result && <article className="ai-result">
-          <div className="ai-result-label"><BrainCircuit size={15} aria-hidden="true" /> {job?.status === 'completed' ? 'Investigation' : job && activeStatuses.has(job.status) ? 'Findings so far' : 'Partial investigation'}</div>
-          <p className="ai-summary">{result.summary}</p>
-          <section className="ai-token-usage" aria-label="Token usage">
-            <strong>Provider token usage</strong>
-            {result.token_usage.some((call) => call.total_tokens !== null)
-              ? <div>{result.token_usage.map((call) => <span key={call.stage}>{call.stage}: {call.total_tokens === null ? 'not reported' : `${call.total_tokens.toLocaleString()} total (${call.prompt_tokens?.toLocaleString() ?? '—'} prompt + ${call.completion_tokens?.toLocaleString() ?? '—'} completion)`}</span>)}</div>
-              : <span>Provider did not report token usage.</span>}
-          </section>
-          {result.findings.length > 0 && <section className="ai-findings" aria-label="Findings">
-            <h3>Findings</h3>
-            {result.findings.map((finding, index) => <article className="ai-finding" key={`${finding.title}-${index}`}>
-              <div className="ai-finding-heading"><h4>{finding.title}</h4><span className={`ai-severity severity-${finding.severity}`}>{finding.severity}</span></div>
-              <p>{finding.detail}</p>
-              <div className="ai-finding-meta"><span>{finding.confidence} confidence</span>{finding.evidence.map((evidence) => <span key={`${evidence.data_view_id}-${evidence.record_ids.join('-')}`}>{evidence.data_view_name}: {evidence.count.toLocaleString()} records{evidence.record_ids.length ? ` · ${evidence.record_ids.join(', ')}` : ''}</span>)}</div>
-            </article>)}
-          </section>}
-          <details className="ai-sources-used"><summary>Sources and query scope</summary>
-            {result.sources.map((source) => <div className="ai-source-used" key={source.data_view_id}><strong>{source.name}</strong><span>{source.index} · {source.records_examined.toLocaleString()} records examined{source.batches_processed !== undefined ? ` · ${source.batches_processed.toLocaleString()} batches` : ''}</span><small>{source.query_summary}</small></div>)}
-          </details>
-          {result.caveats.length > 0 && <div className="ai-caveats"><strong>Limits</strong>{result.caveats.map((caveat, index) => <p key={index}>{caveat}</p>)}</div>}
-        </article>}
+        {result && !activeConversation && <InvestigationResultView result={result} label={job?.status === 'completed' ? 'Investigation' : job && activeStatuses.has(job.status) ? 'Findings so far' : 'Partial investigation'} />}
       </section>
 
       <form className="ai-composer" onSubmit={(event) => void investigate(event)}>

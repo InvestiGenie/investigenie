@@ -251,6 +251,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+function jsonMutation(method: 'POST' | 'PUT' | 'DELETE', body?: unknown, revision?: string): RequestInit {
+  return {
+    method,
+    headers: {
+      ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      ...(revision !== undefined ? { 'If-Match': `"${revision}"` } : {}),
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  };
+}
+
 export const api = {
   async ready(signal?: AbortSignal): Promise<void> {
     await request('/api/health/ready', { signal });
@@ -279,41 +290,24 @@ export const api = {
     return response.models;
   },
   async addAIModel(body: AIModelRequest): Promise<AIModelSummary> {
-    const response = await request<{ model: AIModelSummary }>('/api/ai/models', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    const response = await request<{ model: AIModelSummary }>('/api/ai/models', jsonMutation('POST', body));
     return response.model;
   },
   async updateAIModel(modelId: string, body: AIModelRequest, revision: string): Promise<AIModelSummary> {
-    const response = await request<{ model: AIModelSummary }>(`/api/ai/models/${encodeURIComponent(modelId)}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json', 'If-Match': `"${revision}"` },
-      body: JSON.stringify(body),
-    });
+    const response = await request<{ model: AIModelSummary }>(`/api/ai/models/${encodeURIComponent(modelId)}`, jsonMutation('PUT', body, revision));
     return response.model;
   },
   async removeAIModel(modelId: string, revision: string): Promise<void> {
-    await request(`/api/ai/models/${encodeURIComponent(modelId)}`, {
-      method: 'DELETE',
-      headers: { 'If-Match': `"${revision}"` },
-    });
+    await request(`/api/ai/models/${encodeURIComponent(modelId)}`, jsonMutation('DELETE', undefined, revision));
   },
   async investigate(question: string, dataViewIds: string[], aiModelId: string, timeRange: SearchRequest['time_range'] | null, signal?: AbortSignal): Promise<InvestigationResult> {
     return request<InvestigationResult>('/api/ai/investigate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, data_view_ids: dataViewIds, ai_model_id: aiModelId, time_range: timeRange }),
+      ...jsonMutation('POST', { question, data_view_ids: dataViewIds, ai_model_id: aiModelId, time_range: timeRange }),
       signal,
     });
   },
   async startInvestigation(question: string, dataViewIds: string[], aiModelId: string, timeRange: SearchRequest['time_range'] | null, controls: InvestigationControls): Promise<InvestigationJob> {
-    const response = await request<{ investigation: InvestigationJob }>('/api/ai/investigations', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, data_view_ids: dataViewIds, ai_model_id: aiModelId, time_range: timeRange, ...controls }),
-    });
+    const response = await request<{ investigation: InvestigationJob }>('/api/ai/investigations', jsonMutation('POST', { question, data_view_ids: dataViewIds, ai_model_id: aiModelId, time_range: timeRange, ...controls }));
     return response.investigation;
   },
   async investigation(id: string, signal?: AbortSignal): Promise<InvestigationJob> {
@@ -321,11 +315,7 @@ export const api = {
     return response.investigation;
   },
   async decideInvestigation(id: string, action: 'continue' | 'terminate'): Promise<InvestigationJob> {
-    const response = await request<{ investigation: InvestigationJob }>(`/api/ai/investigations/${encodeURIComponent(id)}/decision`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action }),
-    });
+    const response = await request<{ investigation: InvestigationJob }>(`/api/ai/investigations/${encodeURIComponent(id)}/decision`, jsonMutation('POST', { action }));
     return response.investigation;
   },
   async aiConversations(signal?: AbortSignal): Promise<AIConversationSummary[]> {
@@ -337,52 +327,29 @@ export const api = {
     return response.conversation;
   },
   async continueAIConversation(id: string, message: string, revision: string): Promise<AIConversation> {
-    const response = await request<{ conversation: AIConversation }>(`/api/ai/conversations/${encodeURIComponent(id)}/messages`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'If-Match': `"${revision}"` },
-      body: JSON.stringify({ message }),
-    });
+    const response = await request<{ conversation: AIConversation }>(`/api/ai/conversations/${encodeURIComponent(id)}/messages`, jsonMutation('POST', { message }, revision));
     return response.conversation;
   },
   async removeAIConversation(id: string, revision: string): Promise<void> {
-    await request(`/api/ai/conversations/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-      headers: { 'If-Match': `"${revision}"` },
-    });
+    await request(`/api/ai/conversations/${encodeURIComponent(id)}`, jsonMutation('DELETE', undefined, revision));
   },
   async addDataView(body: CreateDataViewRequest): Promise<void> {
-    await request('/api/data-views', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    await request('/api/data-views', jsonMutation('POST', body));
   },
   async removeDataView(dataViewId: string, revision: string): Promise<void> {
-    await request(`/api/data-views/${encodeURIComponent(dataViewId)}`, { method: 'DELETE', headers: { 'If-Match': `"${revision}"` } });
+    await request(`/api/data-views/${encodeURIComponent(dataViewId)}`, jsonMutation('DELETE', undefined, revision));
   },
   async updateDataView(dataViewId: string, body: CreateDataViewRequest, revision: string): Promise<void> {
-    await request(`/api/data-views/${encodeURIComponent(dataViewId)}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json', 'If-Match': `"${revision}"` },
-      body: JSON.stringify(body),
-    });
+    await request(`/api/data-views/${encodeURIComponent(dataViewId)}`, jsonMutation('PUT', body, revision));
   },
   async addConnection(body: AddConnectionRequest): Promise<void> {
-    await request('/api/connections', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    await request('/api/connections', jsonMutation('POST', body));
   },
   async updateConnection(connectionId: string, body: UpdateConnectionRequest, revision: string): Promise<void> {
-    await request(`/api/connections/${encodeURIComponent(connectionId)}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json', 'If-Match': `"${revision}"` },
-      body: JSON.stringify(body),
-    });
+    await request(`/api/connections/${encodeURIComponent(connectionId)}`, jsonMutation('PUT', body, revision));
   },
   async removeConnection(connectionId: string, revision: string): Promise<void> {
-    await request(`/api/connections/${encodeURIComponent(connectionId)}`, { method: 'DELETE', headers: { 'If-Match': `"${revision}"` } });
+    await request(`/api/connections/${encodeURIComponent(connectionId)}`, jsonMutation('DELETE', undefined, revision));
   },
   async indices(connectionId: string, signal?: AbortSignal): Promise<IndexSummary[]> {
     const response = await request<{ indices: IndexSummary[] }>(`/api/connections/${encodeURIComponent(connectionId)}/indices`, { signal });
@@ -397,9 +364,7 @@ export const api = {
   },
   search(connectionId: string, body: SearchRequest, signal?: AbortSignal): Promise<SearchResult> {
     return request<SearchResult>(`/api/connections/${encodeURIComponent(connectionId)}/search`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      ...jsonMutation('POST', body),
       signal,
     });
   },

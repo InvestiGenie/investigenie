@@ -1,7 +1,7 @@
 use super::{
     ElasticsearchAuthentication, ElasticsearchClient, ElasticsearchError, ElasticsearchSettings,
 };
-use crate::integrations::{
+use crate::data_connectors::{
     string_setting, ConnectionConfig, Connector, ConnectorError, ConnectorFuture, FieldSummary,
     IndexSummary,
 };

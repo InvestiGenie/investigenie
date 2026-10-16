@@ -1,5 +1,5 @@
 use super::{ClickHouseClient, ClickHouseError, ClickHouseTimeField};
-use crate::integrations::{
+use crate::data_connectors::{
     string_setting, ConnectionConfig, Connector, ConnectorError, ConnectorFuture, FieldSummary,
     IndexSummary,
 };
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn descriptor_exposes_optional_execution_time_setting() {
-        let field = crate::integrations::clickhouse::descriptor()
+        let field = crate::data_connectors::clickhouse::descriptor()
             .connection_fields
             .into_iter()
             .find(|field| field["name"] == "max_execution_time")

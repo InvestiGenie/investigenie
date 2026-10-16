@@ -48,7 +48,9 @@ describe('Discover', () => {
     vi.spyOn(api, 'fields').mockResolvedValue([{ name: '@timestamp', field_type: 'date' }]);
     const search = vi.spyOn(api, 'search').mockResolvedValue({ took: 1, timed_out: false, total: 0, total_relation: 'eq', hits: [], histogram: [] });
     renderExplore();
-    await screen.findByText('No timestamped documents match this query.');
+    await screen.findByRole('img', { name: 'Document counts over time' });
+    const initialRange = search.mock.calls.at(-1)?.[1].time_range;
+    expect(initialRange!.end - initialRange!.start).toBe(15 * 60_000);
     fireEvent.click(screen.getByRole('button', { name: 'Edit time window' }));
     enterDateTime('Start', '2026-10-01T00:00:00');
     enterDateTime('End', '2026-10-08T00:00:00');
@@ -69,14 +71,26 @@ describe('Discover', () => {
     ]);
     const start = Date.parse('2026-10-06T08:00:00Z');
     const search = vi.spyOn(api, 'search').mockImplementation(async (_connection, body) => ({
-      took: 1, timed_out: false, total: 3, total_relation: 'eq', hits: [],
+      took: 1, timed_out: false, total: 10000, total_relation: 'gte', hits: [],
       histogram_interval: body.histogram_interval ?? null,
       histogram: [{ timestamp: start, label: null, count: 3, ...(body.histogram_breakdown_field ? { breakdown: [{ key: 'api', count: 2 }, { key: '__other__', count: 1 }] } : {}) }],
     }));
     renderExplore();
     await screen.findByRole('img', { name: 'Document counts over time' });
+    expect(screen.getByLabelText('Histogram interval')).toBeEnabled();
+    expect(search.mock.calls.at(-1)?.[1]).toHaveProperty('histogram_interval');
+    expect(document.querySelector('.histogram-heading')).toHaveTextContent('10,000+ matching documents');
+    fireEvent.click(screen.getByRole('button', { name: 'Clear time window' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+    await waitFor(() => expect(screen.getByLabelText('Break down by')).toBeEnabled());
     expect(screen.getByLabelText('Histogram interval')).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('Break down by'), { target: { value: 'service' } });
+    await waitFor(() => expect(search.mock.calls.at(-1)?.[1]).toMatchObject({ histogram_breakdown_field: 'service' }));
+    expect(search.mock.calls.at(-1)?.[1]).not.toHaveProperty('time_range');
     expect(search.mock.calls.at(-1)?.[1]).not.toHaveProperty('histogram_interval');
+    await waitFor(() => expect(screen.getByLabelText('Break down by')).toBeEnabled());
+    fireEvent.change(screen.getByLabelText('Break down by'), { target: { value: '' } });
+    await waitFor(() => expect(screen.getByLabelText('Break down by')).toBeEnabled());
     fireEvent.click(screen.getByRole('button', { name: 'Edit time window' }));
     enterDateTime('Start', '2026-10-06T08:00:00');
     enterDateTime('End', '2026-10-06T09:00:00');
@@ -270,7 +284,7 @@ describe('Discover', () => {
       }));
 
     renderExplore();
-    expect(await screen.findByText('service.name')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Add service.name to selected fields' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Add host to selected fields' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Add service to selected fields' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Add items to selected fields' })).not.toBeInTheDocument();
@@ -300,7 +314,7 @@ describe('Discover', () => {
     expect(screen.queryByText('logs-2026')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Expand document doc-1' }));
     expect(document.querySelector('.expanded-row td')).toHaveAttribute('colspan', '2');
-    expect(await screen.findAllByText('service.name')).toHaveLength(2);
+    expect(await screen.findAllByText('service.name')).toHaveLength(3);
     expect(screen.getByText('gateway')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Open full document' })).toBeInTheDocument();
     const availableFields = screen.getByRole('region', { name: 'Available Fields' });
@@ -381,7 +395,7 @@ describe('Discover', () => {
     expect(screen.getByText('["api","gateway"]')).toBeInTheDocument();
     expect(await screen.findByRole('img', { name: 'Document counts over time' })).toBeInTheDocument();
     expect(screen.getByText('created_at · 250 matching documents')).toBeInTheDocument();
-    expect(screen.getAllByText('event_id')).toHaveLength(2);
+    expect(screen.getAllByText('event_id')).toHaveLength(3);
     const requestsBeforeOpen = fetchMock.mock.calls.length;
     fireEvent.click(screen.getByRole('button', { name: 'Open full document' }));
     const documentDialog = screen.getByRole('dialog');
