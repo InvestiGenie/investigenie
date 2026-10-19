@@ -1,0 +1,19 @@
+# Shared Trivy settings for scripts/trivy.sh, the pre-push hook and CI.
+severity:
+  - HIGH
+  - CRITICAL
+exit-code: 1
+scan:
+  scanners:
+    - vuln
+    - secret
+    - misconfig
+  skip-dirs:
+    - node_modules
+    - frontend/node_modules
+    - frontend/dist
+    - target
+    - playground/reports
+vulnerability:
+  # Only fail on issues that can be fixed by upgrading.
+  ignore-unfixed: true

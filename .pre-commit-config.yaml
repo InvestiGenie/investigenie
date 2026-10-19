@@ -1,0 +1,105 @@
+default_install_hook_types:
+  - pre-commit
+  - pre-push
+default_stages:
+  - pre-commit
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^backend/migrations/
+        stages: [pre-commit, manual]
+      - id: end-of-file-fixer
+        exclude: ^backend/migrations/
+        stages: [pre-commit, manual]
+      - id: check-yaml
+        stages: [pre-commit, manual]
+      - id: check-json
+        stages: [pre-commit, manual]
+      - id: check-toml
+        stages: [pre-commit, manual]
+      - id: check-merge-conflict
+        stages: [pre-commit, manual]
+      - id: check-added-large-files
+        stages: [pre-commit, manual]
+      - id: detect-private-key
+        stages: [pre-commit, manual]
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+        stages: [pre-commit, manual]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.1
+    hooks:
+      - id: ruff
+        args: [--fix]
+        types_or: [python, pyi]
+        stages: [pre-commit, manual]
+      - id: ruff-format
+        types_or: [python, pyi]
+        stages: [pre-commit, manual]
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+        stages: [pre-commit, manual]
+
+  - repo: https://github.com/hadolint/hadolint
+    rev: v2.15.1
+    hooks:
+      - id: hadolint
+        stages: [pre-commit, manual]
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+        stages: [pre-commit, manual]
+
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.31.1
+    hooks:
+      - id: zizmor
+        stages: [pre-commit, manual]
+
+  - repo: local
+    hooks:
+      - id: rustfmt
+        name: rustfmt
+        entry: cargo fmt --all -- --check
+        language: system
+        pass_filenames: false
+        files: \.rs$
+        stages: [pre-commit, manual]
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --locked --workspace --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+        stages: [pre-push, manual]
+      - id: frontend-build
+        name: frontend typecheck and build
+        entry: npm run build:web
+        language: system
+        pass_filenames: false
+        files: ^(frontend/|package(-lock)?\.json)
+        stages: [pre-push, manual]
+      - id: playground-tests
+        name: playground unit tests
+        entry: python3 -m unittest discover -s playground/tests
+        language: system
+        pass_filenames: false
+        files: ^playground/.*\.py$
+        stages: [pre-commit, manual]
+      - id: trivy
+        name: trivy filesystem scan
+        entry: scripts/trivy.sh fs .
+        language: system
+        pass_filenames: false
+        stages: [pre-push, manual]

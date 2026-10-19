@@ -1,0 +1,5 @@
+failure-threshold: warning
+ignored:
+  # Debian packages come from the pinned bookworm base image; exact apt version pins break
+  # whenever Debian publishes a security update, so they are deliberately not used.
+  - DL3008

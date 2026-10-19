@@ -14,17 +14,37 @@ npm run dev:web                   # UI on http://127.0.0.1:5173
 
 You don't need a database: quickstart stores encrypted data in `investigenie_data/` next to the binary. Datasource and AI credentials are entered in the UI. Never put them in `.env`, code, tests, or logs.
 
+## Quality gates
+
+Install the Git hooks once per clone ([pre-commit](https://pre-commit.com) 3.2+, the Rust/Node/Python toolchains, and ShellCheck and Hadolint). Trivy uses Docker when available; otherwise install [Trivy](https://trivy.dev) locally.
+
+```sh
+pipx install pre-commit        # or: pip install pre-commit
+pre-commit install             # installs both the pre-commit and pre-push hooks
+```
+
+| Stage | Checks |
+| --- | --- |
+| Every commit | Whitespace, final newlines, YAML/JSON/TOML syntax, merge markers, large files, private keys, secrets (gitleaks), `rustfmt`, Python lint and format (ruff), shell (shellcheck), Dockerfile (hadolint), workflows (actionlint, zizmor), playground unit tests |
+| Every push | `cargo clippy -D warnings`, frontend typecheck, Trivy (fixable HIGH/CRITICAL vulnerabilities, secrets, misconfigurations) |
+
+Run everything on demand with `pre-commit run --all-files --hook-stage manual`. Skip a hook once with `SKIP=<id> git commit ...`, never with `--no-verify` on shared branches. Accepted Trivy findings go in `.trivyignore` with a reason and a review date.
+
+`backend/migrations/` is excluded from the whitespace fixers on purpose: sqlx checksums applied migrations, so even a trailing newline would break existing PostgreSQL deployments. Add a new migration instead of editing one.
+
+CI (`.github/workflows/ci.yml`) runs the same hooks plus the full Rust test suite (including the PostgreSQL tests against a service container), the frontend tests and build, the playground tests on Python 3.9 and 3.13, a Docker image build with a smoke test and a Trivy image scan, and dependency review on pull requests. CodeQL (`.github/workflows/codeql.yml`) runs on pull requests and weekly. The playground evaluation (`.github/workflows/playground-eval.yml`) runs the AI investigation flow nightly on `qwen2.5:0.5b`; trigger it manually with other models from the Actions tab.
+
 ## Before you open a PR
 
 ```sh
-cargo fmt --all
+pre-commit run --all-files --hook-stage manual
 cargo test -p investigenie-api
 npm run test:web
 npm run build:web
 ```
 
 - Add or update tests for every behaviour change. Backend upstreams are mocked with `wiremock`; frontend tests use Vitest + Testing Library.
-- Only commit files you changed (if `cargo fmt` reformats other files, leave those out).
+- The codebase is `rustfmt`-clean and CI enforces it, so format everything you touch.
 - Update the docs in `docs/` or `README.md` when behaviour, configuration, or APIs change.
 
 ## Conventions
