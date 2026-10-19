@@ -516,11 +516,20 @@ impl FileStorage {
     ) -> Result<(), StorageError> {
         self.mutate(move |snapshot| {
             validate_ai_conversation(&conversation)?;
-            if snapshot.ai_conversations.len() >= MAX_AI_CONVERSATIONS {
-                return Err(StorageError::Invalid);
-            }
             if snapshot.ai_conversations.contains_key(&conversation.id) {
                 return Err(StorageError::Duplicate);
+            }
+            // Make room by evicting the least recently updated conversations.
+            while snapshot.ai_conversations.len() >= MAX_AI_CONVERSATIONS {
+                let Some(oldest) = snapshot
+                    .ai_conversations
+                    .values()
+                    .min_by(|a, b| (a.updated_at_ms, &a.id).cmp(&(b.updated_at_ms, &b.id)))
+                    .map(|conversation| conversation.id.clone())
+                else {
+                    break;
+                };
+                snapshot.ai_conversations.remove(&oldest);
             }
             snapshot
                 .ai_conversations

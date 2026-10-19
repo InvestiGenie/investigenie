@@ -367,3 +367,39 @@ async fn concurrent_unique_writes_settings_and_rollback_are_atomic() {
     assert!(other.ready().await.is_err());
     database.finish().await;
 }
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL schema via TEST_DATABASE_URL and CONFIG_ENCRYPTION_KEY"]
+async fn full_ai_history_evicts_the_least_recently_updated_conversation() {
+    let database = TestDatabase::new().await;
+    let storage = &database.storage;
+    for index in 0..MAX_AI_CONVERSATIONS {
+        let mut conversation = StoredAiConversation::new(
+            format!("conversation-{index}"),
+            "model-1".to_owned(),
+            vec!["view-1".to_owned()],
+            format!("Question {index}"),
+        );
+        conversation.created_at_ms = 1_000 + index as i64;
+        conversation.updated_at_ms = conversation.created_at_ms;
+        storage.create_ai_conversation(conversation).await.unwrap();
+    }
+    let newest = StoredAiConversation::new(
+        "conversation-new".to_owned(),
+        "model-1".to_owned(),
+        vec!["view-1".to_owned()],
+        "Newest question".to_owned(),
+    );
+    storage.create_ai_conversation(newest).await.unwrap();
+    let ids: Vec<String> = storage
+        .ai_conversations()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|summary| summary.id)
+        .collect();
+    assert_eq!(ids.len(), MAX_AI_CONVERSATIONS);
+    assert!(ids.contains(&"conversation-new".to_owned()));
+    assert!(!ids.contains(&"conversation-0".to_owned()));
+    assert!(ids.contains(&"conversation-1".to_owned()));
+    database.finish().await;
+}
