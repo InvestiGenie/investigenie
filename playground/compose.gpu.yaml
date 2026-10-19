@@ -1,0 +1,12 @@
+# Gives the Ollama container access to NVIDIA GPUs (Linux or Windows/WSL with the NVIDIA Container Toolkit).
+# Used by: ./playground/playground.sh up --ai docker --gpu
+# Docker Desktop on macOS cannot pass the Apple GPU to containers; use --ai host there instead.
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

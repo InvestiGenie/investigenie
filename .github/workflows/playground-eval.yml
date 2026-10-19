@@ -1,0 +1,60 @@
+name: Playground AI evaluation
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Ollama model tag or registered model selector
+        required: true
+        default: qwen2.5:0.5b
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: playground-eval-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PLAYGROUND_AI_CONTEXT: "16384"
+      PLAYGROUND_CLICKHOUSE: "off"
+      PLAYGROUND_EVENTS: "10000"
+      AI_PROBE_TIMEOUT_SECONDS: "600"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Start playground and provision model
+        env:
+          MODEL: ${{ inputs.model || 'qwen2.5:0.5b' }}
+        run: ./playground/playground.sh up --ai docker --models "$MODEL"
+      - name: Evaluate investigations
+        env:
+          MODEL: ${{ inputs.model || 'qwen2.5:0.5b' }}
+        run: |
+          ./playground/playground.sh eval \
+            --model "$MODEL" \
+            --ai-timeout 600 \
+            --budget 1200 \
+            --max-minutes 30 \
+            --max-continues 2 \
+            --fail-on pipeline-error \
+            --summary-file "$GITHUB_STEP_SUMMARY"
+      - name: Upload evaluation report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: playground-ai-evaluation
+          path: playground/reports/*.json
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Stop playground
+        if: always()
+        run: ./playground/playground.sh down
