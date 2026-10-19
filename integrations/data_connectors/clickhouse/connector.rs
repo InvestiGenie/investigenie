@@ -89,7 +89,11 @@ impl Connector for ClickHouseClient {
                 )
                 .await?;
             let hits: Vec<Value> = result.rows.into_iter().enumerate().map(|(offset, source)| json!({"index":request.index,"id":format!("row-{}",row_offset + offset as u64 + 1),"score":null,"source":source})).collect();
-            let relation = if result.next_cursor.is_some() { "gte" } else { "eq" };
+            let relation = if result.next_cursor.is_some() {
+                "gte"
+            } else {
+                "eq"
+            };
             let mut response = json!({"took":result.took,"timed_out":false,"total":result.total,"total_relation":relation,"columns":result.columns,"hits":hits,"histogram":result.histogram,"histogram_unavailable_reason":result.histogram_unavailable_reason});
             if let Some(interval) = result.histogram_interval {
                 response["histogram_interval"] = json!(interval);
@@ -110,9 +114,14 @@ fn rejected_limit_setting(detail: &str) -> Option<&'static str> {
     let mentions_read_only = ["readonly", "read-only", "read only"]
         .iter()
         .any(|term| detail.contains(term));
-    let denies_change = ["cannot modify", "not allowed", "not permitted", "cannot be changed"]
-        .iter()
-        .any(|term| detail.contains(term));
+    let denies_change = [
+        "cannot modify",
+        "not allowed",
+        "not permitted",
+        "cannot be changed",
+    ]
+    .iter()
+    .any(|term| detail.contains(term));
     if !mentions_read_only || !denies_change {
         return None;
     }
@@ -255,7 +264,8 @@ mod tests {
     fn readonly_execution_time_errors_name_only_the_rejected_setting() {
         let error: ConnectorError = ClickHouseError::Rejected {
             status: 500,
-            detail: "Code: 164. Cannot modify max_execution_time in readonly mode; password=secret".to_owned(),
+            detail: "Code: 164. Cannot modify max_execution_time in readonly mode; password=secret"
+                .to_owned(),
         }
         .into();
         assert_eq!(error.code, "clickhouse_limit_setting_denied");

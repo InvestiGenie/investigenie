@@ -1461,7 +1461,8 @@ impl Connector for CapabilityConnector {
     }
     fn indices(
         &self,
-    ) -> crate::data_connectors::ConnectorFuture<'_, Vec<crate::data_connectors::IndexSummary>> {
+    ) -> crate::data_connectors::ConnectorFuture<'_, Vec<crate::data_connectors::IndexSummary>>
+    {
         Box::pin(async {
             Ok(vec![crate::data_connectors::IndexSummary {
                 name: "events".to_owned(),
@@ -1473,7 +1474,8 @@ impl Connector for CapabilityConnector {
     fn fields<'a>(
         &'a self,
         index: &'a str,
-    ) -> crate::data_connectors::ConnectorFuture<'a, Vec<crate::data_connectors::FieldSummary>> {
+    ) -> crate::data_connectors::ConnectorFuture<'a, Vec<crate::data_connectors::FieldSummary>>
+    {
         Box::pin(async move {
             if !matches!(index, "events" | "events-*") {
                 return Ok(Vec::new());

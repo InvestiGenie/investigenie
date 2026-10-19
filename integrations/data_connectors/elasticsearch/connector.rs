@@ -160,7 +160,10 @@ mod tests {
             let mut config = credentials.as_object().unwrap().clone();
             config.insert("url".to_owned(), json!("http://localhost:9200"));
             let connector = connect(&config).unwrap();
-            assert_eq!(json!(connector.public_configuration()), json!({"auth_type":mode}));
+            assert_eq!(
+                json!(connector.public_configuration()),
+                json!({"auth_type":mode})
+            );
         }
     }
 
