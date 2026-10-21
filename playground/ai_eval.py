@@ -77,6 +77,11 @@ QUIET_FAILING_SEVERITIES = {"critical", "high"}
 MAX_CONVERSATIONS = 64  # InvestiGenie keeps this many conversations and evicts the least recently updated
 
 
+def is_provider_timeout_pause(reason):
+    normalized = (reason or "").lower()
+    return "ai provider did not respond" in normalized and "timeout" in normalized
+
+
 def score(result, expected):
     text = result_text(result)
     groups = []
@@ -93,14 +98,20 @@ def score_quiet(result):
     return (0 if alarms else 1), 1, [{"no_high_severity_findings": not alarms, "flagged": alarms}]
 
 
-def outcome_kind(status, result, passed):
-    if passed:
-        return "pass"
-    if status == "failed" or not result:
+def investigation_passed(status, result, matched, total):
+    return status == "completed" and result.get("complete") is True and matched == total
+
+
+def outcome_kind(status, result, passed, provider_timeout_exhausted=False):
+    if status == "failed":
         return "pipeline-error"  # timeouts, unparseable model output, provider errors
-    if status == "terminated" or result.get("complete") is False:
+    if status == "terminated":
+        return "pipeline-error" if provider_timeout_exhausted else "incomplete"
+    if status != "completed" or not result:
+        return "pipeline-error"
+    if result.get("complete") is not True:
         return "incomplete"
-    return "wrong-answer"
+    return "pass" if passed else "wrong-answer"
 
 
 def delete_conversation(job_id):
@@ -145,16 +156,20 @@ def run_one(model, scenario, data_views, args):
     continues = 0
     last_stage = None
     stopped = False
+    provider_timeout_exhausted = False
     while job["status"] not in TERMINAL:
         if not stopped and time.monotonic() - started > args.max_minutes * 60:
             stopped = True
             print(f"      giving up after {args.max_minutes:g} minutes", flush=True)
+            provider_timeout_exhausted = provider_timeout_exhausted or is_provider_timeout_pause(job.get("pause_reason"))
             try:
                 api(f"/api/ai/investigations/{job['id']}/decision", "POST", {"action": "terminate"})
             except RuntimeError:
                 pass
         elif job["status"] == "awaiting_decision":
             action = "continue" if continues < args.max_continues and not stopped else "terminate"
+            timeout_pause = is_provider_timeout_pause(job.get("pause_reason"))
+            provider_timeout_exhausted = provider_timeout_exhausted or (timeout_pause and action == "terminate")
             continues += action == "continue"
             print(f"      paused ({job.get('pause_reason') or 'time budget'}); {action}", flush=True)
             api(f"/api/ai/investigations/{job['id']}/decision", "POST", {"action": action})
@@ -175,7 +190,7 @@ def run_one(model, scenario, data_views, args):
         matched, total, groups = score_quiet(result) if result else (0, 1, [])
     else:
         matched, total, groups = score(result, scenario["expected_keywords"]) if result else (0, len(scenario["expected_keywords"]), [])
-    passed = bool(result) and matched == total
+    passed = investigation_passed(job["status"], result, matched, total)
     tokens = sum((usage.get("total_tokens") or 0) for usage in result.get("token_usage", []))
     return {
         "model": model["name"],
@@ -188,7 +203,8 @@ def run_one(model, scenario, data_views, args):
         "score": matched,
         "max_score": total,
         "passed": passed,
-        "outcome": outcome_kind(job["status"], result, passed),
+        "outcome": outcome_kind(job["status"], result, passed, provider_timeout_exhausted),
+        "provider_timeout_exhausted": provider_timeout_exhausted,
         "keyword_groups": groups,
         "seconds": round(elapsed, 1),
         "records_examined": job.get("progress", {}).get("records_examined"),

@@ -291,8 +291,6 @@ def register_model(name, api_url, model, api_key):
             if existing is None:
                 api("/api/ai/models", "POST", payload, timeout=900)
                 log(f"Registered AI model '{name}' -> {model} at {api_url}")
-            elif existing["api_url"] == api_url.rstrip("/") and existing["model"] == model:
-                log(f"AI model '{name}' already registered")
             else:
                 api(f"/api/ai/models/{existing['id']}", "PUT", payload, headers={"If-Match": f'"{existing["revision"]}"'}, timeout=900)
                 log(f"Updated AI model '{name}' -> {model} at {api_url}")

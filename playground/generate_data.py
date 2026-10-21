@@ -1099,7 +1099,7 @@ class Metrics:
 class Status:
     def __init__(self):
         self.lock = threading.Lock()
-        self.state = {"phase": "starting", "sinks": {}, "seeded": False, "live": False}
+        self.state = {"phase": "starting", "sinks": {}, "seeded": False, "live": False, "live_incident": False}
         self.corpus = None
 
     def update(self, **values):
@@ -1115,31 +1115,45 @@ class Status:
             return json.loads(json.dumps(self.state))
 
 
+def active_scenarios(corpus, state, now=None):
+    now = time.time() if now is None else now
+    active = {}
+    for scenario in corpus.scenarios:
+        start, end = scenario.window(corpus.anchor)
+        active[scenario.id] = bool(state.get("live_incident", False)) if scenario.live else start <= now < end
+    return active
+
+
+def scenario_response(corpus, state, now=None):
+    truth = corpus.ground_truth(now)
+    live_incident = bool(state.get("live_incident", False))
+    truth["live_traffic"] = bool(state.get("live", False))
+    truth["live_incident"] = live_incident
+    if not live_incident:
+        for item in truth["scenarios"]:
+            if item["live"]:
+                scenario = next(scenario for scenario in corpus.scenarios if scenario.id == item["id"])
+                _, end = scenario.window(corpus.anchor)
+                item["live"] = False
+                item["title"] = item["title"].replace("Ongoing:", "Historical:", 1)
+                item["incident_window"]["end"] = iso(end)
+                item["time_range"] = {"start": int((end - 25 * 60) * 1000), "end": int((end + 60) * 1000)}
+    return truth
+
+
 def start_http_server(port, metrics, status):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             path = urllib.parse.urlparse(self.path).path
             if path == "/metrics":
                 corpus = status.corpus
-                active = {}
-                if corpus:
-                    now = time.time()
-                    for scenario in corpus.scenarios:
-                        start, end = scenario.window(corpus.anchor)
-                        active[scenario.id] = start <= now < end or (scenario.live and status.snapshot()["live"])
+                active = active_scenarios(corpus, status.snapshot()) if corpus else {}
                 self.reply(200, metrics.render(active), "text/plain; version=0.0.4; charset=utf-8")
             elif path == "/scenarios":
                 if status.corpus is None:
                     self.reply(503, b'{"error":"corpus not generated yet"}')
                 else:
-                    truth = status.corpus.ground_truth()
-                    truth["live_traffic"] = status.snapshot()["live"]
-                    if not truth["live_traffic"]:  # live scenarios only extend to "now" while live traffic runs
-                        for item in truth["scenarios"]:
-                            if item["live"]:
-                                scenario = next(s for s in status.corpus.scenarios if s.id == item["id"])
-                                start, end = scenario.window(status.corpus.anchor)
-                                item["time_range"] = {"start": int((end - 25 * 60) * 1000), "end": int((end + 60) * 1000)}
+                    truth = scenario_response(status.corpus, status.snapshot())
                     self.reply(200, json.dumps(truth, indent=2).encode())
             elif path in ("/healthz", "/status"):
                 snapshot = self.status_snapshot()
@@ -1408,8 +1422,9 @@ def main():
     seed(corpus, sinks, metrics, status, meta)
     status.update(phase="ready", seeded=True)
 
-    if eps > 0 or (incident and any(s.live for s in scenarios)):
-        status.update(live=True, phase="live")
+    live_incident = incident and any(s.live for s in scenarios)
+    if eps > 0 or live_incident:
+        status.update(live=True, live_incident=live_incident, phase="live")
         live_loop(corpus, sinks, metrics, max(eps, 0.0), incident, env_int("PLAYGROUND_LIVE_RETENTION_DAYS", 3, minimum=0))
     else:
         log("Live traffic disabled; serving status and metrics only")

@@ -403,3 +403,57 @@ async fn full_ai_history_evicts_the_least_recently_updated_conversation() {
     assert!(ids.contains(&"conversation-1".to_owned()));
     database.finish().await;
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL schema via TEST_DATABASE_URL and CONFIG_ENCRYPTION_KEY"]
+async fn concurrent_ai_history_creations_at_capacity_keep_the_limit() {
+    let database = TestDatabase::new().await;
+    let other = database.replica().await;
+    for index in 0..MAX_AI_CONVERSATIONS {
+        let conversation = StoredAiConversation::new(
+            format!("conversation-{index}"),
+            "model-1".to_owned(),
+            vec!["view-1".to_owned()],
+            format!("Question {index}"),
+        );
+        database
+            .storage
+            .create_ai_conversation(conversation)
+            .await
+            .unwrap();
+    }
+
+    let first = StoredAiConversation::new(
+        "conversation-concurrent-1".to_owned(),
+        "model-1".to_owned(),
+        vec!["view-1".to_owned()],
+        "First concurrent question".to_owned(),
+    );
+    let second = StoredAiConversation::new(
+        "conversation-concurrent-2".to_owned(),
+        "model-1".to_owned(),
+        vec!["view-1".to_owned()],
+        "Second concurrent question".to_owned(),
+    );
+    let (first, second) = tokio::join!(
+        database.storage.create_ai_conversation(first),
+        other.create_ai_conversation(second)
+    );
+    assert!(first.is_ok());
+    assert!(second.is_ok());
+
+    let ids: Vec<String> = database
+        .storage
+        .ai_conversations()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|summary| summary.id)
+        .collect();
+    assert_eq!(ids.len(), MAX_AI_CONVERSATIONS);
+    assert!(ids.contains(&"conversation-concurrent-1".to_owned()));
+    assert!(ids.contains(&"conversation-concurrent-2".to_owned()));
+
+    other.close().await;
+    database.finish().await;
+}

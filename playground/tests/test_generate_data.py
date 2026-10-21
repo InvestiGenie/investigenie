@@ -78,6 +78,41 @@ class GroundTruthTests(unittest.TestCase):
                 self.assertLessEqual(min(max(stamps), ANCHOR), end, scenario.id)
 
 
+class LiveIncidentTests(unittest.TestCase):
+    def test_baseline_traffic_does_not_extend_or_activate_a_disabled_incident(self):
+        data = corpus()
+        state = {"live": True, "live_incident": False}
+        now = ANCHOR + 3600
+
+        truth = gd.scenario_response(data, state, now)
+        gateway = next(item for item in truth["scenarios"] if item["id"] == "gateway-search-timeouts")
+        _, incident_end = next(s for s in data.scenarios if s.id == gateway["id"]).window(data.anchor)
+
+        self.assertTrue(truth["live_traffic"])
+        self.assertFalse(truth["live_incident"])
+        self.assertFalse(gateway["live"])
+        self.assertTrue(gateway["title"].startswith("Historical:"))
+        self.assertIsNotNone(gateway["incident_window"]["end"])
+        self.assertEqual(
+            gateway["time_range"],
+            {"start": int((incident_end - 25 * 60) * 1000), "end": int((incident_end + 60) * 1000)},
+        )
+        self.assertFalse(gd.active_scenarios(data, state, now)["gateway-search-timeouts"])
+
+    def test_enabled_live_incident_is_reported_active(self):
+        data = corpus()
+        state = {"live": True, "live_incident": True}
+        now = ANCHOR + 3600
+
+        truth = gd.scenario_response(data, state, now)
+        gateway = next(item for item in truth["scenarios"] if item["id"] == "gateway-search-timeouts")
+
+        self.assertTrue(truth["live_incident"])
+        self.assertTrue(gateway["live"])
+        self.assertEqual(gateway["time_range"], {"start": int((now - 30 * 60) * 1000), "end": int(now * 1000)})
+        self.assertTrue(gd.active_scenarios(data, state, now)["gateway-search-timeouts"])
+
+
 class PruneTests(unittest.TestCase):
     def test_prune_removes_only_old_live_only_indices(self):
         anchor = dt.datetime.now(dt.timezone.utc).timestamp() - 8 * 86400  # seeded 8 days ago, live since

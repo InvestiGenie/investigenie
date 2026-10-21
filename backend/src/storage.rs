@@ -26,6 +26,7 @@ mod filesystem;
 pub const MAX_AI_CONVERSATIONS: usize = 64;
 pub const MAX_AI_CONVERSATION_MESSAGES: usize = 200;
 pub const MAX_AI_CONVERSATION_BYTES: usize = 128 * 1024;
+const AI_CONVERSATIONS_LOCK_NAMESPACE: i32 = 0x4947_454E;
 
 #[derive(Clone)]
 pub enum PersistenceOptions {
@@ -1204,6 +1205,10 @@ impl Storage {
         }
         let encrypted = self.encrypted_ai_conversation(&conversation)?;
         let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext(current_schema()), $1)")
+            .bind(AI_CONVERSATIONS_LOCK_NAMESPACE)
+            .fetch_one(&mut *transaction)
+            .await?;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ai_conversations")
             .fetch_one(&mut *transaction)
             .await?;

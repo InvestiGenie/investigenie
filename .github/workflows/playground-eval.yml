@@ -46,7 +46,16 @@ jobs:
             --max-minutes 30 \
             --max-continues 2 \
             --fail-on pipeline-error \
-            --summary-file "$GITHUB_STEP_SUMMARY"
+            --summary-file /reports/summary.md
+      - name: Publish evaluation summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f playground/reports/summary.md ]]; then
+            cat playground/reports/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Evaluation summary was not produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Upload evaluation report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
