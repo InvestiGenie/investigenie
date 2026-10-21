@@ -3,6 +3,8 @@
 import os
 import sys
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -104,6 +106,46 @@ class OutcomeTests(unittest.TestCase):
                 self.assertEqual(row["outcome"], expected_outcome)
                 self.assertFalse(row["passed"])
                 self.assertEqual(row["provider_timeout_exhausted"], timeout_exhausted)
+
+
+class EvaluationInputTests(unittest.TestCase):
+    def test_repeat_must_be_positive_before_any_api_request(self):
+        for repeat in ("0", "-1", "not-a-number"):
+            with self.subTest(repeat=repeat):
+                with patch.object(sys, "argv", ["ai_eval.py", "--repeat", repeat]):
+                    with patch.object(ai_eval, "call") as api_call:
+                        with redirect_stderr(StringIO()):
+                            with self.assertRaises(SystemExit) as error:
+                                ai_eval.main()
+
+                self.assertEqual(error.exception.code, 2)
+                api_call.assert_not_called()
+
+    def test_empty_scenario_selection_fails_even_when_fail_on_is_never(self):
+        with patch.object(sys, "argv", ["ai_eval.py", "--fail-on", "never"]):
+            with patch.object(ai_eval, "call", return_value={"scenarios": []}):
+                with patch.object(ai_eval, "pick_models") as pick_models:
+                    with self.assertRaisesRegex(SystemExit, "No scenarios selected"):
+                        ai_eval.main()
+
+        pick_models.assert_not_called()
+
+    def test_empty_model_selection_fails_before_writing_a_report(self):
+        scenario = {
+            "id": "example",
+            "question": "What happened?",
+            "difficulty": "easy",
+            "time_range": {"start": 1, "end": 2},
+            "expected_keywords": [["database"]],
+        }
+        with patch.object(sys, "argv", ["ai_eval.py", "--fail-on", "never"]):
+            with patch.object(ai_eval, "call", return_value={"scenarios": [scenario]}):
+                with patch.object(ai_eval, "pick_models", return_value=[]):
+                    with patch.object(ai_eval.os, "makedirs") as make_directories:
+                        with self.assertRaisesRegex(SystemExit, "No AI models selected"):
+                            ai_eval.main()
+
+        make_directories.assert_not_called()
 
 
 if __name__ == "__main__":

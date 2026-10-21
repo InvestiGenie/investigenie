@@ -32,7 +32,7 @@ jobs:
       - uses: github/codeql-action/init@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3
         with:
           languages: ${{ matrix.language }}
-          build-mode: autobuild
+          build-mode: none
       - uses: github/codeql-action/analyze@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3
         with:
           category: /language:${{ matrix.language }}

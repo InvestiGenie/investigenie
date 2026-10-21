@@ -77,6 +77,16 @@ QUIET_FAILING_SEVERITIES = {"critical", "high"}
 MAX_CONVERSATIONS = 64  # InvestiGenie keeps this many conversations and evicts the least recently updated
 
 
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def is_provider_timeout_pause(reason):
     normalized = (reason or "").lower()
     return "ai provider did not respond" in normalized and "timeout" in normalized
@@ -246,7 +256,7 @@ def main():
     parser.add_argument("--max-continues", type=int, default=3, help="automatic 'continue' decisions per run")
     parser.add_argument("--max-minutes", type=float, default=60, help="hard stop per investigation")
     parser.add_argument("--poll", type=float, default=3.0)
-    parser.add_argument("--repeat", type=int, default=1, help="run each scenario N times (local models are not deterministic)")
+    parser.add_argument("--repeat", type=positive_int, default=1, help="run each scenario N times (local models are not deterministic)")
     parser.add_argument(
         "--keep-history", action="store_true", help="keep eval investigations in the AI history (capped at 64; the oldest are evicted)"
     )
@@ -275,7 +285,11 @@ def main():
         if unknown:
             raise SystemExit(f"Unknown scenario(s): {', '.join(sorted(unknown))}")
         scenarios = [item for item in scenarios if item["id"] in args.scenario]
+    if not scenarios:
+        raise SystemExit("No scenarios selected; check the seeder configuration or choose a scenario.")
     models = pick_models(args.model)
+    if not models:
+        raise SystemExit("No AI models selected; register a model or choose a registered model.")
     data_views = args.data_view or ["playground-logs"]
 
     check_history_capacity(len(scenarios) * len(models) * args.repeat, args.keep_history)

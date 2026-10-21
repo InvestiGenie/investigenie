@@ -16,7 +16,7 @@ An evaluation harness then runs AI investigations against the incidents and scor
 ```sh
 ./playground/playground.sh up                 # Ollama in Docker (CPU; add --gpu for NVIDIA)
 ./playground/playground.sh up --ai host       # use Ollama installed on this machine
-./playground/playground.sh up --ai none       # no local model
+./playground/playground.sh up --ai none       # do not start local Ollama
 ```
 
 **On macOS, use `--ai host`.** Docker Desktop cannot give containers the Apple GPU, so a 7B model in Docker runs on the CPU and takes minutes per answer. Install Ollama natively (`brew install ollama && ollama serve`, or the app from ollama.com) and the playground will use it through `host.docker.internal`.

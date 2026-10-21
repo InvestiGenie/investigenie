@@ -15,7 +15,7 @@ Usage: playground.sh <command> [options]
                            --ai docker  run Ollama in Docker (default; CPU unless --gpu)
                            --ai host    use Ollama installed on this machine (fastest on a Mac:
                                         `brew install ollama && ollama serve`)
-                           --ai none    no local model (add one later with `model add`)
+                           --ai none    do not start local Ollama; configure a remote provider in .env if needed
                            --models     comma list of Ollama models, default qwen2.5:7b
   status                 Containers, seeding state and registered models
   logs [service]         Follow logs (default: seeder, setup, ollama)
@@ -57,7 +57,7 @@ compose() {
   case "$AI_MODE" in
     docker) export PLAYGROUND_OLLAMA_DEFAULT_URL="${PLAYGROUND_OLLAMA_DEFAULT_URL:-http://ollama:11434}" ;;
     host)   export PLAYGROUND_OLLAMA_DEFAULT_URL="${PLAYGROUND_OLLAMA_DEFAULT_URL:-http://host.docker.internal:11434}" ;;
-    none)   export PLAYGROUND_AI_PROVIDER="${PLAYGROUND_AI_PROVIDER:-none}" ;;
+    none)   export PLAYGROUND_AI_PROVIDER_DEFAULT="${PLAYGROUND_AI_PROVIDER_DEFAULT:-none}" ;;
   esac
   COMPOSE_PROFILES="$(IFS=,; echo "${profiles[*]-}")" docker compose --project-directory "$DIR" "${files[@]}" "$@"
 }
@@ -128,7 +128,6 @@ case "$command" in
     sub="${1:-list}"; [[ $# -gt 0 ]] && shift
     case "$sub" in
       add) [[ $# -gt 0 ]] || { echo "model add needs at least one model name" >&2; exit 1; }
-           [[ "$AI_MODE" != none ]] || { echo "model add requires Ollama; run './playground/playground.sh up --ai docker' or './playground/playground.sh up --ai host' first." >&2; exit 1; }
            [[ "$AI_MODE" == host ]] && check_host_ollama
            compose run --rm setup models "$@" ;;
       list|ls) compose run --rm --no-deps setup list ;;

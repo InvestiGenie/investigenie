@@ -396,6 +396,9 @@ def main():
     if args.command == "remove-model":
         return 0 if args.names and all([remove_model(name) for name in args.names]) else 1
     if args.command == "models":
+        if AI_PROVIDER in ("none", "off", ""):
+            log("Cannot add models while PLAYGROUND_AI_PROVIDER is disabled; set it to ollama or openai-compatible")
+            return 1
         return 0 if provision_models(args.names or model_list(AI_MODELS)) else 1
 
     results = [provision_elasticsearch(), provision_clickhouse(), provision_models(model_list(AI_MODELS))]

@@ -28,6 +28,8 @@ class PlaygroundScriptTests(unittest.TestCase):
             "{\n"
             "  printf 'PLAYGROUND_OLLAMA_URL=%s\\n' \"${PLAYGROUND_OLLAMA_URL-<unset>}\"\n"
             "  printf 'PLAYGROUND_OLLAMA_DEFAULT_URL=%s\\n' \"${PLAYGROUND_OLLAMA_DEFAULT_URL-<unset>}\"\n"
+            "  printf 'PLAYGROUND_AI_PROVIDER=%s\\n' \"${PLAYGROUND_AI_PROVIDER-<unset>}\"\n"
+            "  printf 'PLAYGROUND_AI_PROVIDER_DEFAULT=%s\\n' \"${PLAYGROUND_AI_PROVIDER_DEFAULT-<unset>}\"\n"
             "  printf 'ARGS='\n"
             "  printf '%q ' \"$@\"\n"
             "  printf '\\n'\n"
@@ -73,15 +75,27 @@ class PlaygroundScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("PLAYGROUND_OLLAMA_URL=http://custom-ollama:11434", self.capture.read_text())
 
-    def test_model_add_is_rejected_when_ai_is_disabled(self):
+    def test_no_ollama_mode_preserves_dotenv_remote_provider(self):
         self.write_state("none")
+        (self.playground / ".env").write_text("PLAYGROUND_AI_PROVIDER=openai-compatible\n")
+
+        result = self.run_script("setup")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        captured = self.capture.read_text()
+        self.assertIn("PLAYGROUND_AI_PROVIDER=<unset>", captured)
+        self.assertIn("PLAYGROUND_AI_PROVIDER_DEFAULT=none", captured)
+        compose = (PLAYGROUND_DIR / "compose.yaml").read_text()
+        self.assertIn("${PLAYGROUND_AI_PROVIDER:-${PLAYGROUND_AI_PROVIDER_DEFAULT:-ollama}}", compose)
+
+    def test_model_add_is_delegated_to_effective_provider_validation(self):
+        self.write_state("none")
+        (self.playground / ".env").write_text("PLAYGROUND_AI_PROVIDER=openai-compatible\n")
 
         result = self.run_script("model", "add", "qwen2.5:3b")
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("model add requires Ollama", result.stderr)
-        self.assertIn("up --ai docker", result.stderr)
-        self.assertFalse(self.capture.exists())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("setup models qwen2.5:3b", self.capture.read_text())
 
 
 if __name__ == "__main__":
