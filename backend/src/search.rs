@@ -58,8 +58,8 @@ impl HistogramInterval {
             return None;
         }
         [
-            "1ms", "1s", "5s", "30s", "1m", "5m", "30m", "1h", "3h", "12h", "1d", "1w",
-            "1M", "1y", "3650d", "36500d",
+            "1ms", "1s", "5s", "30s", "1m", "5m", "30m", "1h", "3h", "12h", "1d", "1w", "1M", "1y",
+            "3650d", "36500d",
         ]
         .into_iter()
         .filter_map(Self::parse)
@@ -228,8 +228,16 @@ mod tests {
 
     #[test]
     fn automatic_histogram_intervals_are_shared_bounded_and_valid() {
-        for (span, expected) in [(0.0, "1ms"), (50_000.0, "1s"), (50_001.0, "5s"), (120_000.0, "5s")] {
-            assert_eq!(HistogramInterval::automatic(span), HistogramInterval::parse(expected));
+        for (span, expected) in [
+            (0.0, "1ms"),
+            (50_000.0, "1s"),
+            (50_001.0, "5s"),
+            (120_000.0, "5s"),
+        ] {
+            assert_eq!(
+                HistogramInterval::automatic(span),
+                HistogramInterval::parse(expected)
+            );
         }
         for span in [-1.0, f64::NAN, f64::INFINITY, f64::MAX] {
             assert!(HistogramInterval::automatic(span).is_none());

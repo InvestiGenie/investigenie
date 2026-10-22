@@ -1,0 +1,2 @@
+# Accepted Trivy findings. One ID per line, each with a comment saying why and until when, e.g.:
+# CVE-2099-0001  # not reachable: we never call the affected API; revisit 2027-01-01

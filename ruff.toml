@@ -1,0 +1,16 @@
+# Python tooling for playground/ and scripts/ (stdlib-only scripts that also run on macOS's system Python).
+line-length = 140
+target-version = "py39"
+
+[lint]
+select = [
+  "E",   # pycodestyle errors
+  "W",   # pycodestyle warnings
+  "F",   # pyflakes
+  "B",   # bugbear
+  "UP",  # pyupgrade (for the 3.9 target)
+  "I",   # import order
+]
+
+[format]
+quote-style = "double"

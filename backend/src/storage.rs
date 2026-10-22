@@ -22,9 +22,11 @@ use uuid::Uuid;
 
 mod filesystem;
 
+/// History keeps at most this many conversations; creating another evicts the least recently updated.
 pub const MAX_AI_CONVERSATIONS: usize = 64;
 pub const MAX_AI_CONVERSATION_MESSAGES: usize = 200;
 pub const MAX_AI_CONVERSATION_BYTES: usize = 128 * 1024;
+const AI_CONVERSATIONS_LOCK_NAMESPACE: i32 = 0x4947_454E;
 
 #[derive(Clone)]
 pub enum PersistenceOptions {
@@ -64,7 +66,9 @@ const LEGACY_VERIFIER_B64: &str = "bm9ydGhzdGFyIGNvbmZpZ3VyYXRpb24gZW5jcnlwdGlvb
 const LEGACY_SNAPSHOT_ID_B64: &str = "bm9ydGhzdGFyLWZpbGVzeXN0ZW0tc25hcHNob3Q=";
 
 fn legacy_verifier() -> Vec<u8> {
-    STANDARD.decode(LEGACY_VERIFIER_B64).expect("valid legacy verifier encoding")
+    STANDARD
+        .decode(LEGACY_VERIFIER_B64)
+        .expect("valid legacy verifier encoding")
 }
 
 #[derive(Debug, Error)]
@@ -147,21 +151,32 @@ impl Encryption {
         })
     }
     fn aad(&self, integration_id: &str) -> Vec<u8> {
-        serde_json::to_vec(&json!(["investigenie-config", 1, self.key_id, integration_id]))
-            .unwrap()
+        serde_json::to_vec(&json!([
+            "investigenie-config",
+            1,
+            self.key_id,
+            integration_id
+        ]))
+        .unwrap()
     }
     fn legacy_aad(&self, integration_id: &str) -> Vec<u8> {
         let namespace = String::from_utf8(
-            STANDARD.decode(LEGACY_NAMESPACE_B64).expect("valid legacy namespace encoding"),
+            STANDARD
+                .decode(LEGACY_NAMESPACE_B64)
+                .expect("valid legacy namespace encoding"),
         )
         .expect("legacy namespace is UTF-8");
         let legacy_id = match integration_id {
             VERIFIER_ID => String::from_utf8(
-                STANDARD.decode(LEGACY_VERIFIER_ID_B64).expect("valid legacy verifier ID encoding"),
+                STANDARD
+                    .decode(LEGACY_VERIFIER_ID_B64)
+                    .expect("valid legacy verifier ID encoding"),
             )
             .expect("legacy verifier ID is UTF-8"),
             SNAPSHOT_ID => String::from_utf8(
-                STANDARD.decode(LEGACY_SNAPSHOT_ID_B64).expect("valid legacy snapshot ID encoding"),
+                STANDARD
+                    .decode(LEGACY_SNAPSHOT_ID_B64)
+                    .expect("valid legacy snapshot ID encoding"),
             )
             .expect("legacy snapshot ID is UTF-8"),
             _ => integration_id.to_owned(),
@@ -216,11 +231,7 @@ impl Encryption {
             .map_err(|_| StorageError::Encryption)
     }
     #[cfg(test)]
-    pub(super) fn encrypt_legacy_fixture(
-        &self,
-        integration_id: &str,
-        plaintext: &[u8],
-    ) -> Vec<u8> {
+    pub(super) fn encrypt_legacy_fixture(&self, integration_id: &str, plaintext: &[u8]) -> Vec<u8> {
         let nonce = [42u8; 12];
         let ciphertext = self
             .cipher
@@ -1194,11 +1205,25 @@ impl Storage {
         }
         let encrypted = self.encrypted_ai_conversation(&conversation)?;
         let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext(current_schema()), $1)")
+            .bind(AI_CONVERSATIONS_LOCK_NAMESPACE)
+            .fetch_one(&mut *transaction)
+            .await?;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ai_conversations")
             .fetch_one(&mut *transaction)
             .await?;
-        if count >= MAX_AI_CONVERSATIONS as i64 {
-            return Err(StorageError::Invalid);
+        // Make room by evicting the least recently updated conversations. Computing the excess from
+        // the current count also trims any overshoot left by concurrent creations.
+        let excess = count - (MAX_AI_CONVERSATIONS as i64 - 1);
+        if excess > 0 {
+            sqlx::query(
+                "DELETE FROM ai_conversations WHERE id IN \
+                 (SELECT id FROM ai_conversations WHERE id <> $1 ORDER BY updated_at_ms ASC, id ASC LIMIT $2)",
+            )
+            .bind(&conversation.id)
+            .bind(excess)
+            .execute(&mut *transaction)
+            .await?;
         }
         sqlx::query("INSERT INTO ai_conversations (id, revision, updated_at_ms, content_encrypted) VALUES ($1,$2,$3,$4)")
             .bind(&conversation.id)

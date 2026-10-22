@@ -202,12 +202,16 @@ async fn prepare_ai_call(
 ) -> Result<(AiSettings, OwnedSemaphorePermit), ApiError> {
     let model = state.storage.ai_model(model_id).await?;
     let settings = model_settings(&model, timeout);
-    let permit = state.ai_slots.clone().try_acquire_owned().map_err(|_| ApiError::Unavailable)?;
+    let permit = state
+        .ai_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::Unavailable)?;
     Ok((settings, permit))
 }
 
 async fn probe_ai_model(model: &StoredAiModel) -> Result<(), ApiError> {
-    ai::test_model(&model_settings(model, ai::AI_TIMEOUT))
+    ai::test_model(&model_settings(model, ai::probe_timeout()))
         .await
         .map_err(ApiError::AiModelTest)
 }
@@ -409,7 +413,8 @@ async fn continue_ai_conversation(
     if conversation.messages.len() + 2 > MAX_AI_CONVERSATION_MESSAGES {
         return Err(ApiError::InvalidConversationMessage);
     }
-    let (settings, _permit) = prepare_ai_call(&state, &conversation.model_id, Duration::from_secs(60)).await?;
+    let (settings, _permit) =
+        prepare_ai_call(&state, &conversation.model_id, Duration::from_secs(60)).await?;
     let answer = ai::continue_conversation(&settings, &conversation.messages, message)
         .await
         .map_err(ApiError::Investigation)?;

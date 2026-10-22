@@ -51,7 +51,7 @@ Both connectors use `HistogramInterval::automatic(span_millis)` in `search.rs` f
 
 AI history routes: `GET /api/ai/conversations` lists summaries; `GET /api/ai/conversations/{id}` reads a conversation; `POST /api/ai/conversations/{id}/messages` adds a follow-up; `DELETE /api/ai/conversations/{id}` deletes it. Follow-ups and deletes require the current quoted `If-Match` revision.
 
-Conversation messages and investigation results are persisted in the encrypted filesystem snapshot or as encrypted PostgreSQL payloads. They are bounded to 64 conversations, 200 messages per conversation, and 128 KiB per conversation to fit the filesystem snapshot limit. Follow-ups use the stored transcript and result; they do not rescan sources. The app has no user authentication, so history is shared by anyone who can access the instance.
+Conversation messages and investigation results are persisted in the encrypted filesystem snapshot or as encrypted PostgreSQL payloads. They are bounded to 64 conversations, 200 messages per conversation, and 128 KiB per conversation to fit the filesystem snapshot limit. When the history is full, starting a new investigation evicts the least recently updated conversation (both storage modes), so the history behaves like a rolling window instead of rejecting new work. Follow-ups use the stored transcript and result; they do not rescan sources. The app has no user authentication, so history is shared by anyone who can access the instance.
 
 ## AI investigations (`ai.rs`)
 
@@ -82,6 +82,7 @@ Jobs (`InvestigationJob`, `Control`) pause at the user's check-in interval or on
 | `FILESYSTEM_PATH` | `investigenie_data/` next to the binary | One API instance per directory. |
 | `DATABASE_URL`, `DB_MAX_CONNECTIONS` | none, `10` | PostgreSQL; use `sslmode=verify-full` outside loopback. |
 | `CONFIG_ENCRYPTION_KEY`, `CONFIG_ENCRYPTION_KEY_ID` | generated in quickstart, `v1` | Base64 of 32 random bytes. Keep it; a wrong key fails closed. |
+| `AI_PROBE_TIMEOUT_SECONDS` | `15` | Timeout (5-600) for the test call made when an AI model is saved. Raise it for slow local models. |
 
 Quickstart (none of `PERSISTENCE_MODE`, `CONFIG_ENCRYPTION_KEY`, `DATABASE_URL` set) stores a generated key beside the data. That suits local use only.
 

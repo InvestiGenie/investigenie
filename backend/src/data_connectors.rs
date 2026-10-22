@@ -137,7 +137,10 @@ mod tests {
 
     #[test]
     fn data_registry_preserves_source_ids_and_excludes_ai_transports() {
-        let ids = registered().into_iter().map(|item| item.id).collect::<Vec<_>>();
+        let ids = registered()
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
         assert!(ids.contains(&"elasticsearch"));
         assert!(ids.contains(&"clickhouse"));
         assert!(!ids.contains(&"openai"));

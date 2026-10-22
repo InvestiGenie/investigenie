@@ -121,15 +121,23 @@ struct HistogramRow {
     count: String,
 }
 
-fn decode_histogram_rows(rows: Vec<Value>) -> Result<Vec<ClickHouseHistogramBucket>, ClickHouseError> {
+fn decode_histogram_rows(
+    rows: Vec<Value>,
+) -> Result<Vec<ClickHouseHistogramBucket>, ClickHouseError> {
     rows.into_iter()
         .map(|row| {
             let row: HistogramRow =
                 serde_json::from_value(row).map_err(|_| ClickHouseError::InvalidResponse)?;
             Ok(ClickHouseHistogramBucket {
-                timestamp: row.timestamp.parse().map_err(|_| ClickHouseError::InvalidResponse)?,
+                timestamp: row
+                    .timestamp
+                    .parse()
+                    .map_err(|_| ClickHouseError::InvalidResponse)?,
                 label: None,
-                count: row.count.parse().map_err(|_| ClickHouseError::InvalidResponse)?,
+                count: row
+                    .count
+                    .parse()
+                    .map_err(|_| ClickHouseError::InvalidResponse)?,
                 breakdown: None,
             })
         })
@@ -219,7 +227,7 @@ impl ClickHouseClient {
             .and_then(Value::as_array)
             .ok_or(ClickHouseError::InvalidResponse)?;
         Ok(rows
-            .into_iter()
+            .iter()
             .filter_map(|row| row.get("name").and_then(Value::as_str).map(str::to_owned))
             .collect())
     }
@@ -304,7 +312,9 @@ impl ClickHouseClient {
         } else {
             String::new()
         };
-        let bounded_query = format!("SELECT * FROM ({filtered_query}){ordering} LIMIT {size} OFFSET {offset} FORMAT JSON");
+        let bounded_query = format!(
+            "SELECT * FROM ({filtered_query}){ordering} LIMIT {size} OFFSET {offset} FORMAT JSON"
+        );
         let started = Instant::now();
         let response = self.execute(&bounded_query).await?;
         let parsed: JsonResponse =
@@ -325,21 +335,40 @@ impl ClickHouseClient {
                         histogram_interval = histogram_options
                             .interval
                             .map(|interval| format!("{}{}", interval.count, interval.suffix()));
-                        self.interval_histogram(&filtered_query, field, breakdown, histogram_options)
-                            .await
+                        self.interval_histogram(
+                            &filtered_query,
+                            field,
+                            breakdown,
+                            histogram_options,
+                        )
+                        .await
                     }
                     None => {
                         let buckets = self.histogram(&filtered_query, field).await;
                         match (buckets, histogram_options.breakdown_field.as_deref()) {
-                            (Ok(buckets), Some(breakdown)) if !buckets.is_empty()
-                                && parsed.meta.iter().any(|column| column.name == breakdown) => {
+                            (Ok(buckets), Some(breakdown))
+                                if !buckets.is_empty()
+                                    && parsed
+                                        .meta
+                                        .iter()
+                                        .any(|column| column.name == breakdown) =>
+                            {
                                 let first = buckets.first().unwrap().timestamp;
                                 let last = buckets.last().unwrap().timestamp;
                                 let span = last.saturating_sub(first).max(1);
                                 let mut options = histogram_options.clone();
-                                options.interval = crate::search::HistogramInterval::automatic(span as f64);
-                                histogram_interval = options.interval.map(|interval| format!("{}{}", interval.count, interval.suffix()));
-                                self.interval_histogram(&filtered_query, field, Some(breakdown), &options).await
+                                options.interval =
+                                    crate::search::HistogramInterval::automatic(span as f64);
+                                histogram_interval = options.interval.map(|interval| {
+                                    format!("{}{}", interval.count, interval.suffix())
+                                });
+                                self.interval_histogram(
+                                    &filtered_query,
+                                    field,
+                                    Some(breakdown),
+                                    &options,
+                                )
+                                .await
                             }
                             (result, _) => result,
                         }
@@ -381,7 +410,11 @@ impl ClickHouseClient {
             },
             took: elapsed,
             columns: parsed.meta.into_iter().map(|column| column.name).collect(),
-            total: if cursor.is_some() { offset.saturating_add(parsed.data.len() as u64) } else { parsed.rows },
+            total: if cursor.is_some() {
+                offset.saturating_add(parsed.data.len() as u64)
+            } else {
+                parsed.rows
+            },
             rows: parsed.data,
             histogram,
             histogram_unavailable_reason,
@@ -400,7 +433,10 @@ impl ClickHouseClient {
         if !valid_identifier(field) || breakdown_field.is_some_and(|name| !valid_identifier(name)) {
             return Err(ClickHouseError::InvalidIdentifier);
         }
-        let zone = format!("'{}'", options.time_zone.replace('\\', "").replace('\'', ""));
+        let zone = format!(
+            "'{}'",
+            options.time_zone.replace(['\\', '\''], "")
+        );
         let field = quote_identifier(field);
         let bucket = format!(
             "toUnixTimestamp64Milli(toDateTime64(toStartOfInterval(toDateTime64({field}, 3, {zone}), INTERVAL {} {}, {zone}), 3, {zone}))",
@@ -413,7 +449,7 @@ impl ClickHouseClient {
              GROUP BY timestamp ORDER BY toInt64(timestamp) LIMIT 1001 FORMAT JSON"
         );
         let response: JsonResponse = serde_json::from_value(self.execute(&totals_query).await?)
-        .map_err(|_| ClickHouseError::InvalidResponse)?;
+            .map_err(|_| ClickHouseError::InvalidResponse)?;
         let mut buckets = decode_histogram_rows(response.data)?;
         let Some(breakdown_field) = breakdown_field else {
             return Ok(buckets);
@@ -426,14 +462,20 @@ impl ClickHouseClient {
              WHERE breakdown_key IN (SELECT breakdown_key FROM top_keys) GROUP BY bucket_ms, breakdown_key ORDER BY bucket_ms LIMIT 4004 FORMAT JSON"
         );
         let response: JsonResponse = serde_json::from_value(self.execute(&breakdown_query).await?)
-        .map_err(|_| ClickHouseError::InvalidResponse)?;
+            .map_err(|_| ClickHouseError::InvalidResponse)?;
         let mut rows = Vec::with_capacity(response.data.len());
         let mut key_totals = Vec::<(String, u64)>::new();
         for row in response.data {
             let row: BreakdownRow =
                 serde_json::from_value(row).map_err(|_| ClickHouseError::InvalidResponse)?;
-            let timestamp: i64 = row.timestamp.parse().map_err(|_| ClickHouseError::InvalidResponse)?;
-            let count: u64 = row.count.parse().map_err(|_| ClickHouseError::InvalidResponse)?;
+            let timestamp: i64 = row
+                .timestamp
+                .parse()
+                .map_err(|_| ClickHouseError::InvalidResponse)?;
+            let count: u64 = row
+                .count
+                .parse()
+                .map_err(|_| ClickHouseError::InvalidResponse)?;
             match key_totals.iter_mut().find(|(key, _)| *key == row.key) {
                 Some((_, total)) => *total += count,
                 None => key_totals.push((row.key.clone(), count)),
@@ -448,7 +490,9 @@ impl ClickHouseClient {
                     key: key.clone(),
                     count: rows
                         .iter()
-                        .filter(|(timestamp, row_key, _)| *timestamp == bucket.timestamp && row_key == key)
+                        .filter(|(timestamp, row_key, _)| {
+                            *timestamp == bucket.timestamp && row_key == key
+                        })
                         .map(|(_, _, count)| *count)
                         .sum(),
                 })
@@ -480,7 +524,7 @@ impl ClickHouseClient {
              ORDER BY intDiv(time_ms, interval_ms) * interval_ms LIMIT 61 FORMAT JSON"
         );
         let response: JsonResponse = serde_json::from_value(self.execute(&histogram_query).await?)
-        .map_err(|_| ClickHouseError::InvalidResponse)?;
+            .map_err(|_| ClickHouseError::InvalidResponse)?;
         decode_histogram_rows(response.data)
     }
 
@@ -580,6 +624,7 @@ mod tests {
             sort_order: Option<&str>,
         ) -> Result<ClickHouseSearchResult, ClickHouseError>;
 
+        #[allow(clippy::too_many_arguments)]
         async fn search_page(
             &self,
             query: &str,
@@ -671,14 +716,9 @@ mod tests {
             .await;
 
         for limit in [None, Some(""), Some("7")] {
-            let client = ClickHouseClient::with_execution_limit(
-                &server.uri(),
-                None,
-                None,
-                None,
-                limit,
-            )
-            .unwrap();
+            let client =
+                ClickHouseClient::with_execution_limit(&server.uri(), None, None, None, limit)
+                    .unwrap();
             client.test_connection().await.unwrap();
         }
 
@@ -703,14 +743,8 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let client = ClickHouseClient::with_execution_limit(
-            &server.uri(),
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let client =
+            ClickHouseClient::with_execution_limit(&server.uri(), None, None, None, None).unwrap();
         client
             .search_page_with_histogram(
                 "SELECT 1 AS value",
@@ -784,14 +818,9 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let client = ClickHouseClient::with_execution_limit(
-            &server.uri(),
-            None,
-            None,
-            None,
-            Some("10"),
-        )
-        .unwrap();
+        let client =
+            ClickHouseClient::with_execution_limit(&server.uri(), None, None, None, Some("10"))
+                .unwrap();
         let request = |token: &str| {
             serde_json::from_value(json!({
             "index":"events","query":"SELECT created_at FROM events","from":99999,"size":2,
@@ -819,11 +848,16 @@ mod tests {
         use serde_json::json;
         let server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
-            .and(|request: &wiremock::Request| String::from_utf8_lossy(&request.body).starts_with("SELECT * FROM ("))
+            .and(|request: &wiremock::Request| {
+                String::from_utf8_lossy(&request.body).starts_with("SELECT * FROM (")
+            })
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "meta":[{"name":"created_at"},{"name":"service"}],
                 "data":[{"created_at":"2026-10-16","service":"api"}],"rows":1
-            }))).expect(1).mount(&server).await;
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(matchers::method("POST"))
             .and(|request: &wiremock::Request| String::from_utf8_lossy(&request.body).starts_with("WITH histogram_source"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -849,12 +883,16 @@ mod tests {
         let request = serde_json::from_value(json!({
             "index":"events","query":"SELECT created_at, service FROM events",
             "histogram_field":"created_at","histogram_breakdown_field":"service","cursor":""
-        })).unwrap();
+        }))
+        .unwrap();
         let result = Connector::search(&client, request).await.unwrap();
         assert_eq!(result["histogram_interval"], "5s");
-        assert_eq!(result["histogram"][0]["breakdown"], json!([
-            {"key":"api","count":3},{"key":"__other__","count":1}
-        ]));
+        assert_eq!(
+            result["histogram"][0]["breakdown"],
+            json!([
+                {"key":"api","count":3},{"key":"__other__","count":1}
+            ])
+        );
     }
 
     #[tokio::test]

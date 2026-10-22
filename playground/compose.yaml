@@ -1,0 +1,214 @@
+# InvestiGenie playground. Prefer the wrapper: ./playground/playground.sh up [--ai docker|host|none]
+#
+# Profiles:
+#   (default)      investigenie, elasticsearch, seeder, setup
+#   ollama         local LLM server in Docker (CPU, or NVIDIA GPU with compose.gpu.yaml)
+#   observability  loki, prometheus, mimir (InvestiGenie has no connector for these yet)
+#   tools          eval: scores AI investigations against the seeded incidents
+#
+# Every knob is an environment variable; see .env.example. Ports are published on 127.0.0.1 only:
+# none of these development services has authentication enabled.
+name: investigenie-playground
+
+x-python: &python
+  image: python:3.12-slim
+  working_dir: /app
+  extra_hosts:
+    - "host.docker.internal:host-gateway"  # setup pulls models from a host Ollama with --ai host (needed on Linux)
+  environment: &python-env
+    PYTHONUNBUFFERED: "1"
+    INVESTIGENIE_URL: http://investigenie:3000
+    SEEDER_URL: http://seeder:8000
+
+services:
+  investigenie:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: investigenie:playground
+    environment:
+      # Quickstart storage: a generated encryption key is kept next to the data in the volume.
+      FILESYSTEM_PATH: /data
+      RUST_API_BIND: 0.0.0.0:3000
+      # Local models can take a while to answer the save-time probe on first load.
+      AI_PROBE_TIMEOUT_SECONDS: ${AI_PROBE_TIMEOUT_SECONDS:-120}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "127.0.0.1:${INVESTIGENIE_PORT:-3000}:3000"
+    volumes:
+      - investigenie-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # reach an Ollama or other model server running on the host
+    healthcheck:
+      test: ["CMD", "/app/investigenie-api", "healthcheck"]
+      interval: 5s
+      timeout: 8s
+      start_period: 20s
+      retries: 12
+    restart: unless-stopped
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms${ES_HEAP:-512m} -Xmx${ES_HEAP:-512m}"
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null"]
+      interval: 5s
+      timeout: 10s
+      start_period: 30s
+      retries: 30
+    restart: unless-stopped
+
+  seeder:
+    <<: *python
+    command: ["python", "/app/generate_data.py"]
+    environment:
+      <<: *python-env
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      LOKI_URL: http://loki:3100
+      STATE_DIR: /state
+      PLAYGROUND_EVENTS: ${PLAYGROUND_EVENTS:-50000}
+      PLAYGROUND_DAYS: ${PLAYGROUND_DAYS:-7}
+      PLAYGROUND_SEED: ${PLAYGROUND_SEED:-731}
+      PLAYGROUND_SCENARIOS: ${PLAYGROUND_SCENARIOS:-all}
+      PLAYGROUND_LIVE_EPS: ${PLAYGROUND_LIVE_EPS:-2}
+      PLAYGROUND_LIVE_INCIDENT: ${PLAYGROUND_LIVE_INCIDENT:-true}
+      PLAYGROUND_LIVE_RETENTION_DAYS: ${PLAYGROUND_LIVE_RETENTION_DAYS:-3}
+      PLAYGROUND_RESEED: ${PLAYGROUND_RESEED:-false}
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./generate_data.py:/app/generate_data.py:ro
+      - seeder-state:/state
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 360
+    restart: unless-stopped
+
+  setup:
+    <<: *python
+    entrypoint: ["python", "/app/setup_playground.py"]
+    environment:
+      <<: *python-env
+      ELASTICSEARCH_CONNECTION_URL: http://elasticsearch:9200
+      PLAYGROUND_CLICKHOUSE: ${PLAYGROUND_CLICKHOUSE:-play}
+      PLAYGROUND_CLICKHOUSE_URL: ${PLAYGROUND_CLICKHOUSE_URL:-https://play.clickhouse.com:443}
+      PLAYGROUND_CLICKHOUSE_USER: ${PLAYGROUND_CLICKHOUSE_USER:-explorer}
+      PLAYGROUND_CLICKHOUSE_PASSWORD: ${PLAYGROUND_CLICKHOUSE_PASSWORD:-}
+      PLAYGROUND_CLICKHOUSE_DATABASE: ${PLAYGROUND_CLICKHOUSE_DATABASE:-default}
+      PLAYGROUND_CLICKHOUSE_DATA_VIEWS: ${PLAYGROUND_CLICKHOUSE_DATA_VIEWS:-github_events:created_at,hackernews:time}
+      PLAYGROUND_AI_PROVIDER: ${PLAYGROUND_AI_PROVIDER:-${PLAYGROUND_AI_PROVIDER_DEFAULT:-ollama}}
+      PLAYGROUND_AI_MODELS: ${PLAYGROUND_AI_MODELS:-qwen2.5:7b}
+      PLAYGROUND_OLLAMA_URL: ${PLAYGROUND_OLLAMA_URL:-${PLAYGROUND_OLLAMA_DEFAULT_URL:-http://ollama:11434}}
+      PLAYGROUND_AI_CONTEXT: ${PLAYGROUND_AI_CONTEXT:-16384}
+      PLAYGROUND_AI_TEMPERATURE: ${PLAYGROUND_AI_TEMPERATURE:-0.1}
+      PLAYGROUND_AI_API_URL: ${PLAYGROUND_AI_API_URL:-}
+      PLAYGROUND_AI_API_KEY: ${PLAYGROUND_AI_API_KEY:-}
+    volumes:
+      - ./setup_playground.py:/app/setup_playground.py:ro
+    depends_on:
+      investigenie:
+        condition: service_healthy
+      seeder:
+        condition: service_started
+      ollama:
+        condition: service_started
+        required: false
+    restart: "no"
+
+  ollama:
+    profiles: [ollama]
+    image: ollama/ollama:0.35.1
+    environment:
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-24h}
+      OLLAMA_CONTEXT_LENGTH: ${PLAYGROUND_AI_CONTEXT:-16384}
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 10s
+      start_period: 10s
+      retries: 12
+    restart: unless-stopped
+
+  eval:
+    <<: *python
+    profiles: [tools]
+    entrypoint: ["python", "/app/ai_eval.py"]
+    environment:
+      <<: *python-env
+      EVAL_REPORT_DIR: /reports
+    volumes:
+      - ./ai_eval.py:/app/ai_eval.py:ro
+      - ./reports:/reports
+    depends_on:
+      investigenie:
+        condition: service_healthy
+      seeder:
+        condition: service_healthy
+    restart: "no"
+
+  loki:
+    profiles: [observability]
+    image: grafana/loki:3.4.2
+    command: ["-config.file=/etc/loki/config.yaml"]
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - ./loki-config.yaml:/etc/loki/config.yaml:ro
+      - loki-data:/loki
+    restart: unless-stopped
+
+  mimir:
+    profiles: [observability]
+    image: grafana/mimir:2.15.0
+    command: ["-config.file=/etc/mimir/config.yaml", "-target=all"]
+    ports:
+      - "127.0.0.1:9009:9009"
+    volumes:
+      - ./mimir-config.yaml:/etc/mimir/config.yaml:ro
+      - mimir-data:/data
+    restart: unless-stopped
+
+  prometheus:
+    profiles: [observability]
+    image: prom/prometheus:v3.2.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+
+volumes:
+  elasticsearch-data:
+  investigenie-data:
+  loki-data:
+  mimir-data:
+  ollama-models:
+  prometheus-data:
+  seeder-state:

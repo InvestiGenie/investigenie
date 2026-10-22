@@ -143,10 +143,8 @@ async fn legacy_encrypted_snapshots_are_migrated_to_current_identifiers() {
     let encryption = Encryption::new(&STANDARD.encode([7u8; 32]), "v1").unwrap();
     let mut snapshot = Snapshot::empty();
     snapshot.verifier = String::from_utf8(legacy_verifier()).unwrap();
-    let bytes = encryption.encrypt_legacy_fixture(
-        SNAPSHOT_ID,
-        &serde_json::to_vec(&snapshot).unwrap(),
-    );
+    let bytes =
+        encryption.encrypt_legacy_fixture(SNAPSHOT_ID, &serde_json::to_vec(&snapshot).unwrap());
     fs::write(path.join(SNAPSHOT_NAME), bytes).unwrap();
 
     let storage = Storage::open(options(&path)).await.unwrap();
@@ -547,6 +545,68 @@ async fn ai_conversations_survive_reopen_and_are_encrypted_revisioned_and_deleta
         storage.ai_conversation(&created.id).await,
         Err(StorageError::AiConversationNotFound)
     ));
+}
+
+#[tokio::test]
+async fn full_ai_history_evicts_the_least_recently_updated_conversation() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(options(directory.path())).await.unwrap();
+    let mut created = Vec::new();
+    for index in 0..MAX_AI_CONVERSATIONS {
+        let mut conversation = StoredAiConversation::new(
+            format!("conversation-{index}"),
+            "model-1".to_owned(),
+            vec!["view-1".to_owned()],
+            format!("Question {index}"),
+        );
+        conversation.created_at_ms = 1_000 + index as i64;
+        conversation.updated_at_ms = conversation.created_at_ms;
+        created.push(storage.create_ai_conversation(conversation).await.unwrap());
+    }
+    // Touching the oldest conversation makes conversation-1 the least recently updated one.
+    storage
+        .append_ai_conversation_messages(
+            &created[0].id,
+            &created[0].revision,
+            vec![StoredAiConversationMessage {
+                role: "user".to_owned(),
+                content: "follow-up".to_owned(),
+                result: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+    let newest = StoredAiConversation::new(
+        "conversation-new".to_owned(),
+        "model-1".to_owned(),
+        vec!["view-1".to_owned()],
+        "Newest question".to_owned(),
+    );
+    storage.create_ai_conversation(newest).await.unwrap();
+
+    let ids: Vec<String> = storage
+        .ai_conversations()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|summary| summary.id)
+        .collect();
+    assert_eq!(ids.len(), MAX_AI_CONVERSATIONS);
+    assert!(ids.contains(&"conversation-new".to_owned()));
+    assert!(ids.contains(&"conversation-0".to_owned()));
+    assert!(!ids.contains(&"conversation-1".to_owned()));
+    assert!(matches!(
+        storage.ai_conversation("conversation-1").await,
+        Err(StorageError::AiConversationNotFound)
+    ));
+
+    drop(storage);
+    let reopened = Storage::open(options(directory.path())).await.unwrap();
+    assert_eq!(
+        reopened.ai_conversations().await.unwrap().len(),
+        MAX_AI_CONVERSATIONS
+    );
 }
 
 #[tokio::test]

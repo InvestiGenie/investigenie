@@ -268,7 +268,11 @@ pub struct InvestigationError {
 
 impl From<AiConnectorError> for InvestigationError {
     fn from(error: AiConnectorError) -> Self {
-        Self { status: error.status, code: error.code, message: error.message }
+        Self {
+            status: error.status,
+            code: error.code,
+            message: error.message,
+        }
     }
 }
 
@@ -507,7 +511,7 @@ pub async fn investigate(
             .await
             .map_err(InvestigationError::storage)?;
         let query = build_query(
-            &connection.integration.id,
+            connection.integration.id,
             view,
             &sources[source_index].filters,
         )?;
@@ -677,6 +681,7 @@ pub async fn investigate(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assemble_response(
     output: &ModelFindings,
     sources: &[SourceResult],
@@ -1581,9 +1586,19 @@ impl Control {
     }
 }
 
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_timeout_accepts_only_bounded_whole_seconds() {
+        assert_eq!(parse_probe_timeout(None), AI_TIMEOUT);
+        assert_eq!(parse_probe_timeout(Some(" 120 ")), Duration::from_secs(120));
+        for invalid in ["", "4", "601", "-1", "1.5", "slow"] {
+            assert_eq!(parse_probe_timeout(Some(invalid)), AI_TIMEOUT, "{invalid}");
+        }
+    }
 
     fn view(id: &str, name: &str) -> DataView {
         DataView {
@@ -1812,7 +1827,8 @@ mod tests {
             .mount(&server)
             .await;
         let messages = [json!({"role":"user","content":"probe"})];
-        let reply = default_connector().complete(&provider_settings(&server).await, &messages, true, None)
+        let reply = default_connector()
+            .complete(&provider_settings(&server).await, &messages, true, None)
             .await
             .unwrap();
         assert_eq!(reply.content, "{\"ok\":true}");
@@ -1997,7 +2013,7 @@ mod tests {
         };
         let result = control
             .call(
-                || std::future::pending::<Result<(), InvestigationError>>(),
+                std::future::pending::<Result<(), InvestigationError>>,
                 || None,
             )
             .await
@@ -2174,7 +2190,9 @@ async fn call_model<T: for<'de> Deserialize<'de>>(
     ];
     let mut usage: Option<ModelUsage> = None;
     for attempt in 0..=MAX_REPAIR_ATTEMPTS {
-        let reply = default_connector().complete(settings, &messages, true, None).await?;
+        let reply = default_connector()
+            .complete(settings, &messages, true, None)
+            .await?;
         merge_usage(&mut usage, reply.usage);
         if reply.truncated {
             return Err(InvestigationError::upstream(
@@ -2228,7 +2246,9 @@ pub async fn continue_conversation(
         messages.push(json!({"role":message.role,"content":content}));
     }
     messages.push(json!({"role":"user","content":question}));
-    let reply = default_connector().complete(settings, &messages, false, Some(1024)).await?;
+    let reply = default_connector()
+        .complete(settings, &messages, false, Some(1024))
+        .await?;
     if reply.truncated {
         return Err(InvestigationError::upstream(
             "ai_response_truncated",
@@ -2238,14 +2258,29 @@ pub async fn continue_conversation(
     Ok(reply.content.trim().to_owned())
 }
 
+/// Timeout for the save-time provider probe. Local models can need longer than the default to load
+/// on first use, so `AI_PROBE_TIMEOUT_SECONDS` (5-600) may raise it; invalid values keep the default.
+pub fn probe_timeout() -> Duration {
+    parse_probe_timeout(std::env::var("AI_PROBE_TIMEOUT_SECONDS").ok().as_deref())
+}
+
+fn parse_probe_timeout(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| (5..=600).contains(seconds))
+        .map(Duration::from_secs)
+        .unwrap_or(AI_TIMEOUT)
+}
+
 pub async fn test_model(settings: &AiSettings) -> Result<(), &'static str> {
     let mut probe_settings = settings.clone();
-    probe_settings.timeout = AI_TIMEOUT;
+    probe_settings.timeout = probe_timeout();
     let messages = [
         json!({"role":"system","content":"Return exactly a JSON object with the boolean field ok set to true."}),
         json!({"role":"user","content":"{\"probe\":true}"}),
     ];
-    let response = default_connector().complete(&probe_settings, &messages, true, Some(32))
+    let response = default_connector()
+        .complete(&probe_settings, &messages, true, Some(32))
         .await
         .map_err(|_| "The provider test returned an unusable response")?;
     let content: Value = parse_model_json(&response.content)

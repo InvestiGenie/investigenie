@@ -14,3 +14,9 @@ data/
 investigenie_data/
 configuration.snapshot
 configuration.lock
+
+# Playground
+playground/.playground-state
+playground/reports/
+__pycache__/
+*.pyc

@@ -429,9 +429,13 @@ impl ElasticsearchClient {
             if let Some(pit) = body.get("pit") {
                 bounds_body["pit"] = pit.clone();
             }
-            let bounds = match self.client.post(url.clone())
+            let bounds = match self
+                .client
+                .post(url.clone())
                 .query(&[("allow_partial_search_results", "false")])
-                .json(&bounds_body).send().await
+                .json(&bounds_body)
+                .send()
+                .await
             {
                 Ok(response) => decode::<Value>(response).await,
                 Err(_) => Err(ElasticsearchError::Request),
@@ -458,8 +462,12 @@ impl ElasticsearchClient {
                 return Err(ElasticsearchError::InvalidResponse);
             }
             if let (Some(first), Some(last)) = (
-                bounds.pointer("/aggregations/first_timestamp/value").and_then(Value::as_f64),
-                bounds.pointer("/aggregations/last_timestamp/value").and_then(Value::as_f64),
+                bounds
+                    .pointer("/aggregations/first_timestamp/value")
+                    .and_then(Value::as_f64),
+                bounds
+                    .pointer("/aggregations/last_timestamp/value")
+                    .and_then(Value::as_f64),
             ) {
                 let span = (last - first).max(1.0);
                 histogram_options.interval = crate::search::HistogramInterval::automatic(span);
@@ -582,10 +590,18 @@ impl ElasticsearchClient {
     }
 }
 
-fn histogram_aggregations(field: &str, request: &SearchRequest, options: &HistogramOptions) -> Value {
+fn histogram_aggregations(
+    field: &str,
+    request: &SearchRequest,
+    options: &HistogramOptions,
+) -> Value {
     let over_time = match options.interval {
         Some(interval) => {
-            let kind = if interval.is_calendar() { "calendar_interval" } else { "fixed_interval" };
+            let kind = if interval.is_calendar() {
+                "calendar_interval"
+            } else {
+                "fixed_interval"
+            };
             let mut histogram = json!({ "date_histogram": {
                 "field": field,
                 (kind): format!("{}{}", interval.count, interval.suffix()),
@@ -593,7 +609,8 @@ fn histogram_aggregations(field: &str, request: &SearchRequest, options: &Histog
                 "min_doc_count": 0
             } });
             if let Some(range) = request.time_range {
-                histogram["date_histogram"]["extended_bounds"] = json!({"min": range.start, "max": range.end});
+                histogram["date_histogram"]["extended_bounds"] =
+                    json!({"min": range.start, "max": range.end});
             }
             histogram
         }
@@ -701,7 +718,11 @@ fn validate_search(request: &SearchRequest) -> Result<(), ElasticsearchError> {
     if let Some(token) = request.cursor.as_deref().filter(|token| !token.is_empty()) {
         SearchCursor::decode(token)?;
     }
-    if request.sort_by.as_deref().is_some_and(|field| !crate::search::safe_field_name(field)) {
+    if request
+        .sort_by
+        .as_deref()
+        .is_some_and(|field| !crate::search::safe_field_name(field))
+    {
         return Err(ElasticsearchError::InvalidIndex);
     }
     if request
@@ -711,7 +732,11 @@ fn validate_search(request: &SearchRequest) -> Result<(), ElasticsearchError> {
     {
         return Err(ElasticsearchError::InvalidIndex);
     }
-    if request.histogram_field.as_deref().is_some_and(|field| !crate::search::safe_field_name(field)) {
+    if request
+        .histogram_field
+        .as_deref()
+        .is_some_and(|field| !crate::search::safe_field_name(field))
+    {
         return Err(ElasticsearchError::InvalidIndex);
     }
     Ok(())
@@ -799,12 +824,15 @@ mod tests {
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/logs-*/_pit"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"initial"})))
-            .expect(1).mount(&server).await;
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/_search"))
             .and(|request: &wiremock::Request| {
                 let body: Value = serde_json::from_slice(&request.body).unwrap();
-                body["size"] == 0 && body["pit"]["id"] == "initial"
+                body["size"] == 0
+                    && body["pit"]["id"] == "initial"
                     && body["aggs"]["first_timestamp"]["min"]["field"] == "created_at"
                     && body["query"] == json!({"match_all":{}})
             })
@@ -812,7 +840,9 @@ mod tests {
                 "timed_out":false,"_shards":{"failed":0},"pit_id":"rotated",
                 "aggregations":{"first_timestamp":{"value":0},"last_timestamp":{"value":120000}}
             })))
-            .expect(1).mount(&server).await;
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/_search"))
             .and(matchers::query_param("allow_partial_search_results", "false"))
@@ -837,10 +867,15 @@ mod tests {
             .and(matchers::path("/_pit"))
             .and(matchers::body_json(json!({"id":"finished"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"succeeded":true})))
-            .expect(1).mount(&server).await;
+            .expect(1)
+            .mount(&server)
+            .await;
         let client = ElasticsearchClient::new(ElasticsearchSettings {
-            url: Url::parse(&server.uri()).unwrap(), authentication: None, tls_insecure: false,
-        }).unwrap();
+            url: Url::parse(&server.uri()).unwrap(),
+            authentication: None,
+            tls_insecure: false,
+        })
+        .unwrap();
         let mut request = cursor_request("");
         request.index = "logs-*".to_owned();
         request.histogram_breakdown_field = Some("service".to_owned());
@@ -848,8 +883,10 @@ mod tests {
         assert_eq!(result.total, 24000);
         assert_eq!(result.total_relation, "eq");
         assert_eq!(result.histogram_interval.as_deref(), Some("5s"));
-        assert_eq!(serde_json::to_value(&result.histogram[0]).unwrap()["breakdown"],
-            json!([{"key":"api","count":20000},{"key":"__other__","count":4000}]));
+        assert_eq!(
+            serde_json::to_value(&result.histogram[0]).unwrap()["breakdown"],
+            json!([{"key":"api","count":20000},{"key":"__other__","count":4000}])
+        );
     }
 
     #[tokio::test]
@@ -864,7 +901,10 @@ mod tests {
                 .await;
             Mock::given(matchers::method("POST"))
                 .and(matchers::path("/_search"))
-                .and(matchers::query_param("allow_partial_search_results", "false"))
+                .and(matchers::query_param(
+                    "allow_partial_search_results",
+                    "false",
+                ))
                 .and(|request: &wiremock::Request| {
                     let body: Value = serde_json::from_slice(&request.body).unwrap();
                     body["sort"][0]["created_at"]["unmapped_type"] == "date"
@@ -1293,7 +1333,10 @@ mod tests {
             "time_range": {"start": 0, "end": 120000}
         }))
         .unwrap();
-        let result = client.search(request).await.expect("histogram search succeeds");
+        let result = client
+            .search(request)
+            .await
+            .expect("histogram search succeeds");
         assert_eq!(result.histogram_interval.as_deref(), Some("1m"));
         let first = serde_json::to_value(&result.histogram[0]).unwrap();
         assert_eq!(
