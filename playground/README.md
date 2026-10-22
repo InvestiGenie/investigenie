@@ -176,6 +176,8 @@ histogram_quantile(0.95, sum by (le, service) (rate(playground_http_request_dura
 ./playground/playground.sh reset --all
 ```
 
+`reset` removes only volumes that exist, so it also works when optional observability services were never started. It keeps the Ollama model volume unless `--all` is specified.
+
 The wrapper is a thin layer over `docker compose -f playground/compose.yaml` with the `ollama`, `observability` and `tools` profiles. It remembers the `up` options in `playground/.playground-state`.
 
 ## Troubleshooting

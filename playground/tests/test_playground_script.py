@@ -1,7 +1,6 @@
 """Tests for the playground wrapper's mode-specific configuration."""
 
 import os
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -17,7 +16,8 @@ class PlaygroundScriptTests(unittest.TestCase):
         self.playground = self.root / "playground"
         self.playground.mkdir()
         self.script = self.playground / "playground.sh"
-        shutil.copy2(PLAYGROUND_DIR / "playground.sh", self.script)
+        self.script.write_bytes((PLAYGROUND_DIR / "playground.sh").read_bytes().replace(b"\r\n", b"\n"))
+        self.removed = self.root / "removed-volumes.txt"
 
         self.bin = self.root / "bin"
         self.bin.mkdir()
@@ -25,6 +25,18 @@ class PlaygroundScriptTests(unittest.TestCase):
         docker = self.bin / "docker"
         docker.write_text(
             "#!/usr/bin/env bash\n"
+            "if [[ \"$1\" == volume && \"$2\" == ls ]]; then\n"
+            "  printf '%s\\n' \"${DOCKER_VOLUMES-}\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "if [[ \"$1\" == volume && \"$2\" == rm ]]; then\n"
+            "  if ! printf '%s\\n' \"${DOCKER_VOLUMES-}\" | grep -Fxq -- \"$4\"; then\n"
+            "    echo 'no such volume' >&2\n"
+            "    exit 1\n"
+            "  fi\n"
+            "  printf '%s\\n' \"$4\" >> \"$DOCKER_REMOVED\"\n"
+            "  exit 0\n"
+            "fi\n"
             "{\n"
             "  printf 'PLAYGROUND_OLLAMA_URL=%s\\n' \"${PLAYGROUND_OLLAMA_URL-<unset>}\"\n"
             "  printf 'PLAYGROUND_OLLAMA_DEFAULT_URL=%s\\n' \"${PLAYGROUND_OLLAMA_DEFAULT_URL-<unset>}\"\n"
@@ -48,6 +60,7 @@ class PlaygroundScriptTests(unittest.TestCase):
         env.pop("PLAYGROUND_OLLAMA_URL", None)
         env["PATH"] = f"{self.bin}{os.pathsep}{env['PATH']}"
         env["DOCKER_CAPTURE"] = str(self.capture)
+        env["DOCKER_REMOVED"] = str(self.removed)
         env.update(extra_env or {})
         return subprocess.run(["bash", str(self.script), *args], capture_output=True, text=True, env=env)
 
@@ -96,6 +109,20 @@ class PlaygroundScriptTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("setup models qwen2.5:3b", self.capture.read_text())
+
+    def test_reset_skips_missing_optional_volumes(self):
+        self.write_state("none")
+        existing = [
+            "investigenie-playground_elasticsearch-data",
+            "investigenie-playground_investigenie-data",
+            "investigenie-playground_seeder-state",
+        ]
+
+        result = self.run_script("reset", extra_env={"DOCKER_VOLUMES": "\n".join(existing)})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.removed.read_text().splitlines(), existing)
+        self.assertFalse((self.playground / ".playground-state").exists())
 
 
 if __name__ == "__main__":

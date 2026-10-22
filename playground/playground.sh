@@ -165,8 +165,12 @@ case "$command" in
     else
       EXTRA_PROFILES="tools ollama observability" compose down
       project=investigenie-playground
+      volumes=$(docker volume ls --format '{{.Name}}')
       for volume in elasticsearch-data investigenie-data loki-data mimir-data prometheus-data seeder-state; do
-        docker volume rm -f "${project}_${volume}" >/dev/null
+        volume_name="${project}_${volume}"
+        if printf '%s\n' "$volumes" | grep -Fqx -- "$volume_name"; then
+          docker volume rm -f "$volume_name" >/dev/null
+        fi
       done
       echo "Removed playground data (kept downloaded models; use 'reset --all' to remove them too)."
     fi
