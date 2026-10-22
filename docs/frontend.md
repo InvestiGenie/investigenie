@@ -23,11 +23,13 @@ React 19 + TypeScript + Vite in `frontend/`. No router and no state library: `Ap
 
 ## Key behaviours
 
+- **Navigation:** internal page changes are recorded in browser history, so Back and Forward move between app pages instead of immediately leaving the tool.
 - **Metadata-driven:** connection forms, query placeholders, sorting rules, and document lookup come from each integration's descriptor. Avoid `if (integration === "x")` in UI code.
 - **Time:** Explore initially selects the last 15 minutes. The UI keeps UTC values and sends epoch milliseconds. The chosen timezone only changes how times are displayed; it never re-queries.
 - **Explore paging:** 50 documents per page. The histogram comes from the first page and is reused while paging.
-- **Histogram:** Auto targets about 50 bars; a fixed interval that would exceed 100 bars is scaled up. Drag or click to zoom (this updates the time window and searches). Manual intervals need a time window; breakdown works for bounded windows and All time, where the server resolves a shared interval. Elasticsearch requests exact matching totals; any lower-bound response is marked with `+`.
+- **Histogram:** Auto targets about 50 bars; a fixed interval that would exceed 100 bars is scaled up. Drag or click to zoom (this updates the time window and searches). Manual intervals need a time window; breakdown works for bounded windows and All time, where the server resolves a shared interval. Explore Elasticsearch searches request exact matching totals; any lower-bound response is marked with `+`.
 - **AI page:** starts a job, polls every second (every 5 s while paused), and shows partial findings at check-ins. Completed conversations are persisted; selecting one restores its transcript, Data Views, and model, and follow-ups use saved findings without rescanning sources.
+- **Explore document investigations:** every document row can start an investigation. Lookup-mode sources fetch the full document; inline-mode sources use the search hit. The AI prompt includes the document ID, index, Data View and applied time range, with source content capped at 6,000 characters.
 - **AI results:** the local `InvestigationResultView` component renders both live and saved results with usage, confidence/evidence, source scope, caveats, and partial labels. A saved result replaces its live duplicate instead of showing both.
 - **AI composer:** model selector, Timeout, and Ask after share one desktop row. The model can flex; duration selects are 76px wide. On small screens the model spans a row above two compact duration controls, without horizontal overflow.
 - **Data Views:** the searchable picker accepts wildcard/comma-separated Elasticsearch patterns and validates fields through the API. ClickHouse tables remain exact names. Connection controls come from integration metadata, including optional ClickHouse execution time; blank creation omits it, clearing on edit sends null.

@@ -11,7 +11,7 @@ Website: [investigenie.com](https://investigenie.com) · Releases: [GitHub Relea
 - **All sources, one UI:** connect as many datasources as you need and save Data Views over any index or table, including Elasticsearch wildcard and comma-separated index patterns.
 - **Explore:** query in each source's own language. You get time windows (last 15 minutes by default) and timezones, sorting, field columns, JSON inspection, and paging past 10,000 results. Elasticsearch counts matches across the entire selected pattern.
 - **Histogram:** auto or fixed intervals, breakdown by field (including All time), and drag-to-zoom.
-- **InvestiGenie AI:** ask a question across 1–5 Data Views. The AI scans every matching record, cites evidence, reports token usage, and checks in with you on long runs.
+- **InvestiGenie AI:** ask a question across 1–5 Data Views. The AI plans from field metadata, gathers bounded samples and aggregations, forms cited hypotheses, reports token usage, and checks in with you on long runs.
 - **AI history:** reopen or delete encrypted conversation history and ask follow-ups using saved findings. Follow-ups do not rescan sources; active scan jobs are not resumed after a restart.
 - **Bring your own model:** works with any OpenAI-compatible provider, including local ones.
 - **Secure by default:** credentials are encrypted at rest, never sent to the browser or the AI, and datasources are only read.

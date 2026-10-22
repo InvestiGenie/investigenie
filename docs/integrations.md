@@ -13,7 +13,7 @@ integrations/
 
 Shared contracts and registration live in `backend/src/data_connectors.rs` and `backend/src/ai_connectors.rs`. The integration folders contain concrete implementations, each with its own `mod.rs` entry point.
 
-Data connectors provide connection metadata, schema, read-only search, paging, and histograms. Their forms and Explore/Data Views behavior are metadata-driven. Investigation query translation must also support a source before AI scans can use it; adding a datasource does not automatically implement that translation.
+Data connectors provide connection metadata, schema, read-only search, paging, and histograms. Their forms and Explore/Data Views behavior are metadata-driven. Investigation query translation must also support a source before AI evidence gathering can use it; adding a datasource does not automatically implement that translation.
 
 Built in: `elasticsearch` (Query DSL / Lucene), `clickhouse` (SQL `WHERE` clauses, read-only).
 
@@ -53,7 +53,7 @@ The full field-by-field contract and response examples are in [integrations/READ
 
 The backend-owned [AI connector contract](../backend/src/ai_connectors.rs) defines `AiConnector::complete`, settings, completion content/usage/truncation, and sanitized errors. [OpenAI-compatible transport](../integrations/ai_connectors/openai/mod.rs) implements Chat Completions for OpenAI and compatible endpoints, including bounded HTTP requests and one fallback when a provider explicitly rejects JSON mode. This is not full coverage of every OpenAI API endpoint.
 
-To add a future transport or harness, implement the completion trait in `integrations/ai_connectors/<id>/mod.rs` and explicitly declare/register it in `backend/src/ai_connectors.rs`; datasource auto-discovery does not scan this directory. Keep provider wire formats inside the transport. Keep prompts, JSON repair, source scanning, evidence validation, jobs, and conversation history in `backend/src/ai.rs` and storage. The current default remains OpenAI-compatible; no new provider-selection field or saved-object migration is required by this move.
+To add a future transport or harness, implement the completion trait in `integrations/ai_connectors/<id>/mod.rs` and explicitly declare/register it in `backend/src/ai_connectors.rs`; datasource auto-discovery does not scan this directory. Keep provider wire formats inside the transport. Keep metadata planning, bounded evidence queries, hypothesis generation, JSON repair, evidence validation, jobs, and conversation history in `backend/src/ai.rs` and storage. The current default remains OpenAI-compatible; no new provider-selection field or saved-object migration is required by this move.
 
 ## Check
 

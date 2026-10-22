@@ -12,7 +12,7 @@ Rust crate `investigenie-api` in `backend/` (Axum + Tokio). One binary: `investi
 | `search.rs` | `SearchRequest` and validation of time ranges, histogram intervals, breakdown fields, and timezones. |
 | `data_connectors.rs` | The datasource `Connector` trait, descriptors, secret-handling helpers, and generated registry. Implementations import `crate::data_connectors`. |
 | `storage.rs`, `storage/filesystem.rs` | Encrypted saved objects with revisions (PostgreSQL or a filesystem snapshot). |
-| `ai.rs` | AI orchestration: prompts, JSON parsing/repair, planning, scanning, evidence compaction, job control, follow-up context, and model probe semantics. Uses the shared AI completion interface. |
+| `ai.rs` | AI orchestration: metadata planning, bounded evidence gathering, hypothesis generation, JSON parsing/repair, job control, follow-up context, and model probe semantics. Uses the shared AI completion interface. |
 | `build.rs` | Finds `integrations/data_connectors/*/mod.rs` and registers datasources at compile time; AI connectors are excluded from this registry. |
 | `ai_connectors.rs` | Provider-neutral `AiConnector` trait, settings, reply/usage/error types, explicit transport modules, and default registration. |
 | `integrations/ai_connectors/openai/mod.rs` (repo root) | OpenAI-compatible HTTP transport, bearer auth, bounded payloads, response/usage decoding, and unsupported JSON-mode fallback. |
@@ -41,7 +41,7 @@ All responses are JSON; errors are `{"error":{"code","message"}}`. Updates and d
 
 ## Search and histogram
 
-Elasticsearch searches request exact matching totals across all selected indices rather than stopping the count at 10,000. Exact counting may cost more on large datasets. All time breakdowns resolve a common bucket interval before calculating top-value series; Elasticsearch uses a min/max timestamp preflight on the same PIT when paging. The time scope remains unbounded.
+Explore Elasticsearch searches request exact matching totals across all selected indices rather than stopping the count at 10,000. Exact counting may cost more on large datasets. AI evidence searches disable exact hit counting and use histogram/top-value aggregates instead. All time breakdowns resolve a common bucket interval before calculating top-value series; Elasticsearch uses a min/max timestamp preflight on the same PIT when paging. The time scope remains unbounded.
 
 Both connectors use `HistogramInterval::automatic(span_millis)` in `search.rs` for automatic breakdown intervals. Keep the candidate intervals and target bucket count in that helper, not separate connector-specific lists. Elasticsearch tolerates unmapped time fields when sorting multi-index patterns; ClickHouse histogram failures preserve valid rows and report an unavailable reason. SQL `LIMIT` bounds returned rows, while ClickHouse server profiles control memory limits; fixed memory/result/overflow URL overrides are not sent.
 
@@ -63,11 +63,11 @@ Both shared connector contracts and registrations live in the backend, while `in
 
 API helpers `model_settings`, `prepare_ai_call`, and `probe_ai_model` share model settings, capacity acquisition, and provider probes across synchronous/background investigations, follow-ups, and model saves. Keep validation/revision checks before those operations; model saves still probe before persistence. `ai_model_save_error` preserves the existing duplicate-model response. Both conversation creation and updates reuse `conversation_timestamp`; no storage schema changes are involved.
 
-1. **Plan:** the AI receives the question and the field names (no data) and proposes filters. Invalid filters are dropped, with a caveat explaining it.
-2. **Scan:** every matching record is read in 100-record pages (Elasticsearch point-in-time snapshots; ClickHouse offsets).
-3. **Compact:** values are trimmed and similar records are grouped by error/message/status fields, keeping a few examples plus counts.
-4. **Analyse:** about 9 KB batches go to the AI with the previous findings; it returns a rolling summary.
-5. **Clean the output:** model replies are parsed leniently, retried once if unusable, and evidence the model wasn't given is removed.
+1. **Plan evidence:** the AI receives the question, selected Data View metadata (field names and types), and time scope. It proposes validated filters, up to four sample fields, and an optional aggregation field; invalid choices are dropped with a caveat.
+2. **Gather evidence:** the backend sends one bounded search request per selected Data View for at most four records plus a time histogram; adapters may issue additional database-side aggregation/preflight queries. Results can include a top-three-plus-`__other__` breakdown. Only four selected fields per record are retained, each capped at 256 bytes; the hypothesis payload keeps at most 16 aggregate buckets. The engine does not page through every matching record.
+3. **Form hypotheses:** the AI receives aggregate summaries and bounded sample evidence, then returns supported findings. Evidence IDs are validated against the supplied samples, and reported counts are capped by available aggregates or sample counts.
+4. **Clean the output:** model replies are parsed leniently, retried once if unusable, and unsupported evidence is removed.
+5. **Knowledge base (future):** record issue patterns, verified solutions, and investigation approaches to provide future hints. No knowledge-base storage or retrieval is implemented yet.
 
 Jobs (`InvestigationJob`, `Control`) pause at the user's check-in interval or on an AI timeout and wait for continue or stop. They are kept in memory: at most 64, with finished jobs kept for 30 minutes.
 
