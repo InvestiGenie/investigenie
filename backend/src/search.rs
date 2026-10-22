@@ -28,6 +28,8 @@ pub struct SearchRequest {
     pub histogram_breakdown_field: Option<String>,
     #[serde(default)]
     pub time_zone: Option<String>,
+    #[serde(skip)]
+    pub track_total_hits: Option<bool>,
 }
 
 fn default_page_size() -> usize {

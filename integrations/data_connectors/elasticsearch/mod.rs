@@ -362,7 +362,7 @@ impl ElasticsearchClient {
             "size": request.size,
             "sort": sort,
             "timeout": SEARCH_TIMEOUT,
-            "track_total_hits": true
+            "track_total_hits": request.track_total_hits.unwrap_or(true)
         });
         let mut body = body;
         if let Some(field) = request.histogram_field.as_deref().filter(|_| {

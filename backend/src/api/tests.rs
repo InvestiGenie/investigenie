@@ -371,11 +371,6 @@ async fn ai_model_list_is_empty_when_no_profiles_are_saved() {
 }
 
 #[tokio::test]
-async fn ai_investigation_plans_queries_and_returns_only_cited_evidence() {
-    assert_ai_investigation_cursor_batches(false).await;
-}
-
-#[tokio::test]
 async fn bundled_web_ui_is_served_same_origin_without_shadowing_api_routes() {
     let (_directory, storage) = status_storage().await;
     let web = tempfile::tempdir().unwrap();
@@ -538,23 +533,14 @@ async fn background_investigations_validate_controls_poll_status_and_reject_unkn
 }
 
 #[tokio::test]
-async fn ai_investigation_scans_all_cursor_batches_and_retains_later_evidence() {
-    assert_ai_investigation_cursor_batches(true).await;
-}
-
-async fn assert_ai_investigation_cursor_batches(multiple_pages: bool) {
+async fn ai_investigation_gathers_bounded_evidence_and_returns_cited_hypotheses() {
     let (_directory, storage) = status_storage().await;
     let source = MockServer::start().await;
     let provider = MockServer::start().await;
-    let first_page_size = if multiple_pages { 100 } else { 2 };
-    let records_examined = if multiple_pages { 102 } else { 2 };
-    let first_hits = (1..=first_page_size)
-        .map(|record_number| json!({
-            "_index":"events","_id":format!("event-{record_number}"),"_score":null,
-            "sort":[1791630000000i64,record_number],
-            "_source":{"@timestamp":"2026-10-10T11:00:00Z","service":"checkout","message":"inventory timeout"}
-        }))
-        .collect::<Vec<_>>();
+    let sample_hits = json!([
+        {"_index":"events","_id":"event-1","_score":null,"_source":{"@timestamp":"2026-10-10T11:00:00Z","service":"checkout","message":"inventory timeout","internal_note":"not selected"}},
+        {"_index":"events","_id":"event-2","_score":null,"_source":{"@timestamp":"2026-10-10T11:01:00Z","service":"checkout","message":"inventory timeout","internal_note":"not selected"}}
+    ]);
     Mock::given(matchers::method("GET"))
         .and(matchers::path("/events/_mapping"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -568,59 +554,42 @@ async fn assert_ai_investigation_cursor_batches(multiple_pages: bool) {
         .mount(&source)
         .await;
     Mock::given(matchers::method("POST"))
-        .and(matchers::path("/events/_pit"))
-        .and(matchers::query_param("keep_alive", "1m"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"test-pit"})))
-        .expect(1)
-        .mount(&source)
-        .await;
-    Mock::given(matchers::method("DELETE"))
-        .and(matchers::path("/_pit"))
-        .and(matchers::body_partial_json(json!({"id":"test-pit"})))
-        .respond_with(ResponseTemplate::new(503))
-        .expect(1)
-        .mount(&source)
-        .await;
-    let search_body = json!({
-        "size":100,"pit":{"id":"test-pit","keep_alive":"1m"},
-        "sort":[{"@timestamp":{"order":"asc"}},{"_shard_doc":"asc"}],
-        "query":{"bool":{"must":[{"query_string":{"query":"service:\"checkout\""}}],"filter":[{"range":{"@timestamp":{"gte":1791630000000i64,"lte":1791633600000i64,"format":"epoch_millis"}}}]}}
-    });
-    Mock::given(matchers::method("POST"))
-        .and(matchers::path("/_search"))
+        .and(matchers::path("/events/_search"))
         .and(matchers::header("content-type", "application/json"))
-        .and(matchers::body_partial_json(search_body.clone()))
         .and(|request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
-            body.get("search_after").is_none() && body.get("from").is_none() && body.get("aggs").is_none()
+            body["size"] == 4
+                && body["from"] == 0
+                && body["track_total_hits"] == false
+                && body.get("pit").is_none()
+                && body.get("search_after").is_none()
+                && body["sort"][0]["@timestamp"]["order"] == "desc"
+                && body["query"]["bool"]["must"][0]["query_string"]["query"]
+                    == "service:\"checkout\""
+                && body["aggs"]["documents_over_time"]["date_histogram"]["fixed_interval"] == "5m"
+                && body["aggs"]["breakdown_values"]["terms"]["field"] == "service"
         })
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "took":7,"timed_out":false,"_shards":{"failed":0},"hits":{"total":{"value":records_examined,"relation":"eq"},"hits":first_hits}
+            "took":7,"timed_out":false,"_shards":{"failed":0},
+            "hits":{"total":{"value":102,"relation":"eq"},"hits":sample_hits},
+            "aggregations":{
+                "documents_over_time":{"buckets":[
+                    {"key":1791630000000i64,"doc_count":60},
+                    {"key":1791630300000i64,"doc_count":42}
+                ]},
+                "breakdown_values":{"buckets":[
+                    {"key":"checkout","doc_count":102,"over_time":{"buckets":[
+                        {"key":1791630000000i64,"doc_count":60},
+                        {"key":1791630300000i64,"doc_count":42}
+                    ]}}
+                ]}
+            }
         })))
         .expect(1)
         .mount(&source)
         .await;
-    if multiple_pages {
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/_search"))
-            .and(matchers::body_partial_json(search_body))
-            .and(matchers::body_partial_json(json!({"search_after":[1791630000000i64,100]})))
-            .and(|request: &wiremock::Request| {
-                let body: Value = serde_json::from_slice(&request.body).unwrap();
-                body.get("from").is_none() && body.get("aggs").is_none()
-            })
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "took":3,"timed_out":false,"_shards":{"failed":0},"hits":{"total":{"value":102,"relation":"eq"},"hits":[
-                    {"_index":"events","_id":"event-101","sort":[1791630001000i64,101],"_source":{"@timestamp":"2026-10-10T11:00:01Z","service":"checkout","message":"payment authorization rejected"}},
-                    {"_index":"events","_id":"event-102","sort":[1791630002000i64,102],"_source":{"@timestamp":"2026-10-10T11:00:02Z","service":"checkout","message":"payment authorization rejected"}}
-                ]}
-            })))
-            .expect(1)
-            .mount(&source)
-            .await;
-    }
 
-    let plan_content = json!({"views":[{"data_view_id":"checkout-view","filters":[{"field":"service","operator":"eq","value":"checkout"}]}]}).to_string();
+    let plan_content = json!({"views":[{"data_view_id":"checkout-view","filters":[{"field":"service","operator":"eq","value":"checkout"}],"sample_fields":["@timestamp","message","service"],"aggregation_field":"service"}]}).to_string();
     Mock::given(matchers::method("POST"))
         .and(matchers::path("/v1/chat/completions"))
         .and(matchers::header(
@@ -631,7 +600,17 @@ async fn assert_ai_investigation_cursor_batches(multiple_pages: bool) {
             json!({"model":"test-model","response_format":{"type":"json_object"}}),
         ))
         .and(|request: &wiremock::Request| {
-            !String::from_utf8_lossy(&request.body).contains("Analyze only the provided records.")
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let system = body["messages"][0]["content"].as_str().unwrap();
+            let input: Value =
+                serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+            !system.contains("Form and update hypotheses")
+                && input["available_views"][0]["fields"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|field| field["name"] == "service" && field["type"] == "keyword")
+                && !input.to_string().contains("inventory timeout")
         })
         .respond_with(
             ResponseTemplate::new(200)
@@ -642,54 +621,26 @@ async fn assert_ai_investigation_cursor_batches(multiple_pages: bool) {
         .await;
     let findings_content = json!({
         "summary":"Checkout errors correlate with inventory timeouts.",
-        "findings":[{"title":"Inventory timeout","detail":"Two checkout events report inventory timeouts.","severity":"high","confidence":"medium","evidence":[{"data_view_id":"checkout-view","data_view_name":"Checkout logs","record_ids":["event-1","event-2"],"count":2}]}],
+        "findings":[{"title":"Inventory timeout","detail":"Aggregate counts and the sampled checkout events report inventory timeouts.","severity":"high","confidence":"medium","evidence":[{"data_view_id":"checkout-view","data_view_name":"Checkout logs","record_ids":["event-1","event-2"],"count":102}]}],
         "caveats":[]
     }).to_string();
-    let findings_mock = Mock::given(matchers::method("POST"))
+    Mock::given(matchers::method("POST"))
         .and(matchers::path("/v1/chat/completions"))
-        .and(matchers::body_string_contains(
-            "Analyze only the provided records.",
-        ))
+        .and(matchers::body_string_contains("Form and update hypotheses"))
         .and(move |request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             let input: Value = serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
-            input["sources"][0]["records_examined"] == first_page_size
+            input["sources"][0]["records_examined"] == 2
+                && input["sources"][0]["aggregation_field"] == "service"
+                && input["sources"][0]["aggregations"].as_array().unwrap().len() == 2
         })
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"choices":[{"message":{"content":findings_content}}],"usage":{"prompt_tokens":420,"completion_tokens":96,"total_tokens":516}})),
         )
-        .expect(if multiple_pages { 0 } else { 1 })
-        .with_priority(1);
-    findings_mock.mount(&provider).await;
-    if multiple_pages {
-        let later_findings = json!({
-            "summary":"Inventory timeouts and later payment authorization failures affect checkout.",
-            "findings":[
-                {"title":"Inventory timeout","detail":"The first batch contains inventory timeouts.","severity":"high","confidence":"medium","evidence":[{"data_view_id":"checkout-view","data_view_name":"Checkout logs","record_ids":["event-1","event-2"],"count":100}]},
-                {"title":"Payment authorization rejected","detail":"The later batch reveals payment authorization failures.","severity":"high","confidence":"high","evidence":[{"data_view_id":"checkout-view","data_view_name":"Checkout logs","record_ids":["event-101","event-102"],"count":2}]}
-            ],"caveats":[]
-        }).to_string();
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/chat/completions"))
-            .and(matchers::body_string_contains(
-                "Analyze only the provided records.",
-            ))
-            .and(|request: &wiremock::Request| {
-                let body: Value = serde_json::from_slice(&request.body).unwrap();
-                let input: Value =
-                    serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
-                input["sources"][0]["records_examined"] == 102
-            })
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices":[{"message":{"content":later_findings}}],
-                "usage":{"prompt_tokens":420,"completion_tokens":96,"total_tokens":516}
-            })))
-            .with_priority(1)
-            .expect(1)
-            .mount(&provider)
-            .await;
-    }
+        .expect(1)
+        .mount(&provider)
+        .await;
 
     storage.create_connection(StoredConnection {
         id:"checkout".to_owned(), name:"Checkout source".to_owned(), integration_id:"elasticsearch".to_owned(),
@@ -735,11 +686,9 @@ async fn assert_ai_investigation_cursor_batches(multiple_pages: bool) {
         body["findings"][0]["evidence"][0]["record_ids"],
         json!(["event-1", "event-2"])
     );
-    assert_eq!(body["sources"][0]["records_examined"], records_examined);
-    assert_eq!(
-        body["sources"][0]["batches_processed"],
-        if multiple_pages { 2 } else { 1 }
-    );
+    assert_eq!(body["findings"][0]["evidence"][0]["count"], 102);
+    assert_eq!(body["sources"][0]["records_examined"], 2);
+    assert_eq!(body["sources"][0]["batches_processed"], 1);
     assert!(body["sources"][0]["query_summary"]
         .as_str()
         .unwrap()
@@ -752,7 +701,7 @@ async fn assert_ai_investigation_cursor_batches(multiple_pages: bool) {
     assert_eq!(body["token_usage"].as_array().unwrap().len(), 2);
     assert_eq!(
         body["token_usage"][1],
-        json!({"stage":"analysis","prompt_tokens":420 * analysis_calls,"completion_tokens":96 * analysis_calls,"total_tokens":516 * analysis_calls})
+        json!({"stage":"hypothesis","prompt_tokens":420 * analysis_calls,"completion_tokens":96 * analysis_calls,"total_tokens":516 * analysis_calls})
     );
     for secret in [
         "source-private-user",
@@ -770,7 +719,7 @@ async fn assert_ai_investigation_cursor_batches(multiple_pages: bool) {
             request["messages"][0]["content"]
                 .as_str()
                 .unwrap()
-                .contains("Analyze only the provided records.")
+                .contains("Form and update hypotheses")
         })
         .map(|request| {
             serde_json::from_str::<Value>(request["messages"][1]["content"].as_str().unwrap())
@@ -788,28 +737,23 @@ async fn assert_ai_investigation_cursor_batches(multiple_pages: bool) {
     assert!(first_examples
         .iter()
         .any(|example| example["record_id"] == "event-2"));
-    assert!(first_examples
+    assert!(first_examples.iter().all(|example| {
+        example["record"].get("internal_note").is_none()
+            && example["record"].get("@timestamp").is_some()
+            && example["record"].get("message").is_some()
+            && example["record"].get("service").is_some()
+    }));
+    assert_eq!(
+        analysis_inputs[0]["sources"][0]["aggregations"][0]["count"],
+        60
+    );
+    assert!(body["caveats"]
+        .as_array()
+        .unwrap()
         .iter()
-        .filter(|example| ["event-1", "event-2", "event-3"]
-            .contains(&example["record_id"].as_str().unwrap()))
-        .all(|example| example["observed_duplicate_count"] == first_page_size));
-    if multiple_pages {
-        assert!(body["sources"][0]["records_examined"].as_u64().unwrap() > 100);
-        assert_eq!(
-            body["findings"][1]["title"],
-            "Payment authorization rejected"
-        );
-        assert_eq!(
-            body["findings"][1]["evidence"][0]["record_ids"],
-            json!(["event-101", "event-102"])
-        );
-        let later_ids = first_examples
-            .iter()
-            .filter(|example| example["observed_duplicate_count"] == 2)
-            .map(|example| example["record_id"].as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(later_ids, vec!["event-101", "event-102"]);
-    }
+        .any(|caveat| caveat
+            .as_str()
+            .is_some_and(|text| text.contains("not an exhaustive scan"))));
     let all_provider_input = provider_requests
         .iter()
         .filter_map(|request| std::str::from_utf8(&request.body).ok())
