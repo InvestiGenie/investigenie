@@ -25,16 +25,16 @@ class PlaygroundScriptTests(unittest.TestCase):
         docker = self.bin / "docker"
         docker.write_text(
             "#!/usr/bin/env bash\n"
-            "if [[ \"$1\" == volume && \"$2\" == ls ]]; then\n"
+            'if [[ "$1" == volume && "$2" == ls ]]; then\n'
             "  printf '%s\\n' \"${DOCKER_VOLUMES-}\"\n"
             "  exit 0\n"
             "fi\n"
-            "if [[ \"$1\" == volume && \"$2\" == rm ]]; then\n"
-            "  if ! printf '%s\\n' \"${DOCKER_VOLUMES-}\" | grep -Fxq -- \"$4\"; then\n"
+            'if [[ "$1" == volume && "$2" == rm ]]; then\n'
+            '  if ! printf \'%s\\n\' "${DOCKER_VOLUMES-}" | grep -Fxq -- "$4"; then\n'
             "    echo 'no such volume' >&2\n"
             "    exit 1\n"
             "  fi\n"
-            "  printf '%s\\n' \"$4\" >> \"$DOCKER_REMOVED\"\n"
+            '  printf \'%s\\n\' "$4" >> "$DOCKER_REMOVED"\n'
             "  exit 0\n"
             "fi\n"
             "{\n"
