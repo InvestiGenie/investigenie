@@ -1,6 +1,7 @@
 import { Fragment, lazy, Suspense, useEffect, useRef, useState, type FormEvent } from 'react';
 import { ArrowDown, ArrowUp, ArrowUpDown, BrainCircuit, ChevronLeft, ChevronRight, Eye, EyeOff } from 'lucide-react';
-import { api, makeSearchRequest, type ConnectionSummary, type DataViewSummary, type DocumentResult, type FieldSummary, type SearchRequest, type SearchResult } from './api';
+import { api, makeSearchRequest, type ConnectionSummary, type DataViewSummary, type DocumentResult, type FieldSummary, type SearchHit, type SearchRequest, type SearchResult } from './api';
+import type { DocumentInvestigationSeed } from './InvestiGenieAIPage';
 import ConnectionsPage from './ConnectionsPage';
 import DataViewsPage from './DataViewsPage';
 import TimeRangePicker from './TimeRangePicker';
@@ -16,6 +17,24 @@ const InvestiGenieAIPage = lazy(() => import('./InvestiGenieAIPage'));
 const AIModelsPage = lazy(() => import('./AIModelsPage'));
 
 type Theme = 'light' | 'dark';
+type AppPage = 'discover' | 'investigenie-ai' | 'connections' | 'data-views' | 'ai-models';
+
+const APP_PAGE_HISTORY_KEY = 'investigeniePage';
+const APP_PAGES = new Set<AppPage>(['discover', 'investigenie-ai', 'connections', 'data-views', 'ai-models']);
+
+function appPageFromHistoryState(state: unknown): AppPage | null {
+  if (typeof state !== 'object' || state === null || Array.isArray(state)) return null;
+  const page = (state as Record<string, unknown>)[APP_PAGE_HISTORY_KEY];
+  return typeof page === 'string' && APP_PAGES.has(page as AppPage) ? page as AppPage : null;
+}
+
+function historyStateForPage(page: AppPage): Record<string, unknown> {
+  const state = window.history.state;
+  return {
+    ...(typeof state === 'object' && state !== null && !Array.isArray(state) ? state : {}),
+    [APP_PAGE_HISTORY_KEY]: page,
+  };
+}
 
 function initialTheme(): Theme {
   try {
@@ -78,7 +97,8 @@ export default function App() {
   const [connections, setConnections] = useState<ConnectionSummary[]>([]);
   const [dataViews, setDataViews] = useState<DataViewSummary[]>([]);
   const [selectedDataViewId, setSelectedDataViewId] = useState('');
-  const [activePage, setActivePage] = useState<'discover' | 'investigenie-ai' | 'connections' | 'data-views' | 'ai-models'>('investigenie-ai');
+  const [activePage, setActivePage] = useState<AppPage>('investigenie-ai');
+  const activePageRef = useRef<AppPage>(activePage);
   const [fields, setFields] = useState<FieldSummary[]>([]);
   const [fieldFilter, setFieldFilter] = useState('');
   const [selectedFieldsByView, setSelectedFieldsByView] = useState<Record<string, string[]>>({});
@@ -90,10 +110,12 @@ export default function App() {
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
   const [results, setResults] = useState<SearchResult | null>(null);
   const [selectedDocument, setSelectedDocument] = useState<DocumentResult | null>(null);
+  const [documentInvestigation, setDocumentInvestigation] = useState<DocumentInvestigationSeed | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [expandedHit, setExpandedHit] = useState<string | null>(null);
   const requestController = useRef<AbortController | null>(null);
+  const documentInvestigationCounter = useRef(0);
   const [pageNumber, setPageNumber] = useState(1);
   const [previousPages, setPreviousPages] = useState<Array<{ number: number; result: SearchResult }>>([]);
   const [forwardPages, setForwardPages] = useState<Array<{ number: number; result: SearchResult }>>([]);
@@ -102,6 +124,25 @@ export default function App() {
   const [breakdownField, setBreakdownField] = useState('');
   const [histogramVisible, setHistogramVisible] = useState(() => getPreference('histogram-visible') !== 'false');
   const appliedSearch = useRef<ReturnType<typeof makeSearchRequest> | null>(null);
+
+  useEffect(() => {
+    window.history.replaceState(historyStateForPage(activePageRef.current), '');
+    const restorePage = (event: PopStateEvent) => {
+      const page = appPageFromHistoryState(event.state);
+      if (!page) return;
+      activePageRef.current = page;
+      setActivePage(page);
+    };
+    window.addEventListener('popstate', restorePage);
+    return () => window.removeEventListener('popstate', restorePage);
+  }, []);
+
+  function navigateTo(page: AppPage) {
+    if (activePageRef.current === page) return;
+    window.history.pushState(historyStateForPage(page), '');
+    activePageRef.current = page;
+    setActivePage(page);
+  }
 
   function firstPageRequest(body: ReturnType<typeof makeSearchRequest>, choice = histogramInterval, breakdown = breakdownField): SearchRequest {
     const resolved = body.time_range ? resolveInterval(choice, body.time_range) : null;
@@ -271,6 +312,32 @@ export default function App() {
     }
   }
 
+  async function investigateDocument(hit: SearchHit) {
+    if (!selectedDataView || !selectedConnectionId) return;
+    setError('');
+    try {
+      let source = hit.source;
+      if (queryMetadata?.document_mode !== 'inline') {
+        const document = await api.document(selectedConnectionId, { index: hit.index, id: hit.id });
+        if (!document.found) throw new Error(`Document ${hit.id} was not found in ${hit.index}.`);
+        source = document.source;
+      }
+      documentInvestigationCounter.current += 1;
+      setDocumentInvestigation({
+        requestId: `${Date.now()}-${documentInvestigationCounter.current}`,
+        dataViewId: selectedDataView.id,
+        dataViewName: selectedDataView.name,
+        index: hit.index,
+        documentId: hit.id,
+        source,
+        timeRange: appliedSearch.current?.time_range ?? null,
+      });
+      navigateTo('investigenie-ai');
+    } catch (reason) {
+      setError(errorMessage(reason, 'Could not load the document for investigation.'));
+    }
+  }
+
   async function nextPage() {
     if (!results || !appliedSearch.current || loading) return;
     const cached = forwardPages.at(-1);
@@ -414,14 +481,14 @@ export default function App() {
       <aside className="rail" aria-label="Primary navigation">
         <div className="rail-brand"><img className="brand-mark" src={investigenieSpark} alt="" aria-label="InvestiGenie" /><span className="nav-label" aria-hidden="true">InvestiGenie</span></div>
         <nav className="rail-nav" aria-label="Main menu">
-          <button className={`rail-button${activePage === 'investigenie-ai' ? ' active' : ''}`} aria-label="InvestiGenie AI" title="InvestiGenie AI" onClick={() => setActivePage('investigenie-ai')}><span className="rail-icon" aria-hidden="true"><BrainCircuit size={19} /></span><span className="nav-label">InvestiGenie AI</span></button>
-          <button className={`rail-button${activePage === 'discover' ? ' active' : ''}`} aria-label="Explore" title="Explore" onClick={() => setActivePage('discover')}><span className="rail-icon" aria-hidden="true">⌕</span><span className="nav-label">Explore</span></button>
+          <button className={`rail-button${activePage === 'investigenie-ai' ? ' active' : ''}`} aria-label="InvestiGenie AI" title="InvestiGenie AI" onClick={() => navigateTo('investigenie-ai')}><span className="rail-icon" aria-hidden="true"><BrainCircuit size={19} /></span><span className="nav-label">InvestiGenie AI</span></button>
+          <button className={`rail-button${activePage === 'discover' ? ' active' : ''}`} aria-label="Explore" title="Explore" onClick={() => navigateTo('discover')}><span className="rail-icon" aria-hidden="true">⌕</span><span className="nav-label">Explore</span></button>
           <button className="rail-button" aria-label="Dashboard" title="Dashboard" disabled><span className="rail-icon" aria-hidden="true">▦</span><span className="nav-label">Dashboard</span></button>
           <div className="rail-nav-group" role="group" aria-label="Management">
             <span className="rail-group-label">Management</span>
-            <button className={`rail-button${activePage === 'ai-models' ? ' active' : ''}`} aria-label="AI Models" title="AI Models" onClick={() => setActivePage('ai-models')}><span className="rail-icon" aria-hidden="true"><BrainCircuit size={18} /></span><span className="nav-label">AI Models</span></button>
-            <button className={`rail-button${activePage === 'connections' ? ' active' : ''}`} aria-label="Connections" title="Connections" onClick={() => setActivePage('connections')}><span className="rail-icon" aria-hidden="true">⌘</span><span className="nav-label">Connections</span></button>
-            <button className={`rail-button${activePage === 'data-views' ? ' active' : ''}`} aria-label="Data Views" title="Data Views" onClick={() => setActivePage('data-views')}><span className="rail-icon" aria-hidden="true">◫</span><span className="nav-label">Data Views</span></button>
+            <button className={`rail-button${activePage === 'ai-models' ? ' active' : ''}`} aria-label="AI Models" title="AI Models" onClick={() => navigateTo('ai-models')}><span className="rail-icon" aria-hidden="true"><BrainCircuit size={18} /></span><span className="nav-label">AI Models</span></button>
+            <button className={`rail-button${activePage === 'connections' ? ' active' : ''}`} aria-label="Connections" title="Connections" onClick={() => navigateTo('connections')}><span className="rail-icon" aria-hidden="true">⌘</span><span className="nav-label">Connections</span></button>
+            <button className={`rail-button${activePage === 'data-views' ? ' active' : ''}`} aria-label="Data Views" title="Data Views" onClick={() => navigateTo('data-views')}><span className="rail-icon" aria-hidden="true">◫</span><span className="nav-label">Data Views</span></button>
           </div>
         </nav>
         <div className="rail-bottom"><button className="rail-toggle" aria-label={navExpanded ? 'Collapse menu' : 'Expand menu'} title={navExpanded ? 'Collapse menu' : 'Expand menu'} aria-expanded={navExpanded} onClick={() => setNavExpanded((expanded) => !expanded)}><span aria-hidden="true">{navExpanded ? '‹' : '›'}</span><span className="nav-label">{navExpanded ? 'Collapse' : 'Expand menu'}</span></button></div>
@@ -434,7 +501,7 @@ export default function App() {
         </header>
 
         {activePage === 'investigenie-ai'
-          ? <Suspense fallback={<div className="loading-state"><span className="spinner dark" /> Loading InvestiGenie AI…</div>}><InvestiGenieAIPage dataViews={dataViews} onManageModels={() => setActivePage('ai-models')} /></Suspense>
+          ? <Suspense fallback={<div className="loading-state"><span className="spinner dark" /> Loading InvestiGenie AI…</div>}><InvestiGenieAIPage dataViews={dataViews} onManageModels={() => navigateTo('ai-models')} initialDocument={documentInvestigation} onDocumentInvestigationConsumed={(requestId) => setDocumentInvestigation((current) => current?.requestId === requestId ? null : current)} /></Suspense>
           : activePage === 'ai-models'
             ? <Suspense fallback={<div className="loading-state"><span className="spinner dark" /> Loading AI models…</div>}><AIModelsPage /></Suspense>
           : activePage === 'connections'
@@ -508,7 +575,7 @@ export default function App() {
                 {results && <div className="results-timing"><span className="query-duration">Took {results.took ?? '—'} ms</span>{results.timed_out && <span className="timeout-label">Timed out; results may be partial</span>}</div>}
               </div>
 
-              {!results && !loading && !error && <div className="empty-state"><div className="empty-glyph">⌕</div>{!selectedDataView ? <><h3>No data views available</h3><button className="sample-query" onClick={() => setActivePage('data-views')}>Create data view</button></> : <><h3>Start with a search</h3><p>{queryMetadata ? applyQueryTemplate(queryMetadata.help, queryMetadata, { index: selectedIndex, query }) : ''}</p></>}</div>}
+              {!results && !loading && !error && <div className="empty-state"><div className="empty-glyph">⌕</div>{!selectedDataView ? <><h3>No data views available</h3><button className="sample-query" onClick={() => navigateTo('data-views')}>Create data view</button></> : <><h3>Start with a search</h3><p>{queryMetadata ? applyQueryTemplate(queryMetadata.help, queryMetadata, { index: selectedIndex, query }) : ''}</p></>}</div>}
               {loading && <div className="loading-state"><span className="spinner dark" /> Querying {integration?.display_name}…</div>}
               {results && !loading && results.hits.length === 0 && <div className="empty-state compact"><h3>No matching documents</h3><p>Try changing the query and search again.</p></div>}
 
@@ -530,10 +597,10 @@ export default function App() {
                         return <Fragment key={hitKey}>
                           <tr>
                             <td className="time-cell" title={timeZone}>{displayField(histogramField ?? '', timestamp)}</td>
-                            <td><button className="doc-toggle" aria-expanded={isExpanded} aria-label={`${isExpanded ? 'Collapse' : 'Expand'} document ${hit.id}`} onClick={() => setExpandedHit(isExpanded ? null : hitKey)}><span className={`disclosure${isExpanded ? ' open' : ''}`} aria-hidden="true">›</span><span className="doc-id">{hit.id}</span></button><span className="doc-message">{displayValue(message)}</span></td>
+                            <td><div className="document-row-main"><button className="doc-toggle" aria-expanded={isExpanded} aria-label={`${isExpanded ? 'Collapse' : 'Expand'} document ${hit.id}`} onClick={() => setExpandedHit(isExpanded ? null : hitKey)}><span className={`disclosure${isExpanded ? ' open' : ''}`} aria-hidden="true">›</span><span className="doc-id">{hit.id}</span></button><button type="button" className="icon-button document-investigate" aria-label={`Investigate document ${hit.id}`} title={`Send document ${hit.id} to AI for investigation`} onClick={() => void investigateDocument(hit)}><BrainCircuit size={14} aria-hidden="true" /></button></div><span className="doc-message">{displayValue(message)}</span></td>
                             {selectedFields.map((name) => <td className="selected-field-cell" key={name}>{displayField(name, sourceField(hit.source, name))}</td>)}
                           </tr>
-                          {isExpanded && <tr className="expanded-row"><td colSpan={2 + selectedFields.length}><div className="source-fields">{sourceFields.map(([name, value]) => <div className="source-field" key={name}><span className="source-field-name">{name}</span><span className="source-field-value">{displayField(name, value)}</span></div>)}</div><button className="open-document" onClick={() => queryMetadata?.document_mode === 'inline' ? setSelectedDocument({ index: hit.index, id: hit.id, found: true, source: hit.source }) : void openDocument(hit.index, hit.id)}>Open full document <span aria-hidden="true">↗</span></button></td></tr>}
+                          {isExpanded && <tr className="expanded-row"><td colSpan={2 + selectedFields.length}><div className="source-fields">{sourceFields.map(([name, value]) => <div className="source-field" key={name}><span className="source-field-name">{name}</span><span className="source-field-value">{displayField(name, value)}</span></div>)}</div><button type="button" className="open-document" onClick={() => queryMetadata?.document_mode === 'inline' ? setSelectedDocument({ index: hit.index, id: hit.id, found: true, source: hit.source }) : void openDocument(hit.index, hit.id)}>Open full document <span aria-hidden="true">↗</span></button></td></tr>}
                         </Fragment>;
                       })}
                     </tbody>

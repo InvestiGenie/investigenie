@@ -171,6 +171,9 @@ th[aria-sort="ascending"] .column-sort-button, th[aria-sort="descending"] .colum
 .time-cell { color: #697873; font: 10px var(--mono); white-space: nowrap; }
 .doc-id { display: block; overflow: hidden; color: #1f5f4e; font: 11px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
 .doc-message { display: block; overflow: hidden; margin-top: 3px; color: #73807d; text-overflow: ellipsis; white-space: nowrap; }
+.document-row-main { min-width: 0; display: flex; align-items: center; gap: 6px; }
+.document-row-main .doc-toggle { flex: 1; min-width: 0; }
+.document-investigate { flex: 0 0 31px; }
 .doc-toggle { max-width: 100%; display: flex; align-items: center; gap: 5px; padding: 0; color: inherit; background: transparent; border: 0; text-align: left; }
 .disclosure { width: 12px; flex: 0 0 12px; color: #6b8d80; font-size: 16px; line-height: 1; transition: transform .12s ease; }
 .disclosure.open { transform: rotate(90deg); }

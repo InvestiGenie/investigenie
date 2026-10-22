@@ -72,6 +72,35 @@ describe('InvestiGenieAIPage', () => {
     expect(await screen.findByText(result.summary)).toBeInTheDocument();
   });
 
+  it('starts an investigation from a selected Explore document', async () => {
+    const timeRange = { start: Date.parse('2026-10-22T10:00:00Z'), end: Date.parse('2026-10-22T10:15:00Z') };
+    const investigate = vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
+    const consumed = vi.fn();
+    render(<InvestiGenieAIPage
+      dataViews={dataViews}
+      initialDocument={{
+        requestId: 'document-request-1',
+        dataViewId: 'service-one',
+        dataViewName: 'Service 1',
+        index: 'service-one-2026.10.22',
+        documentId: 'event-17',
+        source: { message: 'gateway returned 503', service: 'checkout' },
+        timeRange,
+      }}
+      onDocumentInvestigationConsumed={consumed}
+    />);
+
+    await waitFor(() => expect(investigate).toHaveBeenCalledOnce());
+    const [prompt, selectedIds, modelId, range, controls] = investigate.mock.calls[0];
+    expect(prompt).toContain('Document ID: event-17');
+    expect(prompt).toContain('"message": "gateway returned 503"');
+    expect(selectedIds).toEqual(['service-one']);
+    expect(modelId).toBe('model-primary');
+    expect(range).toEqual(timeRange);
+    expect(controls).toEqual(defaultControls);
+    expect(consumed).toHaveBeenCalledWith('document-request-1');
+  });
+
   it('reopens a saved investigation and continues with its transcript', async () => {
     const summary = { id: 'chat-1', revision: 'revision-1', title: 'Why did checkout fail?', updated_at_ms: 10 };
     const conversation: AIConversation = {

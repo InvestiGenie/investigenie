@@ -28,6 +28,7 @@ function renderExplore() {
 describe('Discover', () => {
   beforeEach(() => {
     vi.unstubAllGlobals();
+    window.history.replaceState(null, '', window.location.href);
     clearPreference('theme');
     clearPreference('nav-expanded');
     clearPreference('timezone');
@@ -41,6 +42,20 @@ describe('Discover', () => {
   });
 
   afterEach(() => vi.restoreAllMocks());
+
+  it('uses browser history to return to the previous in-app page', async () => {
+    render(<App />);
+    await screen.findByRole('heading', { name: 'InvestiGenie AI', level: 1 });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Connections' }));
+    expect(screen.getByRole('button', { name: 'Connections' })).toHaveClass('active');
+    fireEvent.click(screen.getByRole('button', { name: 'Explore' }));
+    expect(screen.getByRole('button', { name: 'Explore' })).toHaveClass('active');
+    expect(window.history.state).toMatchObject({ investigeniePage: 'discover' });
+
+    fireEvent.popState(window, { state: { investigeniePage: 'connections' } });
+    expect(screen.getByRole('button', { name: 'Connections' })).toHaveClass('active');
+  });
 
   it('renders an empty histogram for an applied week-long timeframe', async () => {
     vi.spyOn(api, 'connections').mockResolvedValue([connectionFixture(elasticsearchIntegration)]);
@@ -167,6 +182,47 @@ describe('Discover', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled());
     expect(search).toHaveBeenCalledTimes(3);
     expect(screen.getByText('kept-page')).toBeInTheDocument();
+  });
+
+  it('investigates an expanded Explore document using its Data View and search range', async () => {
+    const dataView = { id: 'events-view', revision: 'r1', name: 'Events', connection_id: 'source', index: 'events-*', time_field: '@timestamp' };
+    vi.spyOn(api, 'connections').mockResolvedValue([connectionFixture(elasticsearchIntegration)]);
+    vi.spyOn(api, 'dataViews').mockResolvedValue([dataView]);
+    vi.spyOn(api, 'fields').mockResolvedValue([{ name: '@timestamp', field_type: 'date' }, { name: 'message', field_type: 'text' }]);
+    const search = vi.spyOn(api, 'search').mockResolvedValue({
+      took: 1,
+      timed_out: false,
+      total: 1,
+      total_relation: 'eq',
+      hits: [{ index: 'events-2026.10.22', id: 'event-17', score: null, source: { message: 'brief result' } }],
+      histogram: [],
+    });
+    const document = vi.spyOn(api, 'document').mockResolvedValue({
+      index: 'events-2026.10.22', id: 'event-17', found: true, source: { message: 'gateway returned 503', service: 'checkout' },
+    });
+    vi.mocked(api.aiModels).mockResolvedValue([{ id: 'model-primary', revision: 'r1', name: 'Primary', api_url: 'https://provider.example/v1', model: 'model-x', has_api_key: true }]);
+    const startInvestigation = vi.spyOn(api, 'startInvestigation').mockResolvedValue({
+      id: 'document-job',
+      status: 'completed',
+      progress: { stage: 'Done', records_examined: 1, batches_processed: 1, analysis_cycles: 1, elapsed_ms: 1 },
+      time_budget_seconds: 120,
+      pause_reason: null,
+      result: null,
+      error: null,
+    });
+
+    renderExplore();
+    fireEvent.click(await screen.findByRole('button', { name: 'Investigate document event-17' }));
+
+    expect(await screen.findByRole('heading', { name: 'InvestiGenie AI', level: 1 })).toBeInTheDocument();
+    await waitFor(() => expect(startInvestigation).toHaveBeenCalledOnce());
+    expect(document).toHaveBeenCalledWith('source', { index: 'events-2026.10.22', id: 'event-17' });
+    const [prompt, dataViewIds, modelId, timeRange] = startInvestigation.mock.calls[0];
+    expect(prompt).toContain('Document ID: event-17');
+    expect(prompt).toContain('"message": "gateway returned 503"');
+    expect(dataViewIds).toEqual([dataView.id]);
+    expect(modelId).toBe('model-primary');
+    expect(timeRange).toEqual(search.mock.calls[0][1].time_range);
   });
 
   it('checks each saved datasource when navigating to Connections without consuming list responses', async () => {

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import { ArrowUp, BrainCircuit, Check, CircleAlert, CirclePause, Database, Play, Search, Square, Trash2, X } from 'lucide-react';
-import { api, type AIConversation, type AIConversationSummary, type AIModelSummary, type DataViewSummary, type InvestigationJob, type InvestigationResult } from './api';
+import { api, type AIConversation, type AIConversationSummary, type AIModelSummary, type DataViewSummary, type InvestigationJob, type InvestigationResult, type SearchRequest } from './api';
 import TimeRangePicker from './TimeRangePicker';
 import { getPreference, setPreference, type PreferenceName } from './preferences';
 import { errorMessage } from './format';
@@ -9,6 +9,31 @@ const TIMEOUT_OPTIONS = [15, 30, 60, 120, 300, 600];
 const CHECK_IN_OPTIONS = [60, 120, 300, 600, 1800, 3600];
 const ACTIVE_POLL_MS = 1_000;
 const PAUSED_POLL_MS = 5_000;
+const MAX_DOCUMENT_SOURCE_CHARS = 6_000;
+
+export type DocumentInvestigationSeed = {
+  requestId: string;
+  dataViewId: string;
+  dataViewName: string;
+  index: string;
+  documentId: string;
+  source: Record<string, unknown> | null;
+  timeRange: SearchRequest['time_range'] | null;
+};
+
+function documentInvestigationPrompt(seed: DocumentInvestigationSeed): string {
+  const serializedSource = seed.source === null ? 'No document source was returned.' : JSON.stringify(seed.source, null, 2);
+  const truncated = serializedSource.length > MAX_DOCUMENT_SOURCE_CHARS;
+  const source = serializedSource.slice(0, MAX_DOCUMENT_SOURCE_CHARS);
+  return [
+    'Investigate this document for errors, anomalies, or signs of a production issue. Use the selected Data View to find relevant context and cite this document in your findings.',
+    `Data View: ${seed.dataViewName}`,
+    `Index or table: ${seed.index}`,
+    `Document ID: ${seed.documentId}`,
+    `Document source${truncated ? ' (truncated to fit the investigation prompt)' : ''}:`,
+    source,
+  ].join('\n\n');
+}
 
 function durationLabel(seconds: number): string {
   return seconds < 60 ? `${seconds} sec` : `${seconds / 60} min`;
@@ -54,9 +79,11 @@ function InvestigationResultView({ result, label }: { result: InvestigationResul
 type InvestiGenieAIPageProps = {
   dataViews: DataViewSummary[];
   onManageModels?: () => void;
+  initialDocument?: DocumentInvestigationSeed | null;
+  onDocumentInvestigationConsumed?: (requestId: string) => void;
 };
 
-export default function InvestiGenieAIPage({ dataViews, onManageModels }: InvestiGenieAIPageProps) {
+export default function InvestiGenieAIPage({ dataViews, onManageModels, initialDocument, onDocumentInvestigationConsumed }: InvestiGenieAIPageProps) {
   const [models, setModels] = useState<AIModelSummary[]>([]);
   const [modelStatus, setModelStatus] = useState<'loading' | 'ready' | 'empty' | 'failed'>('loading');
   const [modelError, setModelError] = useState('');
@@ -85,6 +112,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
   const pickerRef = useRef<HTMLDivElement>(null);
   const pickerSearchRef = useRef<HTMLInputElement>(null);
   const pickerTriggerRef = useRef<HTMLButtonElement>(null);
+  const handledDocumentRequest = useRef<string | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -119,6 +147,34 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
       });
     return () => controller.abort();
   }, [modelAttempt]);
+
+  useEffect(() => {
+    if (!initialDocument || handledDocumentRequest.current === initialDocument.requestId || modelStatus === 'loading') return;
+    if (modelStatus === 'ready' && !selectedModelId) return;
+    handledDocumentRequest.current = initialDocument.requestId;
+    onDocumentInvestigationConsumed?.(initialDocument.requestId);
+
+    const prompt = documentInvestigationPrompt(initialDocument);
+    setActiveConversation(null);
+    setJob(null);
+    setSubmittedQuestion('');
+    setQuestion(prompt);
+    setSelectedIds([initialDocument.dataViewId]);
+    setDataViewFilter('');
+    setStartDate(initialDocument.timeRange ? new Date(initialDocument.timeRange.start).toISOString().slice(0, 19) : '');
+    setEndDate(initialDocument.timeRange ? new Date(initialDocument.timeRange.end).toISOString().slice(0, 19) : '');
+    setError('');
+
+    if (!dataViews.some((view) => view.id === initialDocument.dataViewId)) {
+      setError('The document’s Data View is no longer available.');
+      return;
+    }
+    if (modelStatus !== 'ready') {
+      setError(modelStatus === 'empty' ? 'Add an AI model before investigating this document.' : modelError || 'Could not load AI models.');
+      return;
+    }
+    void startNewInvestigation(prompt, [initialDocument.dataViewId], selectedModelId, initialDocument.timeRange);
+  }, [initialDocument, modelStatus, selectedModelId, modelError, dataViews, onDocumentInvestigationConsumed]);
 
   useEffect(() => {
     if (!dataViewPickerOpen) return;
@@ -185,6 +241,29 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
     }
   }
 
+  async function startNewInvestigation(
+    prompt: string,
+    dataViewIds: string[],
+    modelId: string,
+    timeRange: SearchRequest['time_range'] | null,
+  ) {
+    setStarting(true);
+    setError('');
+    setJob(null);
+    setSubmittedQuestion(prompt);
+    try {
+      const started = await api.startInvestigation(prompt, dataViewIds, modelId, timeRange, { ai_timeout_seconds: aiTimeout, time_budget_seconds: checkIn });
+      setJob(started);
+      setQuestion('');
+      setActiveConversation(null);
+      await refreshConversations();
+    } catch (reason) {
+      setError(errorMessage(reason, 'The investigation could not be started.'));
+    } finally {
+      setStarting(false);
+    }
+  }
+
   async function openConversation(id: string) {
     if (!id) {
       setActiveConversation(null);
@@ -248,22 +327,8 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels }: Invest
       }
       return;
     }
-    setStarting(true);
-    setError('');
-    setJob(null);
-    setSubmittedQuestion(prompt);
-    try {
-      const timeRange = startDate && endDate ? { start: Date.parse(`${startDate}Z`), end: Date.parse(`${endDate}Z`) } : null;
-      const started = await api.startInvestigation(prompt, selectedIds, selectedModelId, timeRange, { ai_timeout_seconds: aiTimeout, time_budget_seconds: checkIn });
-      setJob(started);
-      setQuestion('');
-      setActiveConversation(null);
-      await refreshConversations();
-    } catch (reason) {
-      setError(errorMessage(reason, 'The investigation could not be started.'));
-    } finally {
-      setStarting(false);
-    }
+    const timeRange = startDate && endDate ? { start: Date.parse(`${startDate}Z`), end: Date.parse(`${endDate}Z`) } : null;
+    await startNewInvestigation(prompt, selectedIds, selectedModelId, timeRange);
   }
 
   async function decide(action: 'continue' | 'terminate') {
