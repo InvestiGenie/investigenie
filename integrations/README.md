@@ -4,7 +4,7 @@ Concrete data connectors live in `data_connectors/<source_id>/`; concrete AI tra
 
 For the complete implementation workflow, security restrictions, paging contract, AI compatibility requirements, and test checklist, use the [build-integration skill](../.github/skills/build-integration/SKILL.md).
 
-Your data connector converts native datasource responses into InvestiGenie's shared JSON shape. Start from [ClickHouse](data_connectors/clickhouse/mod.rs) and its [connector](data_connectors/clickhouse/connector.rs), or the [Elasticsearch connector](data_connectors/elasticsearch/connector.rs).
+Your data connector converts native datasource responses into InvestiGenie's shared JSON shape. Start from [ClickHouse](data_connectors/clickhouse/mod.rs) and its [connector](data_connectors/clickhouse/connector.rs), the [Elasticsearch connector](data_connectors/elasticsearch/connector.rs), or the [VictoriaLogs connector](data_connectors/victorialogs/mod.rs) for a LogsQL API.
 
 ## 1. Make it visible
 
@@ -47,7 +47,7 @@ Implement the [shared Connector](../backend/src/data_connectors.rs): `Send + Syn
 
 Honor `index`, `query`, `from`, `size`, optional `sort_by`/`sort_order` (`asc`/`desc`), `histogram_field`, and `time_range`. Time bounds are inclusive UTC epoch milliseconds. Filter and sort **before pagination**; aggregate the histogram across all matching records with the same filters, not just the page.
 
-For the current built-in adapters, see [integration behavior](../docs/integrations.md): Elasticsearch accepts wildcard/comma-separated index patterns with exact totals and unmapped time-field sorting. ClickHouse's optional execution limit must be omitted when blank, without fixed memory/result/overflow URL settings. Histogram-only failures preserve valid ClickHouse rows. Both adapters share `HistogramInterval::automatic` for All time breakdown intervals; keep the same interval for totals and top-value series.
+For the current built-in adapters, see [integration behavior](../docs/integrations.md): Elasticsearch accepts wildcard/comma-separated index patterns with exact totals and unmapped time-field sorting. ClickHouse's optional execution limit must be omitted when blank, without fixed memory/result/overflow URL settings. Histogram-only failures preserve valid ClickHouse rows. Both adapters share `HistogramInterval::automatic` for All time breakdown intervals; keep the same interval for totals and top-value series. VictoriaLogs provides the virtual `logs` dataset, `_time` field, bounded JSONL pages, exact hit totals, and hits-API histograms. Its offset paging is not snapshot-consistent, IDs are presentation-only, non-UTC histograms are explicitly unavailable, and AI filter translation is not implemented.
 
 ## 4. Return the Discover shape
 

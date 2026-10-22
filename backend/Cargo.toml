@@ -7,11 +7,12 @@ edition.workspace = true
 axum = "0.8"
 aes-gcm = "0.10"
 base64 = "0.22"
+chrono = "0.4"
 chrono-tz = "0.10"
 dotenvy = "0.15"
 fs2 = "0.4"
 tempfile = "3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "migrate", "macros", "json"] }
 uuid = { version = "1", features = ["v4"] }
 getrandom = "0.2"
