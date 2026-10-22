@@ -10,6 +10,7 @@ integrations/
       victorialogs/
       victoriametrics/
       prometheus/
+      loki/
    ai_connectors/
       openai/
 ```
@@ -18,7 +19,7 @@ Shared contracts and registration live in `backend/src/data_connectors.rs` and `
 
 Data connectors provide connection metadata, schema, read-only search, paging, and histograms. Their forms and Explore/Data Views behavior are metadata-driven. Investigation query translation must also support a source before AI evidence gathering can use it; adding a datasource does not automatically implement that translation.
 
-Built in: `elasticsearch` (Query DSL / Lucene), `clickhouse` (SQL `WHERE` clauses, read-only), `victorialogs` (LogsQL, read-only), `victoriametrics` (raw metrics selectors, read-only), and `prometheus` (PromQL range queries, read-only).
+Built in: `elasticsearch` (Query DSL / Lucene), `clickhouse` (SQL `WHERE` clauses, read-only), `victorialogs` (LogsQL, read-only), `victoriametrics` (raw metrics selectors, read-only), `prometheus` (PromQL range queries, read-only), and `loki` (LogQL, read-only).
 
 ClickHouse connections have an optional **Max execution time (seconds)** setting (1–600). Leave it blank to omit ClickHouse's server-side `max_execution_time`; the HTTP client still bounds each request to 15 seconds when unset. A configured limit extends the client timeout by five seconds. SQL `LIMIT` clauses bound returned rows; configure server-side memory limits in the ClickHouse user profile, since the connector does not override them per request.
 
@@ -27,6 +28,8 @@ VictoriaLogs exposes one virtual `logs` dataset and the native `_time` timestamp
 VictoriaMetrics exposes one virtual `metrics` dataset. Data Views use synthetic `_time` and `_value` fields plus discovered metric labels. Search accepts raw MetricsQL series selectors and returns raw JSONL-export samples; it does not evaluate MetricsQL functions or interpolated range-query points. Exports are capped at 50,000 samples and 16 MiB and fail explicitly if a result exceeds either cap. Pagination is local over the bounded export, so each page re-fetches the result and is not snapshot-consistent while new samples arrive. Label discovery uses VictoriaMetrics' default recent time range and may omit older-only labels. Histograms are derived from raw samples and currently support UTC only. AI filter translation is not implemented.
 
 Prometheus exposes one virtual `metrics` dataset with synthetic `_time` and `_value` fields plus labels discovered from `/api/v1/labels`. Explore runs a PromQL range query at the selected histogram step; the rows are evaluated values, not raw samples, and may include lookback-filled points. The adapter caps results at 500 series, 50,000 sample rows, and 16 MiB, failing explicitly rather than presenting truncated data as complete. Pagination is local and re-runs the range query, so it is not snapshot-consistent. Histograms count the evaluated sample rows. Prometheus warnings are treated as incomplete results. AI filter translation is not implemented.
+
+Grafana Loki exposes one virtual `logs` dataset with synthetic `_time` and `_msg` fields plus stream labels discovered from `/loki/api/v1/labels`. Label discovery uses Loki's default recent time window and may omit older-only labels. Basic and bearer credentials are sent for an external authentication proxy; Loki itself does not provide API authorization, and `X-Scope-OrgID` is a tenant selector, not an authorization boundary. Explore queries use Loki's nanosecond `[start,end)` bounds, translating the app's inclusive millisecond end. Results are capped at 5,000 entries and 16 MiB; a saturated result is rejected rather than treated as complete. Pagination is local and re-runs the bounded query, so it is not snapshot-consistent. Histograms count returned log lines and currently support UTC only. AI LogQL translation is not implemented.
 
 ## Create one with the AI skill (recommended)
 
