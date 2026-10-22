@@ -8,6 +8,7 @@ integrations/
       elasticsearch/
       clickhouse/
       victorialogs/
+      victoriametrics/
    ai_connectors/
       openai/
 ```
@@ -16,11 +17,13 @@ Shared contracts and registration live in `backend/src/data_connectors.rs` and `
 
 Data connectors provide connection metadata, schema, read-only search, paging, and histograms. Their forms and Explore/Data Views behavior are metadata-driven. Investigation query translation must also support a source before AI evidence gathering can use it; adding a datasource does not automatically implement that translation.
 
-Built in: `elasticsearch` (Query DSL / Lucene), `clickhouse` (SQL `WHERE` clauses, read-only), and `victorialogs` (LogsQL, read-only).
+Built in: `elasticsearch` (Query DSL / Lucene), `clickhouse` (SQL `WHERE` clauses, read-only), `victorialogs` (LogsQL, read-only), and `victoriametrics` (raw metrics selectors, read-only).
 
 ClickHouse connections have an optional **Max execution time (seconds)** setting (1–600). Leave it blank to omit ClickHouse's server-side `max_execution_time`; the HTTP client still bounds each request to 15 seconds when unset. A configured limit extends the client timeout by five seconds. SQL `LIMIT` clauses bound returned rows; configure server-side memory limits in the ClickHouse user profile, since the connector does not override them per request.
 
 VictoriaLogs exposes one virtual `logs` dataset and the native `_time` timestamp field. The adapter supports HTTP Basic authentication and `AccountID` / `ProjectID` tenant headers. It returns bounded JSON Lines pages and uses the native hits API for exact totals and histograms. Row IDs are presentation-only, and offset paging is not snapshot-consistent under concurrent ingestion. Histograms currently support UTC only; a non-UTC histogram returns an explicit unavailable reason without discarding log rows. The connector does not yet add VictoriaLogs filter translation to AI investigations.
+
+VictoriaMetrics exposes one virtual `metrics` dataset. Data Views use synthetic `_time` and `_value` fields plus discovered metric labels. Search accepts raw MetricsQL series selectors and returns raw JSONL-export samples; it does not evaluate MetricsQL functions or interpolated range-query points. Exports are capped at 50,000 samples and 16 MiB and fail explicitly if a result exceeds either cap. Pagination is local over the bounded export, so each page re-fetches the result and is not snapshot-consistent while new samples arrive. Label discovery uses VictoriaMetrics' default recent time range and may omit older-only labels. Histograms are derived from raw samples and currently support UTC only. AI filter translation is not implemented.
 
 ## Create one with the AI skill (recommended)
 
