@@ -65,6 +65,14 @@ Choose the native query language, read-only credentials, stable record identity,
 - `total_relation: eq` means exact count; `gte` means a lower bound. Never report page length as an exact total of a larger query. Prefer an honest lower bound over an expensive count on every page.
 - Supply `columns` when projected columns determine valid sorting. Implement every advertised sort and deterministic tie-breaking, including equal timestamps.
 
+### BigQuery datasource notes
+
+- Connections target one explicit billing project and dataset, use the Google BigQuery API root, and accept a service-account JSON key only after validating its OAuth token URI against Google's token endpoints. The key is secret configuration; warn users that user-managed service-account keys are high-risk and recommend keyless identity where available.
+- Grant BigQuery Job User on the billing project and dataset-level read-only access. The dataset setting scopes discovery/schema, not arbitrary custom SQL; the service account's IAM grants determine every resource a query may read.
+- Accept only one parsed BigQuery Standard SQL query statement. Set `maximumBytesBilled` to 10 GiB on every query job, including histogram jobs. Treat it as a per-job cap, not a total request budget.
+- Use BigQuery's `pageToken` for continuation, return exact job totals, cap pages at 100 rows and responses at 16 MiB, and keep cursors bound to the same job/query. IDs are job-relative presentation IDs; do not advertise document lookup.
+- Time filters and histograms require a schema-confirmed DATE, DATETIME, or TIMESTAMP field. Histogram failure must not discard successful query rows; All time uses automatic interval selection from bounded extents.
+
 ## Pagination and Resource Restrictions
 
 - `cursor: null` or omission is legacy offset mode. `cursor: ""` starts a paginated scan; a nonempty cursor continues it. Responses return `next_cursor` only when continuation is possible; absence/null means exhausted.

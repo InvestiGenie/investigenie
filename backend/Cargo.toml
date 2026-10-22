@@ -13,6 +13,7 @@ dotenvy = "0.15"
 fs2 = "0.4"
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+sqlparser = { version = "0.63", default-features = false, features = ["recursive-protection", "std"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "migrate", "macros", "json"] }
 uuid = { version = "1", features = ["v4"] }
 getrandom = "0.2"
@@ -24,6 +25,7 @@ tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+yup-oauth2 = { version = "12", default-features = false, features = ["hyper-rustls", "ring", "service-account"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
