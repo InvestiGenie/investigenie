@@ -857,7 +857,7 @@ impl Connector for BigQueryClient {
     fn test_connection(&self) -> ConnectorFuture<'_, ()> {
         Box::pin(async move {
             let auth = self.authenticator().await?;
-            let token = self.access_token(&auth).await?;
+            let token = self.access_token(auth).await?;
             self.test_connection_with_token(&token).await?;
             Ok(())
         })
@@ -866,7 +866,7 @@ impl Connector for BigQueryClient {
     fn indices(&self) -> ConnectorFuture<'_, Vec<IndexSummary>> {
         Box::pin(async move {
             let auth = self.authenticator().await?;
-            let token = self.access_token(&auth).await?;
+            let token = self.access_token(auth).await?;
             Ok(self
                 .list_tables_with_token(&token)
                 .await?
@@ -883,7 +883,7 @@ impl Connector for BigQueryClient {
     fn fields<'a>(&'a self, index: &'a str) -> ConnectorFuture<'a, Vec<FieldSummary>> {
         Box::pin(async move {
             let auth = self.authenticator().await?;
-            let token = self.access_token(&auth).await?;
+            let token = self.access_token(auth).await?;
             Ok(self
                 .fields_with_token(index, &token)
                 .await?
@@ -918,7 +918,7 @@ impl Connector for BigQueryClient {
             validate_query(&query)?;
 
             let auth = self.authenticator().await?;
-            let token = self.access_token(&auth).await?;
+            let token = self.access_token(auth).await?;
             let schema_fields = if request.histogram_field.is_some()
                 || request.histogram_breakdown_field.is_some()
             {
@@ -1145,6 +1145,105 @@ impl From<BigQueryError> for ConnectorError {
             message: message.to_owned(),
         }
     }
+}
+
+fn is_time_type(field_type: &str) -> bool {
+    matches!(
+        field_type.to_ascii_uppercase().as_str(),
+        "DATE" | "DATETIME" | "TIMESTAMP"
+    )
+}
+
+fn build_search_sql(
+    query: &str,
+    request: &SearchRequest,
+    time_field: Option<&(String, String)>,
+) -> Result<String, BigQueryError> {
+    let mut sql = format!("SELECT __ig_source.* FROM ({query}) AS __ig_source");
+    if let Some(range) = request.time_range.as_ref() {
+        if !range.is_valid() {
+            return Err(BigQueryError::InvalidQuery);
+        }
+        let (field, _) = time_field.ok_or(BigQueryError::InvalidQuery)?;
+        let field = quote_field_path(field)?;
+        sql.push_str(&format!(
+            " WHERE TIMESTAMP(__ig_source.{field}) BETWEEN TIMESTAMP_MILLIS({}) AND TIMESTAMP_MILLIS({})",
+            range.start, range.end
+        ));
+    }
+    if let Some(field) = request.sort_by.as_deref() {
+        let field = quote_field_path(field)?;
+        let order = match request.sort_order.as_deref().unwrap_or("asc") {
+            "asc" => "ASC",
+            "desc" => "DESC",
+            _ => return Err(BigQueryError::InvalidQuery),
+        };
+        sql.push_str(&format!(" ORDER BY __ig_source.{field} {order}"));
+    } else if request
+        .sort_order
+        .as_deref()
+        .is_some_and(|order| order != "asc")
+    {
+        return Err(BigQueryError::InvalidQuery);
+    }
+    validate_query(&sql)?;
+    Ok(sql)
+}
+
+fn timestamp_bucket_expression(
+    timestamp: &str,
+    interval: HistogramInterval,
+    time_zone: &str,
+) -> String {
+    let fixed_seconds = match interval.unit {
+        crate::search::IntervalUnit::Millisecond => None,
+        crate::search::IntervalUnit::Second => Some(i64::from(interval.count)),
+        crate::search::IntervalUnit::Minute => Some(i64::from(interval.count) * 60),
+        crate::search::IntervalUnit::Hour => Some(i64::from(interval.count) * 3_600),
+        crate::search::IntervalUnit::Day if interval.count > 1 => {
+            Some(i64::from(interval.count) * 86_400)
+        }
+        crate::search::IntervalUnit::Week
+        | crate::search::IntervalUnit::Month
+        | crate::search::IntervalUnit::Year
+        | crate::search::IntervalUnit::Day => None,
+    };
+    if interval.unit == crate::search::IntervalUnit::Millisecond {
+        let millis = interval.count;
+        format!("TIMESTAMP_MILLIS(DIV(UNIX_MILLIS({timestamp}), {millis}) * {millis})")
+    } else if let Some(seconds) = fixed_seconds {
+        format!("TIMESTAMP_SECONDS(DIV(UNIX_SECONDS({timestamp}), {seconds}) * {seconds})")
+    } else {
+        let part = match interval.unit {
+            crate::search::IntervalUnit::Day => "DAY",
+            crate::search::IntervalUnit::Week => "WEEK",
+            crate::search::IntervalUnit::Month => "MONTH",
+            crate::search::IntervalUnit::Year => "YEAR",
+            _ => unreachable!(),
+        };
+        format!("TIMESTAMP_TRUNC({timestamp}, {part}, '{time_zone}')")
+    }
+}
+
+fn parse_timestamp_value(value: &Value) -> Option<i64> {
+    let value = value.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.timestamp_millis())
+        .or_else(|| {
+            let value = value.replace(' ', "T");
+            chrono::DateTime::parse_from_rfc3339(&value)
+                .ok()
+                .map(|timestamp| timestamp.timestamp_millis())
+        })
+}
+
+fn valid_job_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
 }
 
 #[cfg(test)]
@@ -1509,103 +1608,4 @@ mod tests {
         let config = serde_json::from_value(invalid).unwrap();
         assert!(connect(&config).is_err());
     }
-}
-
-fn is_time_type(field_type: &str) -> bool {
-    matches!(
-        field_type.to_ascii_uppercase().as_str(),
-        "DATE" | "DATETIME" | "TIMESTAMP"
-    )
-}
-
-fn build_search_sql(
-    query: &str,
-    request: &SearchRequest,
-    time_field: Option<&(String, String)>,
-) -> Result<String, BigQueryError> {
-    let mut sql = format!("SELECT __ig_source.* FROM ({query}) AS __ig_source");
-    if let Some(range) = request.time_range.as_ref() {
-        if !range.is_valid() {
-            return Err(BigQueryError::InvalidQuery);
-        }
-        let (field, _) = time_field.ok_or(BigQueryError::InvalidQuery)?;
-        let field = quote_field_path(&field)?;
-        sql.push_str(&format!(
-            " WHERE TIMESTAMP(__ig_source.{field}) BETWEEN TIMESTAMP_MILLIS({}) AND TIMESTAMP_MILLIS({})",
-            range.start, range.end
-        ));
-    }
-    if let Some(field) = request.sort_by.as_deref() {
-        let field = quote_field_path(field)?;
-        let order = match request.sort_order.as_deref().unwrap_or("asc") {
-            "asc" => "ASC",
-            "desc" => "DESC",
-            _ => return Err(BigQueryError::InvalidQuery),
-        };
-        sql.push_str(&format!(" ORDER BY __ig_source.{field} {order}"));
-    } else if request
-        .sort_order
-        .as_deref()
-        .is_some_and(|order| order != "asc")
-    {
-        return Err(BigQueryError::InvalidQuery);
-    }
-    validate_query(&sql)?;
-    Ok(sql)
-}
-
-fn timestamp_bucket_expression(
-    timestamp: &str,
-    interval: HistogramInterval,
-    time_zone: &str,
-) -> String {
-    let fixed_seconds = match interval.unit {
-        crate::search::IntervalUnit::Millisecond => None,
-        crate::search::IntervalUnit::Second => Some(i64::from(interval.count)),
-        crate::search::IntervalUnit::Minute => Some(i64::from(interval.count) * 60),
-        crate::search::IntervalUnit::Hour => Some(i64::from(interval.count) * 3_600),
-        crate::search::IntervalUnit::Day if interval.count > 1 => {
-            Some(i64::from(interval.count) * 86_400)
-        }
-        crate::search::IntervalUnit::Week
-        | crate::search::IntervalUnit::Month
-        | crate::search::IntervalUnit::Year
-        | crate::search::IntervalUnit::Day => None,
-    };
-    if interval.unit == crate::search::IntervalUnit::Millisecond {
-        let millis = interval.count;
-        format!("TIMESTAMP_MILLIS(DIV(UNIX_MILLIS({timestamp}), {millis}) * {millis})")
-    } else if let Some(seconds) = fixed_seconds {
-        format!("TIMESTAMP_SECONDS(DIV(UNIX_SECONDS({timestamp}), {seconds}) * {seconds})")
-    } else {
-        let part = match interval.unit {
-            crate::search::IntervalUnit::Day => "DAY",
-            crate::search::IntervalUnit::Week => "WEEK",
-            crate::search::IntervalUnit::Month => "MONTH",
-            crate::search::IntervalUnit::Year => "YEAR",
-            _ => unreachable!(),
-        };
-        format!("TIMESTAMP_TRUNC({timestamp}, {part}, '{time_zone}')")
-    }
-}
-
-fn parse_timestamp_value(value: &Value) -> Option<i64> {
-    let value = value.as_str()?;
-    chrono::DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|timestamp| timestamp.timestamp_millis())
-        .or_else(|| {
-            let value = value.replace(' ', "T");
-            chrono::DateTime::parse_from_rfc3339(&value)
-                .ok()
-                .map(|timestamp| timestamp.timestamp_millis())
-        })
-}
-
-fn valid_job_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 256
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
 }
