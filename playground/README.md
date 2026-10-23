@@ -128,6 +128,8 @@ Each failure is classified as a `wrong-answer` (completed but missed the root ca
 
 `--fail-on pipeline-error` makes the exit code depend only on the flow breaking, not on wrong answers. The nightly `playground-eval.yml` workflow uses that with `qwen2.5:0.5b`, which is too small to answer well but quickly shows when a change breaks investigations. In GitHub Actions the scorecard is also written to the job summary.
 
+The workflow uploads the JSON reports as the `playground-ai-evaluation` artifact. On failure, it also includes `services.log` with the last 200 log lines from each of InvestiGenie and Ollama, captured before teardown.
+
 It prints a scorecard (passes, keywords, failure kinds, average time, tokens) and writes the full results, including summaries and findings, to `playground/reports/ai-eval-<timestamp>.json`. Without Docker, run `python3 playground/ai_eval.py --help` directly against the published ports. It uses only the standard library.
 
 ## Configuration

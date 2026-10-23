@@ -47,6 +47,12 @@ jobs:
             --max-continues 2 \
             --fail-on pipeline-error \
             --summary-file /reports/summary.md
+      - name: Capture failure diagnostics
+        if: failure()
+        run: |
+          mkdir -p playground/reports
+          docker compose -f playground/compose.yaml --profile ollama logs \
+            --no-color --tail 200 investigenie ollama > playground/reports/services.log
       - name: Publish evaluation summary
         if: always()
         shell: bash
@@ -61,7 +67,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: playground-ai-evaluation
-          path: playground/reports/*.json
+          path: |
+            playground/reports/*.json
+            playground/reports/services.log
           if-no-files-found: ignore
           retention-days: 30
       - name: Stop playground
