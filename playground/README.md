@@ -126,7 +126,7 @@ For each model and scenario, the harness does the following:
 
 Each failure is classified as a `wrong-answer` (completed but missed the root cause), `incomplete` (stopped or partial) or `pipeline-error` (timeout, unparseable model output, provider error). This separates "the model reasoned badly" from "the model or the flow broke".
 
-`--fail-on pipeline-error` makes the exit code depend only on the flow breaking, not on wrong answers. The nightly `playground-eval.yml` workflow uses that with `qwen2.5:0.5b`, which is too small to answer well but quickly shows when a change breaks investigations. In GitHub Actions the scorecard is also written to the job summary.
+`--fail-on pipeline-error` makes the exit code depend only on the flow breaking, not on wrong answers. The nightly `playground-eval.yml` workflow uses that with `qwen2.5:1.5b` as a CPU-friendly flow smoke test, not an answer-quality gate. The 0.5B model triggered Ollama HTTP 500 errors during structured generation in repeated runs; the 1.5B comparison completed without pipeline errors. In GitHub Actions the scorecard is also written to the job summary.
 
 The workflow uploads the JSON reports as the `playground-ai-evaluation` artifact. On failure, it also includes `services.log` with the last 200 log lines from each of InvestiGenie and Ollama, captured before teardown.
 

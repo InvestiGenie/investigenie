@@ -32,7 +32,7 @@ Run everything on demand with `pre-commit run --all-files --hook-stage manual`. 
 
 `backend/migrations/` is excluded from the whitespace fixers on purpose: sqlx checksums applied migrations, so even a trailing newline would break existing PostgreSQL deployments. Add a new migration instead of editing one.
 
-CI (`.github/workflows/ci.yml`) also scans the checked-out repository with Gitleaks; the local Gitleaks hook scans staged changes. CI runs the same hooks plus the full Rust test suite (including the PostgreSQL tests against a service container), the frontend tests and build, the playground tests on Python 3.9 and 3.13, a Docker image build with a smoke test and a Trivy image scan, and dependency review on pull requests. CodeQL (`.github/workflows/codeql.yml`) runs on pull requests and weekly. The playground evaluation (`.github/workflows/playground-eval.yml`) runs the AI investigation flow nightly on `qwen2.5:0.5b`; trigger it manually with other models from the Actions tab.
+CI (`.github/workflows/ci.yml`) also scans the checked-out repository with Gitleaks; the local Gitleaks hook scans staged changes. CI runs the same hooks plus the full Rust test suite (including the PostgreSQL tests against a service container), the frontend tests and build, the playground tests on Python 3.9 and 3.13, a Docker image build with a smoke test and a Trivy image scan, and dependency review on pull requests. CodeQL (`.github/workflows/codeql.yml`) runs on pull requests and weekly. The playground evaluation (`.github/workflows/playground-eval.yml`) runs the AI investigation flow nightly on `qwen2.5:1.5b`; trigger it manually with other models from the Actions tab.
 
 ## Before you open a PR
 
