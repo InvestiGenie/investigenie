@@ -4,6 +4,24 @@ import { api, makeSearchRequest } from './api';
 describe('API requests', () => {
   afterEach(() => vi.unstubAllGlobals());
 
+  it('uses explicit knowledge routes and quoted revisions without retry', async () => {
+    const entry = { title: 'Runbook', kind: 'runbook' as const, status: 'draft' as const, content: 'Check pool', services: [], environments: [], connection_ids: [], data_view_ids: [], tags: [], source_url: null };
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ entry, entries: [entry] }) });
+    vi.stubGlobal('fetch', fetchMock);
+    const signal = new AbortController().signal;
+    await expect(api.knowledgeEntries(signal)).resolves.toEqual([entry]);
+    await expect(api.knowledgeEntry('entry/id', signal)).resolves.toEqual(entry);
+    await expect(api.addKnowledge(entry)).resolves.toEqual(entry);
+    await api.updateKnowledge('entry/id', entry, 'revision-1');
+    await api.removeKnowledge('entry/id', 'revision-2');
+    expect(fetchMock.mock.calls[0][1]).toEqual({ signal });
+    expect(fetchMock.mock.calls[1][0]).toContain('/api/knowledge/entry%2Fid');
+    expect(fetchMock.mock.calls[2][1].headers).toEqual({ 'Content-Type': 'application/json' });
+    expect(fetchMock.mock.calls[3][1].headers['If-Match']).toBe('"revision-1"');
+    expect(fetchMock.mock.calls[4][1].headers['If-Match']).toBe('"revision-2"');
+    expect(JSON.parse(fetchMock.mock.calls[3][1].body)).toEqual(entry);
+  });
+
   it('probes API readiness and forwards cancellation', async () => {
     const signal = new AbortController().signal;
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ status: 'ready' }) });

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
-import { ArrowUp, BrainCircuit, Check, CircleAlert, CirclePause, Database, Play, Search, Square, Trash2, X } from 'lucide-react';
-import { api, type AIConversation, type AIConversationSummary, type AIModelSummary, type DataViewSummary, type InvestigationJob, type InvestigationResult, type SearchRequest } from './api';
+import { ArrowUp, BookOpen, BrainCircuit, Check, CircleAlert, CirclePause, Database, Play, Save, Search, Square, Trash2, X } from 'lucide-react';
+import { api, type AIConversation, type AIConversationSummary, type AIModelSummary, type DataViewSummary, type InvestigationJob, type InvestigationResult, type KnowledgeInput, type SearchRequest } from './api';
 import TimeRangePicker from './TimeRangePicker';
 import { getPreference, setPreference, type PreferenceName } from './preferences';
 import { errorMessage } from './format';
@@ -51,7 +51,70 @@ function storedSeconds(name: PreferenceName, options: number[], fallback: number
 
 const activeStatuses = new Set<InvestigationJob['status']>(['running', 'stopping', 'awaiting_decision']);
 
-function InvestigationResultView({ result, label }: { result: InvestigationResult; label: string }) {
+type KnowledgeDraftContext = { investigationId: string; question: string; modelId: string; dataViewIds: string[] };
+
+function boundedUtf8(value: string, bytes: number): string {
+  return new TextDecoder().decode(new TextEncoder().encode(value).subarray(0, bytes), { stream: true });
+}
+
+function investigationKnowledgeDraft(result: InvestigationResult, context: KnowledgeDraftContext): KnowledgeInput {
+  const content = [
+    '> Unverified investigation draft. Review the evidence, confirm the cause, and record the resolution before publishing.',
+    '## Investigation reference',
+    `Investigation ID: ${context.investigationId}\n\nAI model profile: ${context.modelId}`,
+    '## Original question', context.question,
+    '## Summary', result.summary,
+    '## Findings',
+    ...result.findings.flatMap((finding) => [
+      `### ${finding.title}`, `Severity: ${finding.severity}; confidence: ${finding.confidence}.`, finding.detail,
+      ...finding.evidence.map((evidence) => `- Data View: ${evidence.data_view_name} (${evidence.data_view_id}); observed count: ${evidence.count}; record IDs: ${evidence.record_ids.join(', ') || 'None supplied'}.`),
+    ]),
+    '## Sources and query scope',
+    ...result.sources.map((source) => `### ${source.name}\n\nData View: ${source.data_view_id}\n\nIndex/table: ${source.index}\n\nRecords examined: ${source.records_examined}\n\n${source.query_summary}`),
+    '## Caveats', ...(result.caveats.length ? result.caveats.map((caveat) => `- ${caveat}`) : ['No additional caveats recorded.']),
+    '## Confirmed cause and resolution', 'Not confirmed. Add the verified cause, resolution, and recovery checks during review.',
+  ].join('\n\n');
+  const truncated = '\n\n> Content was truncated to the knowledge size limit. Review the original investigation for the full evidence and caveats.';
+  const contentBytes = new TextEncoder().encode(content).length;
+  const draft: KnowledgeInput = {
+    title: boundedUtf8(context.question.trim() || result.summary.trim() || 'Investigation draft', 256),
+    kind: 'resolved_incident', status: 'draft',
+    content: contentBytes <= 32_768 ? content : boundedUtf8(content, 32_768 - new TextEncoder().encode(truncated).length) + truncated,
+    services: [], environments: [], connection_ids: [], tags: ['investigation'], source_url: null,
+    data_view_ids: [...new Set([...context.dataViewIds, ...result.sources.map((source) => source.data_view_id)])].slice(0, 20),
+  };
+  let contentLimit = 32_768;
+  const suffixBytes = new TextEncoder().encode(truncated).length;
+  while (new TextEncoder().encode(JSON.stringify(draft)).length > 65_536 && contentLimit > suffixBytes) {
+    contentLimit = Math.floor(contentLimit / 2);
+    draft.content = boundedUtf8(content, Math.max(0, contentLimit - suffixBytes)) + truncated;
+  }
+  if (new TextEncoder().encode(JSON.stringify(draft)).length > 65_536) throw new Error('The knowledge draft scope exceeds the supported size limit.');
+  return draft;
+}
+
+function InvestigationResultView({ result, label, draftContext, onOpenKnowledge }: { result: InvestigationResult; label: string; draftContext?: KnowledgeDraftContext; onOpenKnowledge?: (id: string) => void }) {
+  const [saving, setSaving] = useState(false);
+  const [savedDraftId, setSavedDraftId] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState('');
+  const saveInFlight = useRef(false);
+
+  async function saveKnowledgeDraft() {
+    if (!draftContext || result.complete === false || saveInFlight.current || savedDraftId) return;
+    saveInFlight.current = true;
+    setSaving(true);
+    setSaveError('');
+    try {
+      const draft = await api.addKnowledge(investigationKnowledgeDraft(result, draftContext));
+      setSavedDraftId(draft.id);
+    } catch (reason) {
+      setSaveError(errorMessage(reason, 'Could not save the knowledge draft.'));
+    } finally {
+      saveInFlight.current = false;
+      setSaving(false);
+    }
+  }
+
   return <article className="ai-result">
     <div className="ai-result-label"><BrainCircuit size={15} aria-hidden="true" /> {label}</div>
     <p className="ai-summary">{result.summary}</p>
@@ -73,6 +136,12 @@ function InvestigationResultView({ result, label }: { result: InvestigationResul
       {result.sources.map((source) => <div className="ai-source-used" key={source.data_view_id}><strong>{source.name}</strong><span>{source.index} · {source.records_examined.toLocaleString()} records examined{source.batches_processed !== undefined ? ` · ${source.batches_processed.toLocaleString()} batches` : ''}</span><small>{source.query_summary}</small></div>)}
     </details>
     {result.caveats.length > 0 && <div className="ai-caveats"><strong>Limits</strong>{result.caveats.map((caveat, index) => <p key={index}>{caveat}</p>)}</div>}
+    {draftContext && result.complete !== false && <div className="ai-knowledge-actions">
+      <button type="button" className="quiet-button" disabled={saving || savedDraftId !== null} onClick={() => void saveKnowledgeDraft()}>{savedDraftId ? <Check size={15} aria-hidden="true" /> : <Save size={15} aria-hidden="true" />}{saving ? 'Saving knowledge draft...' : savedDraftId ? 'Knowledge draft saved' : 'Save as knowledge draft'}</button>
+      {savedDraftId && <span role="status">Saved as draft.</span>}
+      {savedDraftId && onOpenKnowledge && <button type="button" className="quiet-button" onClick={() => onOpenKnowledge(savedDraftId)}><BookOpen size={15} aria-hidden="true" /> Review knowledge draft</button>}
+      {saveError && <div className="alert ai-error" role="alert"><CircleAlert size={16} aria-hidden="true" /><span>{saveError}</span></div>}
+    </div>}
   </article>;
 }
 
@@ -81,9 +150,10 @@ type InvestiGenieAIPageProps = {
   onManageModels?: () => void;
   initialDocument?: DocumentInvestigationSeed | null;
   onDocumentInvestigationConsumed?: (requestId: string) => void;
+  onOpenKnowledge?: (id: string) => void;
 };
 
-export default function InvestiGenieAIPage({ dataViews, onManageModels, initialDocument, onDocumentInvestigationConsumed }: InvestiGenieAIPageProps) {
+export default function InvestiGenieAIPage({ dataViews, onManageModels, initialDocument, onDocumentInvestigationConsumed, onOpenKnowledge }: InvestiGenieAIPageProps) {
   const [models, setModels] = useState<AIModelSummary[]>([]);
   const [modelStatus, setModelStatus] = useState<'loading' | 'ready' | 'empty' | 'failed'>('loading');
   const [modelError, setModelError] = useState('');
@@ -100,6 +170,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
   const [conversationBusy, setConversationBusy] = useState(false);
   const [conversationError, setConversationError] = useState('');
   const [submittedQuestion, setSubmittedQuestion] = useState('');
+  const [submittedScope, setSubmittedScope] = useState({ dataViewIds: [] as string[], modelId: '' });
   const [starting, setStarting] = useState(false);
   const [deciding, setDeciding] = useState(false);
   const [error, setError] = useState('');
@@ -251,6 +322,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
     setError('');
     setJob(null);
     setSubmittedQuestion(prompt);
+    setSubmittedScope({ dataViewIds: [...dataViewIds], modelId });
     try {
       const started = await api.startInvestigation(prompt, dataViewIds, modelId, timeRange, { ai_timeout_seconds: aiTimeout, time_budget_seconds: checkIn });
       setJob(started);
@@ -415,7 +487,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
           ? activeConversation.messages.map((message, index) => message.role === 'user'
             ? <div className="ai-user-message" key={`${index}-user`}><span>You</span><p>{message.content}</p></div>
             : message.result
-              ? <InvestigationResultView key={`${index}-result`} result={message.result} label={message.result.complete === false ? 'Partial investigation' : 'Investigation'} />
+              ? <InvestigationResultView key={`${activeConversation.id}-${index}-result`} result={message.result} label={message.result.complete === false ? 'Partial investigation' : 'Investigation'} draftContext={{ investigationId: activeConversation.id, question: activeConversation.messages.find((item) => item.role === 'user')?.content ?? activeConversation.title, modelId: activeConversation.model_id, dataViewIds: activeConversation.data_view_ids }} onOpenKnowledge={onOpenKnowledge} />
               : <div className="ai-assistant-message" key={`${index}-assistant`}><span>InvestiGenie AI</span><p>{message.content}</p></div>)
           : submittedQuestion && <div className="ai-user-message"><span>You</span><p>{submittedQuestion}</p></div>}
         {starting && <div className="ai-thinking" role="status"><span className="spinner dark" /> Starting investigation…</div>}
@@ -438,7 +510,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
         </section>}
         {error && <div className="alert ai-error" role="alert"><CircleAlert size={16} aria-hidden="true" /><span>{error}</span></div>}
         {job?.status === 'terminated' && !result && <p className="ai-empty-sources">The investigation was stopped before any findings were produced.</p>}
-        {result && !activeConversation && <InvestigationResultView result={result} label={job?.status === 'completed' ? 'Investigation' : job && activeStatuses.has(job.status) ? 'Findings so far' : 'Partial investigation'} />}
+        {result && !activeConversation && <InvestigationResultView key={job?.id} result={result} label={job?.status === 'completed' ? 'Investigation' : job && activeStatuses.has(job.status) ? 'Findings so far' : 'Partial investigation'} draftContext={job?.status === 'completed' ? { investigationId: job.id, question: submittedQuestion, ...submittedScope } : undefined} onOpenKnowledge={onOpenKnowledge} />}
       </section>
 
       <form className="ai-composer" onSubmit={(event) => void investigate(event)}>

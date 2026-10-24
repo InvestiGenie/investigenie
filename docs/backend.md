@@ -12,6 +12,7 @@ Rust crate `investigenie-api` in `backend/` (Axum + Tokio). One binary: `investi
 | `search.rs` | `SearchRequest` and validation of time ranges, histogram intervals, breakdown fields, and timezones. |
 | `data_connectors.rs` | The datasource `Connector` trait, descriptors, secret-handling helpers, and generated registry. Implementations import `crate::data_connectors`. |
 | `storage.rs`, `storage/filesystem.rs` | Encrypted saved objects with revisions (PostgreSQL or a filesystem snapshot). |
+| `storage/knowledge.rs`, `api/knowledge.rs` | Bounded encrypted knowledge entries, revision-checked CRUD, and strict API input types. |
 | `ai.rs` | AI orchestration: metadata planning, bounded evidence gathering, hypothesis generation, JSON parsing/repair, job control, follow-up context, and model probe semantics. Uses the shared AI completion interface. |
 | `build.rs` | Finds `integrations/data_connectors/*/mod.rs` and registers datasources at compile time; AI connectors are excluded from this registry. |
 | `ai_connectors.rs` | Provider-neutral `AiConnector` trait, settings, reply/usage/error types, explicit transport modules, and default registration. |
@@ -33,6 +34,8 @@ All responses are JSON; errors are `{"error":{"code","message"}}`. Updates and d
 | `GET /api/connections/{id}/indices/{index}/documents/{doc}` | One document (lookup integrations only). |
 | `POST /api/connections/{id}/search` | Documents + histogram. |
 | `/api/data-views[/{id}]` | Data View CRUD; validated against the source. |
+| `GET, POST /api/knowledge` | List `{entries}` or create `{entry}` (201). |
+| `GET, PUT, DELETE /api/knowledge/{id}` | Read/update `{entry}` or delete (204); updates/deletes require quoted `If-Match`. |
 | `/api/ai/models[/{id}]` | AI model profiles; tested before save; the key is never returned. |
 | `POST /api/ai/investigations` | Start a background investigation (202). |
 | `GET /api/ai/investigations/{id}` | Job status, progress, partial or final result. |
@@ -67,7 +70,17 @@ API helpers `model_settings`, `prepare_ai_call`, and `probe_ai_model` share mode
 2. **Gather evidence:** the backend sends one bounded search request per selected Data View for at most four records plus a time histogram; adapters may issue additional database-side aggregation/preflight queries. Results can include a top-three-plus-`__other__` breakdown. Only four selected fields per record are retained, each capped at 256 bytes; the hypothesis payload keeps at most 16 aggregate buckets. The engine does not page through every matching record.
 3. **Form hypotheses:** the AI receives aggregate summaries and bounded sample evidence, then returns supported findings. Evidence IDs are validated against the supplied samples, and reported counts are capped by available aggregates or sample counts.
 4. **Clean the output:** model replies are parsed leniently, retried once if unusable, and unsupported evidence is removed.
-5. **Knowledge base (future):** record issue patterns, verified solutions, and investigation approaches with provenance and verification status. Retrieval may suggest a deterministic known-case path, but current findings must still come from fresh bounded evidence; unknown cases retain hypothesis generation, with observed and inferred claims distinguished. Store outcomes and false-positive feedback as reviewable proposals, and promote knowledge only after verification. Evaluate paths on shared regression cases for evidence quality, latency, and cost. Defer streaming ingestion and MCP until needed; MCP also requires authentication and per-caller authorization. No knowledge-base storage or retrieval is implemented yet. See the [investigation pipeline plan](investigation-pipeline.md).
+5. **Knowledge retrieval (future):** manual knowledge storage is implemented. The UI can explicitly copy a completed investigation into an unverified draft through the existing knowledge create route; investigations do not automatically create entries or retrieve knowledge. Future retrieval must treat published entries as candidate guidance, recheck current bounded evidence, and retain cited revision/excerpt snapshots. See the [investigation pipeline plan](investigation-pipeline.md).
+
+## Knowledge management
+
+Entries contain `title`, `kind` (`service_context`, `runbook`, `resolved_incident`), `status` (`draft`, `published`, `archived`), Markdown `content`, `services`, `environments`, `connection_ids`, `data_view_ids`, `tags`, and an optional `source_url`. Empty scope arrays mean global applicability. Scope identifiers are retained when their source is deleted; the UI labels unavailable references rather than silently broadening the scope. IDs, revisions, and created/updated timestamps are server-managed and are not accepted in mutation bodies.
+
+Both modes encrypt the complete entry, not just its content. PostgreSQL stores each encrypted payload in `knowledge_entries`; filesystem mode adds a default-empty map to existing snapshots. Updates and deletes use atomic revision checks; stale writes return 409 without retry. There is no stored revision-history browser in this milestone.
+
+Limits: 128 entries, nonblank titles up to 256 bytes, nonblank content up to 32,768 bytes, up to 20 items per scope/tag array (labels up to 128 bytes), source links up to 2,048 bytes, and API mutation bodies up to 65,536 bytes. Source links permit only HTTP/HTTPS without embedded credentials. Search/filtering is local to the bounded UI collection; no search index or embeddings are persisted.
+
+Publishing indicates editorial availability, not independent verification. Completed investigation results can be explicitly saved as drafts and reviewed through the Knowledge editor; this uses existing CRUD and does not change the storage schema. Automatic creation/publishing, automatic retrieval, immutable investigation knowledge citations, and feedback promotion are not implemented yet. The instance has no login or tenancy; anyone with access can read and modify knowledge, so protect it with the same authenticated gateway as the rest of the application.
 
 Jobs (`InvestigationJob`, `Control`) pause at the user's check-in interval or on an AI timeout and wait for continue or stop. They are kept in memory: at most 64, with finished jobs kept for 30 minutes.
 
@@ -86,7 +99,7 @@ Jobs (`InvestigationJob`, `Control`) pause at the user's check-in interval or on
 
 Quickstart (none of `PERSISTENCE_MODE`, `CONFIG_ENCRYPTION_KEY`, `DATABASE_URL` set) stores a generated key beside the data. That suits local use only.
 
-Run `investigenie-api migrate` after upgrading a PostgreSQL-backed deployment to create the AI conversation history table. Filesystem snapshots add the history map compatibly when next written.
+Run `investigenie-api migrate` after upgrading a PostgreSQL-backed deployment, including the `202610230001_knowledge.sql` migration for knowledge entries. Filesystem snapshots add optional history and knowledge maps compatibly when next written.
 
 ## Tests
 

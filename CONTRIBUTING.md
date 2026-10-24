@@ -56,6 +56,7 @@ npm run build:web
 - **No datasource special-casing in shared code:** add the capability to the integration descriptor instead.
 - **Errors:** `{"error":{"code","message"}}` with a stable `code`, and no upstream bodies or credentials.
 - **Saved objects:** writes use revisions (`If-Match`); keep them that way.
+- **Knowledge:** manual entries are encrypted in both storage modes and bounded to 128 entries with 32 KiB content each. Completed-result promotion is user-triggered and always creates an unverified draft through existing CRUD; never auto-publish findings. Keep Markdown previews free of raw HTML and external images. Publication is not verification; retrieval and investigation citation snapshots are a separate milestone. PostgreSQL upgrades require the new knowledge migration.
 - **UI:** accessible labels and roles (the tests rely on them), and both themes styled.
 - **Commits:** imperative subject ≤72 characters, plus a short body explaining what changed and why.
 

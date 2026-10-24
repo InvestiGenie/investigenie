@@ -1,5 +1,66 @@
 use super::*;
 
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn knowledge_postgres_encrypts_entries_and_serializes_concurrent_edits() {
+    let database = TestDatabase::new().await;
+    let replica = database.replica().await;
+    let input = serde_json::from_value(json!({
+        "title":"Private knowledge", "kind":"runbook", "status":"draft",
+        "content":"Private database recovery procedure"
+    }))
+    .unwrap();
+    let created = database.storage.create_knowledge(input).await.unwrap();
+    assert_eq!(
+        replica.knowledge_entry(&created.id).await.unwrap().revision,
+        created.revision
+    );
+    assert_eq!(replica.knowledge_entries().await.unwrap().len(), 1);
+    let encrypted: Vec<u8> =
+        sqlx::query_scalar("SELECT entry_encrypted FROM knowledge_entries WHERE id=$1")
+            .bind(&created.id)
+            .fetch_one(&database.storage.pool)
+            .await
+            .unwrap();
+    for plaintext in ["Private knowledge", "Private database recovery procedure"] {
+        assert!(!String::from_utf8_lossy(&encrypted).contains(plaintext));
+    }
+    let mut first = created.clone();
+    first.status = KnowledgeStatus::Published;
+    let mut second = created.clone();
+    second.status = KnowledgeStatus::Archived;
+    let (first, second) = tokio::join!(
+        database
+            .storage
+            .update_knowledge(&created.id, &created.revision, first),
+        replica.update_knowledge(&created.id, &created.revision, second)
+    );
+    assert!(matches!(
+        (&first, &second),
+        (Ok(_), Err(StorageError::Conflict)) | (Err(StorageError::Conflict), Ok(_))
+    ));
+    assert!(matches!(
+        replica
+            .remove_knowledge(&created.id, &created.revision)
+            .await,
+        Err(StorageError::Conflict)
+    ));
+    let current = replica.knowledge_entry(&created.id).await.unwrap();
+    assert_eq!(current.created_at_ms, created.created_at_ms);
+    replica
+        .remove_knowledge(&created.id, &current.revision)
+        .await
+        .unwrap();
+    assert!(database
+        .storage
+        .knowledge_entries()
+        .await
+        .unwrap()
+        .is_empty());
+    replica.close().await;
+    database.finish().await;
+}
+
 pub struct TestDatabase {
     pub options: StorageOptions,
     pub schema: String,

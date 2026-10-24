@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
-import { api } from './api';
+import { api, type AIConversation, type KnowledgeEntry } from './api';
 import { clearPreference } from './preferences';
 import { clickhouseIntegration, connectionFixture, elasticsearchIntegration, thirdIntegration } from './test-fixtures';
 
@@ -42,6 +42,58 @@ describe('Discover', () => {
   });
 
   afterEach(() => vi.restoreAllMocks());
+
+  it('saves history findings as a draft and opens the Knowledge editor for review', async () => {
+    vi.spyOn(api, 'connections').mockResolvedValue([]);
+    vi.spyOn(api, 'dataViews').mockResolvedValue([]);
+    const conversation: AIConversation = {
+      id: 'case-1', revision: 'case-revision', title: 'Payments case', model_id: 'model-original', data_view_ids: ['events'], created_at_ms: 1, updated_at_ms: 2,
+      messages: [{ role: 'user', content: 'Why did payments fail?' }, { role: 'assistant', content: 'Pool exhaustion', result: { summary: 'Pool exhaustion', complete: true, findings: [], sources: [{ data_view_id: 'events', name: 'Events', index: 'events-*', records_examined: 4, query_summary: 'Last 30 minutes' }], caveats: ['Sampled evidence'], token_usage: [] } }],
+    };
+    vi.mocked(api.aiConversations).mockResolvedValue([conversation]);
+    vi.spyOn(api, 'aiConversation').mockResolvedValue(conversation);
+    let savedDraft: KnowledgeEntry | null = null;
+    vi.spyOn(api, 'addKnowledge').mockImplementation(async (input) => { savedDraft = { ...input, id: 'draft-review', revision: 'draft-revision', created_at_ms: 1, updated_at_ms: 1 }; return savedDraft; });
+    vi.spyOn(api, 'knowledgeEntries').mockImplementation(async () => savedDraft ? [savedDraft] : []);
+    render(<App />);
+    await screen.findByRole('option', { name: conversation.title });
+    fireEvent.change(screen.getByLabelText('AI conversation history'), { target: { value: conversation.id } });
+    fireEvent.click(await screen.findByRole('button', { name: 'Save as knowledge draft' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Review knowledge draft' }));
+    expect(await screen.findByLabelText('Title', {}, { timeout: 5000 })).toHaveValue('Why did payments fail?');
+    expect(screen.getByLabelText('Status')).toHaveValue('draft');
+    expect((screen.getByLabelText('Content') as HTMLTextAreaElement).value).toContain('case-1');
+    expect(window.history.state).toMatchObject({ investigeniePage: 'knowledge' });
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Connections' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Knowledge' }));
+    await screen.findByText('Why did payments fail?');
+    expect(screen.queryByLabelText('Title')).not.toBeInTheDocument();
+  });
+
+  it('opens Knowledge through history and protects unsaved edits', async () => {
+    vi.spyOn(api, 'connections').mockResolvedValue([]);
+    vi.spyOn(api, 'dataViews').mockResolvedValue([]);
+    vi.spyOn(api, 'knowledgeEntries').mockResolvedValue([]);
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    render(<App />);
+    fireEvent.click(screen.getByRole('button', { name: 'Knowledge' }));
+    await screen.findByText('No knowledge entries');
+    expect(window.history.state).toMatchObject({ investigeniePage: 'knowledge' });
+    fireEvent.click(screen.getByRole('button', { name: 'New entry' }));
+    fireEvent.change(screen.getByLabelText('Title'), { target: { value: 'Unsaved runbook' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Connections' }));
+    expect(confirm).toHaveBeenCalled();
+    expect(screen.getByLabelText('Title')).toHaveValue('Unsaved runbook');
+    fireEvent.popState(window, { state: { investigeniePage: 'connections' } });
+    expect(screen.getByLabelText('Title')).toHaveValue('Unsaved runbook');
+    confirm.mockReturnValue(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Connections' }));
+    expect(screen.getByRole('button', { name: 'Connections' })).toHaveClass('active');
+    fireEvent.popState(window, { state: { investigeniePage: 'knowledge' } });
+    await screen.findByText('No knowledge entries');
+    expect(screen.getByRole('button', { name: 'Knowledge' })).toHaveClass('active');
+  });
 
   it('uses browser history to return to the previous in-app page', async () => {
     render(<App />);
@@ -785,7 +837,7 @@ describe('Discover', () => {
     expect(screen.getByText('Connections', { selector: '.nav-label' })).toBeInTheDocument();
     expect(screen.getByText('Data Views', { selector: '.nav-label' })).toBeInTheDocument();
     const management = screen.getByRole('group', { name: 'Management' });
-    expect(within(management).getAllByRole('button').map((button) => button.getAttribute('aria-label'))).toEqual(['AI Models', 'Connections', 'Data Views']);
+    expect(within(management).getAllByRole('button').map((button) => button.getAttribute('aria-label'))).toEqual(['Knowledge', 'AI Models', 'Connections', 'Data Views']);
     expect(within(management).getByRole('button', { name: 'Connections' })).toBeInTheDocument();
     expect(within(management).getByRole('button', { name: 'Data Views' })).toBeInTheDocument();
     expect(within(management).getByRole('button', { name: 'AI Models' })).toBeInTheDocument();

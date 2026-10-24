@@ -3,6 +3,109 @@ use crate::storage::tests::TestDatabase;
 use tower::ServiceExt;
 use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
+#[tokio::test]
+async fn knowledge_routes_manage_entries_and_enforce_revisions() {
+    let (_directory, storage) = status_storage().await;
+    let app = router("http://localhost".parse().unwrap(), storage);
+    let body = json!({"title":"Database recovery", "kind":"runbook", "status":"draft", "content":"Check the connection pool"});
+    let response = app
+        .clone()
+        .oneshot(json_request("/api/knowledge", body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(response.into_body(), 65_536)
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(&bytes).unwrap();
+    let id = created["entry"]["id"].as_str().unwrap();
+    let revision = created["entry"]["revision"].as_str().unwrap();
+    let path = format!("/api/knowledge/{id}");
+    let response = app
+        .clone()
+        .oneshot(model_request(Method::PUT, &path, Some(body.clone()), None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
+    let mut published = body.clone();
+    published["status"] = json!("published");
+    let response = app
+        .clone()
+        .oneshot(model_request(
+            Method::PUT,
+            &path,
+            Some(published),
+            Some(revision),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 65_536)
+        .await
+        .unwrap();
+    let updated: Value = serde_json::from_slice(&bytes).unwrap();
+    let current = updated["entry"]["revision"].as_str().unwrap();
+    assert_ne!(current, revision);
+    assert_eq!(updated["entry"]["status"], "published");
+    for method in [Method::PUT, Method::DELETE] {
+        let payload = (method == Method::PUT).then(|| body.clone());
+        let response = app
+            .clone()
+            .oneshot(model_request(method, &path, payload, Some(revision)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+    for target in [&path, "/api/knowledge"] {
+        assert_eq!(
+            app.clone()
+                .oneshot(model_request(Method::GET, target, None, None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        app.clone()
+            .oneshot(model_request(Method::DELETE, &path, None, Some(current)))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let response = app
+        .clone()
+        .oneshot(model_request(Method::GET, &path, None, None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    for (field, value) in [
+        ("content", json!("")),
+        ("source_url", json!("javascript:alert(1)")),
+    ] {
+        let mut invalid = body.clone();
+        invalid[field] = value;
+        assert_eq!(
+            app.clone()
+                .oneshot(json_request("/api/knowledge", invalid))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let mut forged = body;
+    forged["revision"] = json!("client-controlled");
+    assert_eq!(
+        app.oneshot(json_request("/api/knowledge", forged))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
 fn headers(revision: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(header::IF_MATCH, format!("\"{revision}\"").parse().unwrap());

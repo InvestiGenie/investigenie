@@ -15,7 +15,7 @@ flowchart LR
 
 | Part | Where | Role |
 |---|---|---|
-| Web UI | `frontend/` | Explore, Data Views, Connections, AI Models, InvestiGenie AI. Built to static files. |
+| Web UI | `frontend/` | Explore, Data Views, Connections, AI Models, Knowledge, InvestiGenie AI. Built to static files. |
 | API server | `backend/` | Routes, storage, AI investigations, and serving the built UI on the same address. |
 | Data connectors | `integrations/data_connectors/<id>/` | One folder per datasource. Discovered at build time; existing IDs remain unchanged. |
 | AI connectors | `integrations/ai_connectors/` | Concrete transports only. `openai/` implements OpenAI-compatible Chat Completions. |
@@ -38,7 +38,7 @@ flowchart LR
 
 **AI investigation:** UI starts a background job → the AI receives field names/types and plans safe filters, sample fields, and an aggregation field → the evidence engine issues bounded source queries for samples and aggregations → the AI forms hypotheses from that evidence → the UI polls the job and can continue or stop it at check-ins.
 
-The investigation evidence pipeline uses metadata-only planning, bounded sample queries and source aggregations before hypothesis generation. See [AI Investigation Pipeline](investigation-pipeline.md) for its stages and future knowledge-base boundary.
+The investigation evidence pipeline uses metadata-only planning, bounded sample queries and source aggregations before hypothesis generation. Knowledge entries are manually managed and encrypted in either persistence mode; automatic retrieval is not yet connected. See [AI Investigation Pipeline](investigation-pipeline.md) for its stages and future retrieval boundary.
 
 **AI history:** each investigation and its result are persisted in encrypted storage. Users can reopen, delete, or continue a conversation; follow-ups receive the saved transcript and findings, not a new source scan.
 

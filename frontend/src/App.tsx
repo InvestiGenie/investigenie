@@ -1,5 +1,5 @@
 import { Fragment, lazy, Suspense, useEffect, useRef, useState, type FormEvent } from 'react';
-import { ArrowDown, ArrowUp, ArrowUpDown, BrainCircuit, ChevronLeft, ChevronRight, Eye, EyeOff } from 'lucide-react';
+import { ArrowDown, ArrowUp, ArrowUpDown, BookOpen, BrainCircuit, ChevronLeft, ChevronRight, Eye, EyeOff } from 'lucide-react';
 import { api, makeSearchRequest, type ConnectionSummary, type DataViewSummary, type DocumentResult, type FieldSummary, type SearchHit, type SearchRequest, type SearchResult } from './api';
 import type { DocumentInvestigationSeed } from './InvestiGenieAIPage';
 import ConnectionsPage from './ConnectionsPage';
@@ -15,12 +15,13 @@ import investigenieSpark from './investigenie-spark.svg';
 const HistogramChart = lazy(() => import('./HistogramChart'));
 const InvestiGenieAIPage = lazy(() => import('./InvestiGenieAIPage'));
 const AIModelsPage = lazy(() => import('./AIModelsPage'));
+const KnowledgePage = lazy(() => import('./KnowledgePage'));
 
 type Theme = 'light' | 'dark';
-type AppPage = 'discover' | 'investigenie-ai' | 'connections' | 'data-views' | 'ai-models';
+type AppPage = 'discover' | 'investigenie-ai' | 'connections' | 'data-views' | 'ai-models' | 'knowledge';
 
 const APP_PAGE_HISTORY_KEY = 'investigeniePage';
-const APP_PAGES = new Set<AppPage>(['discover', 'investigenie-ai', 'connections', 'data-views', 'ai-models']);
+const APP_PAGES = new Set<AppPage>(['discover', 'investigenie-ai', 'connections', 'data-views', 'ai-models', 'knowledge']);
 
 function appPageFromHistoryState(state: unknown): AppPage | null {
   if (typeof state !== 'object' || state === null || Array.isArray(state)) return null;
@@ -99,6 +100,8 @@ export default function App() {
   const [selectedDataViewId, setSelectedDataViewId] = useState('');
   const [activePage, setActivePage] = useState<AppPage>('investigenie-ai');
   const activePageRef = useRef<AppPage>(activePage);
+  const knowledgeDirty = useRef(false);
+  const [knowledgeEntryId, setKnowledgeEntryId] = useState<string | null>(null);
   const [fields, setFields] = useState<FieldSummary[]>([]);
   const [fieldFilter, setFieldFilter] = useState('');
   const [selectedFieldsByView, setSelectedFieldsByView] = useState<Record<string, string[]>>({});
@@ -130,6 +133,12 @@ export default function App() {
     const restorePage = (event: PopStateEvent) => {
       const page = appPageFromHistoryState(event.state);
       if (!page) return;
+      if (activePageRef.current === 'knowledge' && knowledgeDirty.current && !window.confirm('Discard unsaved knowledge changes?')) {
+        window.history.pushState(historyStateForPage('knowledge'), '');
+        return;
+      }
+      knowledgeDirty.current = false;
+      setKnowledgeEntryId(null);
       activePageRef.current = page;
       setActivePage(page);
     };
@@ -139,6 +148,9 @@ export default function App() {
 
   function navigateTo(page: AppPage) {
     if (activePageRef.current === page) return;
+    if (knowledgeDirty.current && !window.confirm('Discard unsaved knowledge changes?')) return;
+    knowledgeDirty.current = false;
+    setKnowledgeEntryId(null);
     window.history.pushState(historyStateForPage(page), '');
     activePageRef.current = page;
     setActivePage(page);
@@ -486,6 +498,7 @@ export default function App() {
           <button className="rail-button" aria-label="Dashboard" title="Dashboard" disabled><span className="rail-icon" aria-hidden="true">▦</span><span className="nav-label">Dashboard</span></button>
           <div className="rail-nav-group" role="group" aria-label="Management">
             <span className="rail-group-label">Management</span>
+            <button className={`rail-button${activePage === 'knowledge' ? ' active' : ''}`} aria-label="Knowledge" title="Knowledge" onClick={() => navigateTo('knowledge')}><span className="rail-icon" aria-hidden="true"><BookOpen size={18} /></span><span className="nav-label">Knowledge</span></button>
             <button className={`rail-button${activePage === 'ai-models' ? ' active' : ''}`} aria-label="AI Models" title="AI Models" onClick={() => navigateTo('ai-models')}><span className="rail-icon" aria-hidden="true"><BrainCircuit size={18} /></span><span className="nav-label">AI Models</span></button>
             <button className={`rail-button${activePage === 'connections' ? ' active' : ''}`} aria-label="Connections" title="Connections" onClick={() => navigateTo('connections')}><span className="rail-icon" aria-hidden="true">⌘</span><span className="nav-label">Connections</span></button>
             <button className={`rail-button${activePage === 'data-views' ? ' active' : ''}`} aria-label="Data Views" title="Data Views" onClick={() => navigateTo('data-views')}><span className="rail-icon" aria-hidden="true">◫</span><span className="nav-label">Data Views</span></button>
@@ -496,14 +509,16 @@ export default function App() {
 
       <div className="workspace">
         <header className="topbar">
-          <div className="breadcrumb"><h1 className="workspace-title">{activePage === 'connections' ? 'Connections' : activePage === 'data-views' ? 'Data Views' : activePage === 'ai-models' ? 'AI Models' : activePage === 'investigenie-ai' ? 'InvestiGenie AI' : 'Explore'}</h1></div>
+          <div className="breadcrumb"><h1 className="workspace-title">{activePage === 'knowledge' ? 'Knowledge' : activePage === 'connections' ? 'Connections' : activePage === 'data-views' ? 'Data Views' : activePage === 'ai-models' ? 'AI Models' : activePage === 'investigenie-ai' ? 'InvestiGenie AI' : 'Explore'}</h1></div>
           <div className="topbar-right"><button className="theme-toggle" type="button" aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`} aria-pressed={theme === 'dark'} title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`} onClick={() => setTheme((current) => current === 'light' ? 'dark' : 'light')}><span aria-hidden="true">{theme === 'light' ? '☾' : '☀'}</span></button></div>
         </header>
 
         {activePage === 'investigenie-ai'
-          ? <Suspense fallback={<div className="loading-state"><span className="spinner dark" /> Loading InvestiGenie AI…</div>}><InvestiGenieAIPage dataViews={dataViews} onManageModels={() => navigateTo('ai-models')} initialDocument={documentInvestigation} onDocumentInvestigationConsumed={(requestId) => setDocumentInvestigation((current) => current?.requestId === requestId ? null : current)} /></Suspense>
+          ? <Suspense fallback={<div className="loading-state"><span className="spinner dark" /> Loading InvestiGenie AI…</div>}><InvestiGenieAIPage dataViews={dataViews} onManageModels={() => navigateTo('ai-models')} initialDocument={documentInvestigation} onDocumentInvestigationConsumed={(requestId) => setDocumentInvestigation((current) => current?.requestId === requestId ? null : current)} onOpenKnowledge={(id) => { navigateTo('knowledge'); setKnowledgeEntryId(id); }} /></Suspense>
           : activePage === 'ai-models'
             ? <Suspense fallback={<div className="loading-state"><span className="spinner dark" /> Loading AI models…</div>}><AIModelsPage /></Suspense>
+          : activePage === 'knowledge'
+            ? <Suspense fallback={<div className="loading-state" role="status">Loading knowledge...</div>}><KnowledgePage connections={connections} dataViews={dataViews} initialEntryId={knowledgeEntryId} onDirtyChange={(dirty) => { knowledgeDirty.current = dirty; }} /></Suspense>
           : activePage === 'connections'
           ? <ConnectionsPage connections={connections} onConnectionsChange={refreshConnections} />
           : activePage === 'data-views'

@@ -13,6 +13,7 @@ Website: [investigenie.com](https://investigenie.com) · Releases: [GitHub Relea
 - **Histogram:** auto or fixed intervals, breakdown by field (including All time), and drag-to-zoom.
 - **InvestiGenie AI:** ask a question across 1–5 Data Views. The AI plans from field metadata, gathers bounded samples and aggregations, forms cited hypotheses, reports token usage, and checks in with you on long runs.
 - **AI history:** reopen or delete encrypted conversation history and ask follow-ups using saved findings. Follow-ups do not rescan sources; active scan jobs are not resumed after a restart.
+- **Knowledge:** manually create, edit, publish, archive, restore, and delete encrypted service context, runbooks, and resolved incidents. Completed investigations can be explicitly saved as unverified knowledge drafts for review. Search by content and filter by status, type, service, and environment. Automatic investigation retrieval is a later milestone.
 - **Bring your own model:** works with any OpenAI-compatible provider, including local ones.
 - **Secure by default:** credentials are encrypted at rest, never sent to the browser or the AI, and datasources are only read.
 - **Extensible:** datasource adapters live in `integrations/data_connectors/`; AI transports live in `integrations/ai_connectors/`, starting with OpenAI-compatible Chat Completions. An AI skill guides datasource additions.

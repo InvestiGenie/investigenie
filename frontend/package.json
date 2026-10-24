@@ -1,7 +1,7 @@
 {
   "name": "investigenie-web",
   "private": true,
-  "version": "0.3.0-alpha",
+  "version": "0.4.0-alpha",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
@@ -15,7 +15,9 @@
     "lucide-react": "^1.53.0",
     "react": "^19.1.0",
     "react-day-picker": "^10.0.2",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.6.4",

@@ -1,5 +1,99 @@
 use super::*;
 
+fn knowledge_entry() -> KnowledgeEntry {
+    serde_json::from_value(json!({
+        "title": "Database recovery", "kind": "runbook", "status": "draft",
+        "content": "Private recovery procedure", "services": ["payments"],
+        "source_url": "https://example.com/runbook"
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn knowledge_lifecycle_is_encrypted_and_revision_checked() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(options(directory.path())).await.unwrap();
+    let original = storage.create_knowledge(knowledge_entry()).await.unwrap();
+    assert_eq!(storage.knowledge_entries().await.unwrap().len(), 1);
+    let mut draft = original.clone();
+    draft.status = KnowledgeStatus::Published;
+    let published = storage
+        .update_knowledge(&original.id, &original.revision, draft.clone())
+        .await
+        .unwrap();
+    assert_ne!(published.revision, original.revision);
+    assert_eq!(published.created_at_ms, original.created_at_ms);
+    assert!(matches!(
+        storage
+            .update_knowledge(&original.id, &original.revision, draft)
+            .await,
+        Err(StorageError::Conflict)
+    ));
+    assert!(matches!(
+        storage
+            .remove_knowledge(&original.id, &original.revision)
+            .await,
+        Err(StorageError::Conflict)
+    ));
+    let bytes = fs::read(directory.path().join(SNAPSHOT_NAME)).unwrap();
+    for plaintext in [
+        "Database recovery",
+        "Private recovery procedure",
+        "payments",
+    ] {
+        assert!(!String::from_utf8_lossy(&bytes).contains(plaintext));
+    }
+    drop(storage);
+    let storage = Storage::open(options(directory.path())).await.unwrap();
+    assert_eq!(
+        storage.knowledge_entry(&original.id).await.unwrap().status,
+        KnowledgeStatus::Published
+    );
+    let mut archived = published.clone();
+    archived.status = KnowledgeStatus::Archived;
+    let archived = storage
+        .update_knowledge(&original.id, &published.revision, archived)
+        .await
+        .unwrap();
+    let mut restored = archived.clone();
+    restored.status = KnowledgeStatus::Draft;
+    let restored = storage
+        .update_knowledge(&original.id, &archived.revision, restored)
+        .await
+        .unwrap();
+    storage
+        .remove_knowledge(&original.id, &restored.revision)
+        .await
+        .unwrap();
+    assert!(storage.knowledge_entries().await.unwrap().is_empty());
+    assert!(matches!(
+        storage.knowledge_entry(&original.id).await,
+        Err(StorageError::KnowledgeNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn knowledge_rejects_invalid_content_and_unsafe_source_links() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(options(directory.path())).await.unwrap();
+    for content in [String::new(), "x".repeat(32_769)] {
+        let mut entry = knowledge_entry();
+        entry.content = content;
+        assert!(matches!(
+            storage.create_knowledge(entry).await,
+            Err(StorageError::Invalid)
+        ));
+    }
+    for source in ["javascript:alert(1)", "https://user:password@example.com"] {
+        let mut entry = knowledge_entry();
+        entry.source_url = Some(source.to_owned());
+        assert!(matches!(
+            storage.create_knowledge(entry).await,
+            Err(StorageError::Invalid)
+        ));
+    }
+}
+
 fn options(path: &Path) -> PersistenceOptions {
     PersistenceOptions::Filesystem {
         path: path.to_owned(),
@@ -127,12 +221,31 @@ async fn ai_model_secrets_are_encrypted_and_profiles_survive_reopen() {
 }
 
 #[test]
-fn version_one_snapshots_without_ai_models_remain_readable() {
+fn version_one_snapshots_without_optional_collections_remain_readable() {
     let mut snapshot = serde_json::to_value(Snapshot::empty()).unwrap();
     snapshot.as_object_mut().unwrap().remove("ai_models");
+    snapshot.as_object_mut().unwrap().remove("knowledge");
     let snapshot: Snapshot = serde_json::from_value(snapshot).unwrap();
     assert!(snapshot.ai_models.is_empty());
+    assert!(snapshot.knowledge.is_empty());
     assert!(snapshot.validate().is_ok());
+}
+
+#[tokio::test]
+async fn knowledge_entry_capacity_is_bounded() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(options(directory.path())).await.unwrap();
+    for _ in 0..knowledge::MAX_KNOWLEDGE_ENTRIES {
+        storage.create_knowledge(knowledge_entry()).await.unwrap();
+    }
+    assert!(matches!(
+        storage.create_knowledge(knowledge_entry()).await,
+        Err(StorageError::Invalid)
+    ));
+    assert_eq!(
+        storage.knowledge_entries().await.unwrap().len(),
+        knowledge::MAX_KNOWLEDGE_ENTRIES
+    );
 }
 
 #[tokio::test]

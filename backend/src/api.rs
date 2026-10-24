@@ -35,6 +35,8 @@ const MAX_CONCURRENT_UPSTREAM_REQUESTS: usize = 64;
 const MAX_TRACKED_INVESTIGATIONS: usize = 64;
 const FINISHED_INVESTIGATION_RETENTION: Duration = Duration::from_secs(30 * 60);
 
+mod knowledge;
+
 type InvestigationJobs = Arc<Mutex<HashMap<String, Arc<ai::InvestigationJob>>>>;
 
 #[derive(Clone)]
@@ -102,6 +104,19 @@ pub fn router(web_origin: HeaderValue, storage: Storage) -> Router {
         .route("/api/health/ready", get(readiness))
         .route("/api/settings", get(settings).put(update_settings))
         .route("/api/integrations", get(integrations))
+        .route(
+            "/api/knowledge",
+            get(knowledge::list)
+                .post(knowledge::create)
+                .layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
+            "/api/knowledge/{id}",
+            get(knowledge::read)
+                .put(knowledge::update)
+                .delete(knowledge::remove)
+                .layer(DefaultBodyLimit::max(65_536)),
+        )
         .route("/api/connections", get(connections).post(add_connection))
         .route("/api/data-views", get(data_views).post(create_data_view))
         .route(
@@ -728,6 +743,7 @@ enum ApiError {
     Investigation(ai::InvestigationError),
     InvestigationNotFound,
     InvalidConversationMessage,
+    InvalidKnowledge,
     InvestigationDecision(&'static str),
 }
 
@@ -754,6 +770,7 @@ impl IntoResponse for ApiError {
             Self::Storage(StorageError::ViewNotFound) => (StatusCode::NOT_FOUND, "data_view_not_found", "The requested data view does not exist".to_owned()),
             Self::Storage(StorageError::AiModelNotFound) => (StatusCode::NOT_FOUND, "ai_model_not_found", "The requested AI model does not exist".to_owned()),
             Self::Storage(StorageError::AiConversationNotFound) => (StatusCode::NOT_FOUND, "ai_conversation_not_found", "The requested AI conversation does not exist".to_owned()),
+            Self::Storage(StorageError::KnowledgeNotFound) => (StatusCode::NOT_FOUND, "knowledge_not_found", "The requested knowledge entry does not exist".to_owned()),
             Self::Storage(StorageError::Invalid) => (StatusCode::BAD_REQUEST, "invalid_configuration", "Configuration fields are invalid".to_owned()),
             Self::Storage(_) => (StatusCode::SERVICE_UNAVAILABLE, "configuration_storage_unavailable", "Configuration storage is unavailable".to_owned()),
             Self::InvalidTimeRange => (
@@ -783,6 +800,7 @@ impl IntoResponse for ApiError {
             Self::Investigation(error) => (error.status, error.code, error.message),
             Self::InvestigationNotFound => (StatusCode::NOT_FOUND, "investigation_not_found", "The investigation does not exist or has expired".to_owned()),
             Self::InvalidConversationMessage => (StatusCode::BAD_REQUEST, "invalid_ai_message", "A follow-up message must contain 1 to 8000 bytes and the conversation must stay within its message limit".to_owned()),
+            Self::InvalidKnowledge => (StatusCode::BAD_REQUEST, "invalid_knowledge", "Knowledge fields are invalid or the 128-entry limit has been reached. Content must contain 1 to 32768 bytes; source links must use HTTP or HTTPS without credentials.".to_owned()),
             Self::InvestigationDecision(message) => (StatusCode::CONFLICT, "investigation_not_paused", message.to_owned()),
         };
 

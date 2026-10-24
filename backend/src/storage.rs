@@ -21,6 +21,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod filesystem;
+mod knowledge;
+pub use knowledge::{KnowledgeEntry, KnowledgeKind, KnowledgeStatus};
 
 /// History keeps at most this many conversations; creating another evicts the least recently updated.
 pub const MAX_AI_CONVERSATIONS: usize = 64;
@@ -91,6 +93,8 @@ pub enum StorageError {
     AiModelNotFound,
     #[error("AI conversation does not exist")]
     AiConversationNotFound,
+    #[error("Knowledge entry does not exist")]
+    KnowledgeNotFound,
     #[error("Configuration changed; reload before editing")]
     Conflict,
     #[error("Record is invalid")]

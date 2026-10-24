@@ -23,6 +23,8 @@ pub(super) struct Snapshot {
     pub ai_models: BTreeMap<String, StoredAiModel>,
     #[serde(default)]
     pub ai_conversations: BTreeMap<String, StoredAiConversation>,
+    #[serde(default)]
+    pub knowledge: BTreeMap<String, KnowledgeEntry>,
     pub settings: PublicSettings,
 }
 
@@ -35,6 +37,7 @@ impl Snapshot {
             views: BTreeMap::new(),
             ai_models: BTreeMap::new(),
             ai_conversations: BTreeMap::new(),
+            knowledge: BTreeMap::new(),
             settings: PublicSettings {
                 settings: json!({"theme":"system", "default_timezone":"UTC"}),
                 revision: revision(),
@@ -82,6 +85,15 @@ impl Snapshot {
         for (id, conversation) in &self.ai_conversations {
             validate_ai_conversation(conversation)?;
             if id != &conversation.id {
+                return Err(StorageError::Invalid);
+            }
+        }
+        if self.knowledge.len() > knowledge::MAX_KNOWLEDGE_ENTRIES {
+            return Err(StorageError::Invalid);
+        }
+        for (id, entry) in &self.knowledge {
+            knowledge::validate_entry(entry)?;
+            if id != &entry.id {
                 return Err(StorageError::Invalid);
             }
         }
@@ -286,7 +298,7 @@ impl FileStorage {
         .map_err(|_| StorageError::Unavailable)?
     }
 
-    async fn mutate<T: Send + 'static>(
+    pub(super) async fn mutate<T: Send + 'static>(
         self: &Arc<Self>,
         operation: impl FnOnce(&mut Snapshot) -> Result<T, StorageError> + Send + 'static,
     ) -> Result<T, StorageError> {

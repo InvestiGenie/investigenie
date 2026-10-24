@@ -74,6 +74,27 @@ export type AIModelSummary = {
   has_api_key: true;
 };
 
+export type KnowledgeKind = 'service_context' | 'runbook' | 'resolved_incident';
+export type KnowledgeStatus = 'draft' | 'published' | 'archived';
+export type KnowledgeInput = {
+  title: string;
+  kind: KnowledgeKind;
+  status: KnowledgeStatus;
+  content: string;
+  services: string[];
+  environments: string[];
+  connection_ids: string[];
+  data_view_ids: string[];
+  tags: string[];
+  source_url: string | null;
+};
+export type KnowledgeEntry = KnowledgeInput & {
+  id: string;
+  revision: string;
+  created_at_ms: number;
+  updated_at_ms: number;
+};
+
 export type AIModelRequest = {
   name: string;
   api_url: string;
@@ -263,6 +284,21 @@ function jsonMutation(method: 'POST' | 'PUT' | 'DELETE', body?: unknown, revisio
 }
 
 export const api = {
+  async knowledgeEntries(signal?: AbortSignal): Promise<KnowledgeEntry[]> {
+    return (await request<{ entries: KnowledgeEntry[] }>('/api/knowledge', { signal })).entries;
+  },
+  async knowledgeEntry(id: string, signal?: AbortSignal): Promise<KnowledgeEntry> {
+    return (await request<{ entry: KnowledgeEntry }>(`/api/knowledge/${encodeURIComponent(id)}`, { signal })).entry;
+  },
+  async addKnowledge(body: KnowledgeInput): Promise<KnowledgeEntry> {
+    return (await request<{ entry: KnowledgeEntry }>('/api/knowledge', jsonMutation('POST', body))).entry;
+  },
+  async updateKnowledge(id: string, body: KnowledgeInput, revision: string): Promise<KnowledgeEntry> {
+    return (await request<{ entry: KnowledgeEntry }>(`/api/knowledge/${encodeURIComponent(id)}`, jsonMutation('PUT', body, revision))).entry;
+  },
+  async removeKnowledge(id: string, revision: string): Promise<void> {
+    await request(`/api/knowledge/${encodeURIComponent(id)}`, jsonMutation('DELETE', undefined, revision));
+  },
   async ready(signal?: AbortSignal): Promise<void> {
     await request('/api/health/ready', { signal });
   },
