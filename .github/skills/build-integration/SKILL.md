@@ -121,7 +121,7 @@ Build-time registration makes a source available to Explore, not automatically t
 - Preserve actual provider usage accounting. Missing usage is not reported, never estimated. More distinct signals can increase cost; batching does not promise fixed total price/runtime.
 - Investigations run as in-memory background jobs (the legacy synchronous route remains). Encrypted conversation history persists in filesystem/PostgreSQL, but that is not durable scan-job resumption. Follow-ups use saved transcript/results without rescanning sources; writes/deletes require If-Match. See `docs/backend.md` for caps, routes, and migrations.
 - OpenAI transport retries explicit JSON-mode rejection once without `response_format`; backend orchestration repairs unusable JSON once. Missing/null record fields are normal, not a reason to abort analysis. Keep provider diagnostics sanitized and evidence validation intact.
-- `docs/investigation-pipeline.md` describes the metadata, evidence, hypothesis, and future knowledge-base boundaries. The knowledge base is not implemented; do not add persistence or retrieval without a separate design.
+- `docs/investigation-pipeline.md` describes metadata/evidence/hypothesis boundaries and the implemented knowledge lifecycle. Manual encrypted CRUD and explicit save-as-draft from completed live/history results are implemented; publication is not verification. Automatic creation, retrieval, and immutable investigation knowledge citations remain future work; do not imply datasource registration enables any of them.
 
 ## Required Tests and Completion Checklist
 
@@ -129,7 +129,7 @@ Build-time registration makes a source available to Explore, not automatically t
 2. Mock-upstream tests: authentication stays server-side; test/list/schema/search/document shapes; empty/one-record results; stable sorts with ties; time filters; full-query histograms; projected columns; not-found/partial/timeout errors.
 3. Paging tests: first and continuation requests, more than one page, advancement, exhaustion, full final page, duplicate timestamps, deep pages beyond legacy offsets, lower-bound/exact totals, no repeated aggregation, expiration/cleanup, and concurrent-write limitations.
 4. Security/storage tests: summaries and errors omit secrets, edits retain/replace credentials, stale `If-Match` operations fail, saved objects survive restart, and both PostgreSQL and encrypted-filesystem storage are preserved. Never ignore `backend/migrations/`.
-5. If AI-compatible: test source-specific plan translation, later-page evidence, repeated-signal counts, bounded prompts, unsupported operators, failure propagation, and real usage aggregation.
+5. If AI-compatible: test source-specific plan translation, bounded sample/aggregate evidence, supported counts, bounded prompts, unsupported operators, failure propagation, and real usage aggregation. Do not imply the AI evidence path paginates through the dataset.
 6. Validate from the repository root:
 
    ```sh

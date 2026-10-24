@@ -39,6 +39,15 @@ React 19 + TypeScript + Vite in `frontend/`. No router and no state library: `Ap
 - **API address:** production builds call the same origin. The dev server calls `http://127.0.0.1:3000` (override with `VITE_API_BASE_URL`).
 - **Shared behavior:** `jsonMutation` in `api.ts` constructs JSON mutation bodies and quoted If-Match headers while routes remain explicit. Reuse `errorMessage`/`formatCount` from `format.ts` and `ErrorAlert`/`StatusNotice` from `PageFeedback.tsx`; keep specialized polling/decision flows separate.
 
+## Knowledge workflow
+
+1. Open **Management > Knowledge > New entry** to write service context, a runbook, or an incident entry manually. Set applicability with services, environments, and optional connection/Data View checklists; empty scope arrays mean global applicability.
+2. For an existing case, reopen it from **AI conversation history** or use its completed live result. Click **Save as knowledge draft** once, then **Review knowledge draft**. This copies existing evidence into an unverified draft; it does not call the model again or publish anything. Partial or failed results do not offer this action.
+3. Review the question, investigation reference, findings, evidence, query scope, caveats, and any truncation notice. Fill in the confirmed cause, resolution, and recovery checks, and adjust the title, type, tags, and applicability before choosing **Published** and saving. Publishing is an editorial decision, not an independent verification result.
+4. Use search and status/type/service/environment filters to find entries. **Archive** keeps an entry; **Restore to draft** makes it reviewable again. Permanent deletion requires confirmation. If a revision conflict occurs, preserve your notes and reload the current entry before editing again.
+
+The knowledge page is shared by everyone who can access the instance; there is no per-user ownership or access control yet. Entries are not currently retrieved by investigations, so publishing one does not change later AI answers. Storage locations, backups, and the PostgreSQL upgrade requirement are documented in [Backend](backend.md#storage-upgrades-and-backups).
+
 ## Develop and test
 
 ```sh

@@ -132,6 +132,10 @@ The workflow uploads the JSON reports as the `playground-ai-evaluation` artifact
 
 It prints a scorecard (passes, keywords, failure kinds, average time, tokens) and writes the full results, including summaries and findings, to `playground/reports/ai-eval-<timestamp>.json`. Without Docker, run `python3 playground/ai_eval.py --help` directly against the published ports. It uses only the standard library.
 
+### Reviewing investigation knowledge
+
+The evaluation harness does not create knowledge entries. By default it deletes its investigation history after scoring; pass `--keep-history` to inspect completed cases in the UI. To retain a case as knowledge, reopen it from AI history, click **Save as knowledge draft**, then **Review knowledge draft**. Confirm the findings and fill in the cause/resolution before publishing; a completed evaluation can still contain wrong answers. Published entries are not yet retrieved by investigations and do not improve subsequent evaluations automatically.
+
 ## Configuration
 
 Copy `playground/.env.example` to `playground/.env`. The main settings:
@@ -161,7 +165,7 @@ python3 -m unittest discover -s playground/tests
 ./playground/playground.sh up --observability
 ```
 
-This adds Loki (with the same logs as JSON lines, labelled by `service_name`, `level` and `environment`), Prometheus (scraping the seeder's `playground_http_requests_total`, `playground_http_request_duration_seconds` and `playground_scenario_active` metrics) and Mimir (Prometheus remote-write target). InvestiGenie has no Loki or Prometheus connector yet. These services are for building and testing one.
+This adds Loki (with the same logs as JSON lines, labelled by `service_name`, `level` and `environment`), Prometheus (scraping the seeder's `playground_http_requests_total`, `playground_http_request_duration_seconds` and `playground_scenario_active` metrics) and Mimir (Prometheus remote-write target). InvestiGenie includes Loki and Prometheus connectors for Explore; add their connections and Data Views manually. These connectors do not yet implement AI investigation filter translation. Mimir is the stack's remote-write backend, not an additional dedicated InvestiGenie connector.
 
 ```promql
 sum by (service, status) (rate(playground_http_requests_total[5m]))

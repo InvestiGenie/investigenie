@@ -21,7 +21,7 @@ Rust crate `investigenie-api` in `backend/` (Axum + Tokio). One binary: `investi
 
 ## API
 
-All responses are JSON; errors are `{"error":{"code","message"}}`. Updates and deletes need `If-Match: "<revision>"`; a missing header returns 428 and a stale one returns 409.
+Responses are JSON except for no-content deletes such as knowledge deletion (204); errors are `{"error":{"code","message"}}`. Updates and deletes need `If-Match: "<revision>"`; a missing header returns 428 and a stale one returns 409.
 
 | Route | Purpose |
 |---|---|
@@ -46,7 +46,7 @@ All responses are JSON; errors are `{"error":{"code","message"}}`. Updates and d
 
 Explore Elasticsearch searches request exact matching totals across all selected indices rather than stopping the count at 10,000. Exact counting may cost more on large datasets. AI evidence searches disable exact hit counting and use histogram/top-value aggregates instead. All time breakdowns resolve a common bucket interval before calculating top-value series; Elasticsearch uses a min/max timestamp preflight on the same PIT when paging. The time scope remains unbounded.
 
-Both connectors use `HistogramInterval::automatic(span_millis)` in `search.rs` for automatic breakdown intervals. Keep the candidate intervals and target bucket count in that helper, not separate connector-specific lists. Elasticsearch tolerates unmapped time fields when sorting multi-index patterns; ClickHouse histogram failures preserve valid rows and report an unavailable reason. SQL `LIMIT` bounds returned rows, while ClickHouse server profiles control memory limits; fixed memory/result/overflow URL overrides are not sent.
+Elasticsearch and ClickHouse use `HistogramInterval::automatic(span_millis)` in `search.rs` for automatic breakdown intervals. Keep the candidate intervals and target bucket count in that helper, not separate connector-specific lists. Elasticsearch tolerates unmapped time fields when sorting multi-index patterns; ClickHouse histogram failures preserve valid rows and report an unavailable reason. SQL `LIMIT` bounds returned rows, while ClickHouse server profiles control memory limits; fixed memory/result/overflow URL overrides are not sent.
 
 `SearchRequest` fields: `index`, `query`, `size` (≤100), `cursor` (`""` starts a paged scan), `sort_by`/`sort_order`, `histogram_field`, `time_range` (inclusive epoch ms), `histogram_interval` (`30s`, `5m`, `1d`, `1w`, `1M`, `1y`; requires a time range, ≤1000 buckets), `histogram_breakdown_field` (top 3 values + `__other__`), `time_zone`.
 
@@ -81,6 +81,13 @@ Both modes encrypt the complete entry, not just its content. PostgreSQL stores e
 Limits: 128 entries, nonblank titles up to 256 bytes, nonblank content up to 32,768 bytes, up to 20 items per scope/tag array (labels up to 128 bytes), source links up to 2,048 bytes, and API mutation bodies up to 65,536 bytes. Source links permit only HTTP/HTTPS without embedded credentials. Search/filtering is local to the bounded UI collection; no search index or embeddings are persisted.
 
 Publishing indicates editorial availability, not independent verification. Completed investigation results can be explicitly saved as drafts and reviewed through the Knowledge editor; this uses existing CRUD and does not change the storage schema. Automatic creation/publishing, automatic retrieval, immutable investigation knowledge citations, and feedback promotion are not implemented yet. The instance has no login or tenancy; anyone with access can read and modify knowledge, so protect it with the same authenticated gateway as the rest of the application.
+
+### Storage, upgrades, and backups
+
+- Filesystem mode keeps entries inside the encrypted `configuration.snapshot` under `FILESYSTEM_PATH`, alongside the other saved objects. Quickstart mode stores the generated `encryption.key` in that directory; explicitly configured deployments obtain their key from `CONFIG_ENCRYPTION_KEY` instead.
+- PostgreSQL mode stores encrypted payloads in `knowledge_entries`. Run `investigenie-api migrate` when upgrading to 0.4.0-alpha before starting the updated server; older filesystem snapshots add an empty knowledge collection compatibly.
+- Back up the snapshot or database together with the corresponding encryption key and key ID. A different or lost key makes saved objects unreadable. Preview/test instances may use separate directories and do not merge their knowledge into another instance automatically.
+- Knowledge is server-side, not browser storage. Completing an investigation stores conversation history, not a knowledge entry; the explicit save action creates the separate draft. See the [knowledge lifecycle](investigation-pipeline.md#knowledge-lifecycle-implemented).
 
 Jobs (`InvestigationJob`, `Control`) pause at the user's check-in interval or on an AI timeout and wait for continue or stop. They are kept in memory: at most 64, with finished jobs kept for 30 minutes.
 

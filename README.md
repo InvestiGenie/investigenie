@@ -2,13 +2,14 @@
 
 **Connect every data source once. Investigate all your logs from one place.**
 
-InvestiGenie is a self-hosted log explorer with an AI investigator. Connect Elasticsearch and ClickHouse side by side, browse and chart any of them from one screen, and ask questions in plain language. The AI then reads every matching record and reports grounded findings.
+InvestiGenie is a self-hosted log explorer with an AI investigator. Browse supported log, metric, and SQL sources from one screen. AI investigations currently support Elasticsearch and ClickHouse: they plan from metadata, examine bounded samples and source aggregations, and report findings with evidence references rather than scanning every matching record.
 
 Website: [investigenie.com](https://investigenie.com) · Releases: [GitHub Releases](https://github.com/InvestiGenie/investigenie/releases)
 
 ## Features
 
 - **All sources, one UI:** connect as many datasources as you need and save Data Views over any index or table, including Elasticsearch wildcard and comma-separated index patterns.
+- **Supported datasources:** Elasticsearch, ClickHouse, BigQuery, Loki, Prometheus, VictoriaLogs, and VictoriaMetrics. Explore capabilities vary by connector; build-time registration alone does not enable AI investigations for a datasource.
 - **Explore:** query in each source's own language. You get time windows (last 15 minutes by default) and timezones, sorting, field columns, JSON inspection, and paging past 10,000 results. Elasticsearch counts matches across the entire selected pattern.
 - **Histogram:** auto or fixed intervals, breakdown by field (including All time), and drag-to-zoom.
 - **InvestiGenie AI:** ask a question across 1–5 Data Views. The AI plans from field metadata, gathers bounded samples and aggregations, forms cited hypotheses, reports token usage, and checks in with you on long runs.
@@ -30,12 +31,15 @@ Shared connector interfaces and registration stay in `backend/src/data_connector
 docker run -d --name investigenie -p 127.0.0.1:3000:3000 -v investigenie-data:/data ghcr.io/investigenie/investigenie:<version>
 ```
 
+GHCR pull access depends on package visibility and permissions. If anonymous pulls return 401, authenticate with a pull-authorized account or build locally with `docker compose up --build`; publishing a GitHub release does not itself make a container package public.
+
 **From source:** see [Contributing](CONTRIBUTING.md#setup).
 
 Then:
-1. **Connections:** add your Elasticsearch or ClickHouse endpoint.
+1. **Connections:** add a supported datasource.
 2. **Data Views:** pick a connection, index or table, and time field.
-3. **Explore** your logs, or add a provider under **AI Models** and ask **InvestiGenie AI**.
+3. **Explore** your data, or add a provider under **AI Models** and ask **InvestiGenie AI** over supported Elasticsearch or ClickHouse Data Views.
+4. **Knowledge:** create entries manually, or reopen a completed investigation in AI history and choose **Save as knowledge draft**, then **Review knowledge draft**. Review and publish entries yourself; completed investigations do not automatically add knowledge, and investigations do not retrieve knowledge yet. See the [knowledge workflow](docs/frontend.md#knowledge-workflow).
 
 > Release binaries are unsigned. On macOS, run `xattr -d com.apple.quarantine investigenie-api` once. On Windows, choose **More info → Run anyway**.
 

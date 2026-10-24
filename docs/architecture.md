@@ -5,9 +5,9 @@ InvestiGenie is one Rust server that serves a React app and a JSON API. Datasour
 ```mermaid
 flowchart LR
   Browser["Browser (React UI)"] -->|"/ and /api/*"| API["investigenie-api (Rust, Axum)"]
-  API --> Store[("Saved objects<br/>filesystem or PostgreSQL<br/>AES-GCM encrypted")]
-  API --> ES[(Elasticsearch)]
-  API --> CH[(ClickHouse)]
+  API --> Store[("Saved objects and knowledge<br/>connections, Data Views, AI profiles,<br/>settings, conversation history, knowledge entries<br/>filesystem or PostgreSQL; AES-GCM encrypted")]
+  API --> Connectors["Compiled-in data connectors<br/>Elasticsearch, ClickHouse, BigQuery<br/>Loki, Prometheus, VictoriaLogs, VictoriaMetrics"]
+  Connectors --> Sources[("Connected data sources<br/>read-only access")]
   API -->|"metadata + bounded evidence"| LLM["AI provider<br/>(OpenAI-compatible)"]
 ```
 
@@ -20,7 +20,7 @@ flowchart LR
 | Data connectors | `integrations/data_connectors/<id>/` | One folder per datasource. Discovered at build time; existing IDs remain unchanged. |
 | AI connectors | `integrations/ai_connectors/` | Concrete transports only. `openai/` implements OpenAI-compatible Chat Completions. |
 | Connector contracts | `backend/src/data_connectors.rs`, `backend/src/ai_connectors.rs` | Shared interfaces, types, and registration owned by the backend. |
-| Storage | `backend/src/storage*` | Connections, Data Views, AI model profiles, settings, and AI conversation history. Encrypted, with revisions. |
+| Storage | `backend/src/storage*` | Connections, Data Views, AI model profiles, settings, AI conversation history, and knowledge entries. Encrypted, with revisions. |
 
 ## Core concepts
 
@@ -29,6 +29,7 @@ flowchart LR
 - **Integration:** the code that talks to a datasource type and describes its UI (form fields, query language, capabilities).
 - **AI connector:** provider transport only: authentication, HTTP limits, completion decoding, usage, and protocol-specific fallbacks. Metadata planning, bounded evidence queries, hypothesis generation, JSON repair, evidence validation, job control, and history remain in the backend.
 - **AI model profile:** an OpenAI-compatible endpoint, model, and key, chosen per investigation.
+- **Knowledge entry:** scoped service context, a runbook, or an incident write-up. It is manually managed or explicitly copied from a completed investigation as an unverified draft. Publication is not verification; investigations do not retrieve entries yet.
 
 `backend/src/data_connectors.rs` owns the datasource `Connector` contract, metadata/configuration helpers, and generated registry; implementations import `crate::data_connectors`. `backend/src/ai_connectors.rs` owns `AiConnector`, `AiSettings`, `ProviderReply`, `ModelUsage`, sanitized `AiConnectorError`, and `default_connector()`, and declares concrete transport modules with explicit paths. The default is OpenAI-compatible; saved model/connection schemas and API payloads have not changed. New harness transports implement the shared completion interface and are registered explicitly in the backend contract module. There is no runtime plugin loader or AI connector selector yet. "OpenAI-compatible" describes the supported Chat Completions protocol, not every endpoint in OpenAI's API.
 
@@ -41,6 +42,8 @@ flowchart LR
 The investigation evidence pipeline uses metadata-only planning, bounded sample queries and source aggregations before hypothesis generation. Knowledge entries are manually managed and encrypted in either persistence mode; automatic retrieval is not yet connected. See [AI Investigation Pipeline](investigation-pipeline.md) for its stages and future retrieval boundary.
 
 **AI history:** each investigation and its result are persisted in encrypted storage. Users can reopen, delete, or continue a conversation; follow-ups receive the saved transcript and findings, not a new source scan.
+
+**Knowledge management:** UI creates/lists entries through `/api/knowledge` and reads/updates/deletes through `/api/knowledge/{id}`. Existing entries require the current quoted `If-Match` revision for mutations. A completed live or history result can be explicitly copied into an unverified draft; **Review knowledge draft** opens the saved entry in the editor. No model call, automatic save, publication, or retrieval is triggered by this copy. See the [knowledge lifecycle](investigation-pipeline.md#knowledge-lifecycle-implemented).
 
 ## Design rules
 
@@ -55,5 +58,5 @@ The investigation evidence pipeline uses metadata-only planning, bounded sample 
 | Shape | Storage | Notes |
 |---|---|---|
 | Release zip / single binary | Filesystem (quickstart by default) | One process serves UI + API on port 3000. |
-| Docker (`ghcr.io/investigenie/investigenie`) | Filesystem in the `/data` volume | amd64 + arm64, non-root, health check built in. |
+| Docker (`ghcr.io/investigenie/investigenie`) | Filesystem in the `/data` volume | amd64 + arm64, non-root, health check built in. Registry access depends on package visibility and pull permissions. |
 | Multiple replicas | PostgreSQL | Run `investigenie-api migrate` once per schema change. AI jobs are per-replica (in memory). |

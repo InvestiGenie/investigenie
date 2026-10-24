@@ -44,7 +44,7 @@ The repo includes the agent skill [`build-integration`](../.github/skills/build-
 
 1. Open the `investigenie/` folder in VS Code with GitHub Copilot (or another agent that reads `.github/skills`).
 2. In agent mode, ask for the integration with the details the agent cannot guess:
-   > Use the build-integration skill to add a **Loki** integration. Endpoint is HTTP with optional bearer token. Queries are LogQL. Time field is the log timestamp.
+   > Use the build-integration skill to add a new datasource. API documentation: [provide URL]. Authentication: [provide method]. Query syntax, timestamp field, paging, and aggregation endpoints: [provide details]. Check existing connectors before creating a new ID.
 3. The agent reads the contracts, scaffolds `integrations/data_connectors/<id>/`, and writes the tests.
 4. Review the result against the checklist at the end of the skill, then run the checks below.
 
@@ -66,7 +66,7 @@ The skill also works as a checklist when you write an integration by hand.
 7. **Stay safe:** read-only credentials and queries, timeouts, size limits, and errors that never include secrets.
 8. **Test it:** mock the upstream with `wiremock`. Cover settings, credentials, fields, empty results, sorting, time filters, histogram counts, paging, and errors.
 
-The full field-by-field contract and response examples are in [integrations/README.md](../integrations/README.md). Start from the closest existing data connector ([ClickHouse](../integrations/data_connectors/clickhouse/mod.rs) is the smallest).
+The full field-by-field contract and response examples are in [integrations/README.md](../integrations/README.md). Start from the closest existing data connector, such as [ClickHouse](../integrations/data_connectors/clickhouse/mod.rs) for a read-only SQL source.
 
 ## AI transports
 
@@ -88,4 +88,4 @@ npm run test:web
 npm run build:web
 ```
 
-Then start the app, add a connection on **Connections**, create a Data View, and try Explore and InvestiGenie AI against it.
+Then start the app, add a connection on **Connections**, create a Data View, and try Explore. Test InvestiGenie AI only when the source-specific investigation translation is implemented; registering a datasource alone does not enable it.
