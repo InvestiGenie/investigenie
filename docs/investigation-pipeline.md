@@ -8,8 +8,14 @@ flowchart TD
     M --> P[Evidence plan<br/>filters, sample fields, aggregation field]
     P --> V[Validate plan against metadata]
     V --> E[Evidence gathering engine]
-    E -->|bounded sample query| S[Small set of source records]
-    E -->|aggregate query| A[Time histogram and optional top values]
+    E -->|latest · max 4 rows| L[Newest sample]
+    L -->|more matches indicated| R[Earlier sample · max 4 rows]
+    L -->|filters return no rows| F[Broader fallback · same time range · max 4 rows]
+    F -->|more matches indicated| R
+    L --> S[Up to 8 unique retained rows]
+    R --> S
+    F --> S
+    E -->|first query only| A[Time histogram and optional top values]
     S --> H[Hypothesis engine<br/>explain evidence and propose causes]
     A --> H
     H --> R[Findings with cited sample IDs]
@@ -25,8 +31,8 @@ Solid arrows show implemented flows. The dotted retrieval arrow is planned, not 
 ## Boundaries
 
 - Planning uses Data View names, indices, field names, and field types. It returns candidate filters, a bounded list of sample fields, and an optional aggregation field.
-- The evidence engine validates those choices and sends one bounded search request per selected Data View for at most four records plus a time histogram. Adapters may make additional database-side aggregation/preflight requests. AI Elasticsearch requests disable exact hit counting. The result can include one top-value breakdown (up to three values plus `__other__` per bucket) when supported. Sample records include at most four selected fields, values are capped at 256 bytes, and the hypothesis payload keeps at most 16 histogram buckets. It does not page through every matching record.
-- Hypothesis generation receives the question, validated scope, aggregate summaries, and compact sample evidence. Findings may cite only IDs included in those samples.
+- The evidence engine validates those choices and runs at most three bounded sample queries per Data View: latest rows, earliest rows if additional matches are indicated, and a broader query within the same time range if filters return no rows. Each query returns at most four records; at most eight unique sample rows per Data View are retained. The first query may also request a source-side histogram and top-value breakdown (up to three values plus `__other__` per bucket), which can cover more records than the sample. AI Elasticsearch requests disable exact hit counting. Sample records include at most four selected fields, values are capped at 256 bytes, and the hypothesis payload keeps at most 16 aggregate buckets. Timed-out source searches fail the investigation. The result reports sampled rows, compact records actually supplied to the model, aggregation totals, and each query scope separately. It does not page through every matching record.
+- Hypothesis generation receives the question, validated scope, per-query coverage, aggregate summaries, and compact sample evidence. Findings without valid sample citations are removed; finding counts are derived from distinct cited sample IDs, never copied from a whole-query aggregate. Empty results are reported as insufficient sampled evidence, not an all-clear. Confidence remains model judgment and conclusions are never marked verified automatically. Valid citations establish traceability only; they do not establish that an inferred cause is correct or immune to misleading source text.
 - Manual knowledge storage and management are implemented, with draft/published/archived status and revision-checked edits. Completed live/history results can be explicitly copied into unverified drafts with their investigation reference and evidence scope, then reviewed in the Knowledge editor. Publishing is an editorial decision, not proof of correctness. Automatic entry creation, retrieval, and investigation citation snapshots remain future work; investigations currently run without knowledge entries.
 
 ## Knowledge lifecycle (implemented)

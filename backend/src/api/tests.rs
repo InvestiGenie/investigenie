@@ -637,6 +637,20 @@ async fn background_investigations_validate_controls_poll_status_and_reject_unkn
 
 #[tokio::test]
 async fn ai_investigation_gathers_bounded_evidence_and_returns_cited_hypotheses() {
+    assert_bounded_ai_evidence(false, false).await;
+}
+
+#[tokio::test]
+async fn ai_investigation_broadens_empty_filters_within_the_query_budget() {
+    assert_bounded_ai_evidence(true, false).await;
+}
+
+#[tokio::test]
+async fn ai_investigation_does_not_treat_timed_out_searches_as_complete_evidence() {
+    assert_bounded_ai_evidence(false, true).await;
+}
+
+async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool) {
     let (_directory, storage) = status_storage().await;
     let source = MockServer::start().await;
     let provider = MockServer::start().await;
@@ -673,8 +687,8 @@ async fn ai_investigation_gathers_bounded_evidence_and_returns_cited_hypotheses(
                 && body["aggs"]["breakdown_values"]["terms"]["field"] == "service"
         })
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "took":7,"timed_out":false,"_shards":{"failed":0},
-            "hits":{"total":{"value":102,"relation":"eq"},"hits":sample_hits},
+            "took":7,"timed_out":source_timed_out,"_shards":{"failed":0},
+            "hits":{"total":{"value":if empty_filters {0} else {102},"relation":"eq"},"hits":if empty_filters {json!([])} else {sample_hits.clone()}},
             "aggregations":{
                 "documents_over_time":{"buckets":[
                     {"key":1791630000000i64,"doc_count":60},
@@ -691,6 +705,40 @@ async fn ai_investigation_gathers_bounded_evidence_and_returns_cited_hypotheses(
         .expect(1)
         .mount(&source)
         .await;
+
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/events/_search"))
+        .and(|request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            body["size"] == 4 && body["sort"][0]["@timestamp"]["order"] == "desc"
+                && body["query"]["bool"]["must"][0]["match_all"].is_object()
+                && body.get("search_after").is_none()
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "took":3,"timed_out":false,"_shards":{"failed":0},
+            "hits":{"total":{"value":102,"relation":"eq"},"hits":sample_hits},
+            "aggregations":{"documents_over_time":{"buckets":[{"key":1791630000000i64,"doc_count":60},{"key":1791630300000i64,"doc_count":42}]}}
+        })))
+        .expect(if empty_filters && !source_timed_out {1} else {0})
+        .mount(&source).await;
+
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/events/_search"))
+        .and(move |request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            body["size"] == 4 && body["sort"][0]["@timestamp"]["order"] == "asc"
+                && if empty_filters { body["query"]["bool"]["must"][0]["match_all"].is_object() } else { body["query"]["bool"]["must"][0]["query_string"]["query"] == "service:\"checkout\"" }
+                && body.get("aggs").is_none() && body.get("search_after").is_none()
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "took":2,"timed_out":false,"_shards":{"failed":0},
+            "hits":{"total":{"value":102,"relation":"eq"},"hits":[
+                {"_index":"events","_id":"event-0","_source":{"@timestamp":"2026-10-10T10:00:00Z","service":"checkout","message":"inventory timeout began"}},
+                {"_index":"events","_id":"event-1","_source":{"@timestamp":"2026-10-10T11:00:00Z","service":"checkout","message":"inventory timeout"}}
+            ]}
+        })))
+        .expect(if source_timed_out {0} else {1})
+        .mount(&source).await;
 
     let plan_content = json!({"views":[{"data_view_id":"checkout-view","filters":[{"field":"service","operator":"eq","value":"checkout"}],"sample_fields":["@timestamp","message","service"],"aggregation_field":"service"}]}).to_string();
     Mock::given(matchers::method("POST"))
@@ -733,7 +781,7 @@ async fn ai_investigation_gathers_bounded_evidence_and_returns_cited_hypotheses(
         .and(move |request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             let input: Value = serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
-            input["sources"][0]["records_examined"] == 2
+            input["sources"][0]["records_examined"] == 3
                 && input["sources"][0]["aggregation_field"] == "service"
                 && input["sources"][0]["aggregations"].as_array().unwrap().len() == 2
         })
@@ -741,7 +789,7 @@ async fn ai_investigation_gathers_bounded_evidence_and_returns_cited_hypotheses(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"choices":[{"message":{"content":findings_content}}],"usage":{"prompt_tokens":420,"completion_tokens":96,"total_tokens":516}})),
         )
-        .expect(1)
+        .expect(if source_timed_out {0} else {1})
         .mount(&provider)
         .await;
 
@@ -784,14 +832,59 @@ async fn ai_investigation_gathers_bounded_evidence_and_returns_cited_hypotheses(
         .await
         .unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
+    if source_timed_out {
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["error"]["code"], "source_query_failed");
+        return;
+    }
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["findings"][0]["evidence"][0]["record_ids"],
         json!(["event-1", "event-2"])
     );
-    assert_eq!(body["findings"][0]["evidence"][0]["count"], 102);
-    assert_eq!(body["sources"][0]["records_examined"], 2);
-    assert_eq!(body["sources"][0]["batches_processed"], 1);
+    assert_eq!(body["findings"][0]["evidence"][0]["count"], 2);
+    assert_eq!(body["sources"][0]["records_examined"], 3);
+    assert_eq!(
+        body["sources"][0]["batches_processed"],
+        if empty_filters { 3 } else { 2 }
+    );
+    assert_eq!(body["sources"][0]["sample_limit"], 8);
+    assert_eq!(body["sources"][0]["aggregate_records"], 102);
+    assert_eq!(
+        body["sources"][0]["evidence_queries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        if empty_filters { 3 } else { 2 }
+    );
+    assert_eq!(
+        body["sources"][0]["evidence_queries"][0]["sampling"],
+        "latest"
+    );
+    assert_eq!(
+        body["sources"][0]["evidence_queries"][1]["sampling"],
+        if empty_filters { "latest" } else { "earliest" }
+    );
+    if empty_filters {
+        assert_eq!(
+            body["sources"][0]["evidence_queries"][2]["sampling"],
+            "earliest"
+        );
+        let fallback = body["sources"][0]["evidence_queries"][1]["query_summary"]
+            .as_str()
+            .unwrap();
+        assert!(fallback.contains("Time range: 1791630000000 to 1791633600000"));
+        assert!(fallback.contains("no additional filters"));
+    }
+    assert_eq!(body["evidence_status"], "sample_supported");
+    assert_eq!(body["conclusions_verified"], false);
+    if empty_filters {
+        assert!(body["caveats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|note| note.as_str().unwrap().contains("broader query")));
+    }
     assert!(body["sources"][0]["query_summary"]
         .as_str()
         .unwrap()

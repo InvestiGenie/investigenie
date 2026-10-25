@@ -125,6 +125,10 @@ export type InvestigationResult = {
     records_examined: number;
     batches_processed?: number;
     query_summary: string;
+    sample_records_available?: number;
+    sample_limit?: number;
+    aggregate_records?: number | null;
+    evidence_queries?: Array<{ sampling: string; query_summary: string; records_returned: number; aggregate_records: number | null }>;
   }>;
   caveats: string[];
   token_usage: Array<{
@@ -134,6 +138,8 @@ export type InvestigationResult = {
     total_tokens: number | null;
   }>;
   complete?: boolean;
+  evidence_status?: 'sample_supported' | 'insufficient_evidence';
+  conclusions_verified?: boolean;
 };
 
 export type InvestigationControls = {

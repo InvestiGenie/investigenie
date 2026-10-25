@@ -16,9 +16,9 @@ const result: InvestigationResult = {
     detail: 'Both views show related timeout events in the selected investigation window.',
     severity: 'high',
     confidence: 'medium',
-    evidence: [{ data_view_id: 'service-two', data_view_name: 'Service 2', record_ids: ['event-1'], count: 12 }],
+    evidence: [{ data_view_id: 'service-two', data_view_name: 'Service 2', record_ids: ['event-1'], count: 1 }],
   }],
-  sources: [{ data_view_id: 'service-two', name: 'Service 2', index: 'service-two-*', records_examined: 12, query_summary: 'Last 30 minutes; error_type EQ' }],
+  sources: [{ data_view_id: 'service-two', name: 'Service 2', index: 'service-two-*', records_examined: 1, query_summary: 'Last 30 minutes; error_type EQ', sample_records_available: 1, sample_limit: 8, aggregate_records: 12, evidence_queries: [{ sampling: 'latest', query_summary: 'Last 30 minutes; error_type EQ', records_returned: 1, aggregate_records: 12 }] }],
   caveats: ['Analysis is limited to the last 30 minutes.'],
   token_usage: [
     { stage: 'planning', prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
@@ -57,6 +57,37 @@ describe('InvestiGenieAIPage', () => {
     }]);
   });
   afterEach(() => vi.restoreAllMocks());
+
+  it('separates deterministic sampling coverage, aggregate totals and cited records', async () => {
+    vi.spyOn(api, 'startInvestigation').mockResolvedValue(job({ result: {
+      ...result, evidence_status: 'sample_supported', conclusions_verified: false,
+      sources: [{ ...result.sources[0], records_examined: 3, sample_records_available: 3, sample_limit: 8, aggregate_records: 102,
+        evidence_queries: [{ sampling: 'latest', query_summary: 'Filtered checkout events; last 30 minutes', records_returned: 2, aggregate_records: 102 }, { sampling: 'earliest', query_summary: 'Filtered checkout events; last 30 minutes', records_returned: 2, aggregate_records: null }] }],
+    } }));
+    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    await screen.findByRole('combobox', { name: /AI model/ });
+    openDataViewPicker(); fireEvent.click(screen.getByLabelText(/Service 1/));
+    fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Investigate errors' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
+    expect(await screen.findByText('3 sampled records')).toBeInTheDocument();
+    expect(screen.getByText('2 bounded evidence queries')).toBeInTheDocument();
+    expect(screen.getByText(/Service 2: 1 cited sample records/)).toBeInTheDocument();
+    expect(screen.getByText(/not verified causes/)).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Sources and query scope'));
+    expect(screen.getByText('102 records counted by query aggregation (not a finding count)')).toBeInTheDocument();
+    expect(screen.getByText(/2\. earliest sample/)).toBeInTheDocument();
+  });
+
+  it('does not turn insufficient evidence into an incident draft or an all-clear', async () => {
+    vi.spyOn(api, 'startInvestigation').mockResolvedValue(job({ result: { ...result, findings: [], summary: 'Insufficient sampled evidence.', evidence_status: 'insufficient_evidence', conclusions_verified: false } }));
+    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    await screen.findByRole('combobox', { name: /AI model/ });
+    openDataViewPicker(); fireEvent.click(screen.getByLabelText(/Service 1/));
+    fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Investigate errors' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
+    expect(await screen.findByText(/An empty sample does not establish/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Save as knowledge draft' })).not.toBeInTheDocument();
+  });
 
   it('explicitly saves completed findings as an unverified scoped knowledge draft', async () => {
     vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
@@ -242,6 +273,10 @@ describe('InvestiGenieAIPage', () => {
     expect(screen.getByText('analysis: 360 total (300 prompt + 60 completion)')).toBeInTheDocument();
     expect(screen.getByText(result.caveats[0])).toBeInTheDocument();
     expect(screen.getByText('Sources and query scope')).toBeInTheDocument();
+    expect(screen.getByText('Saved investigation scope')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Edit time window' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Choose Data Views' })).toBeDisabled();
+    expect(screen.getByRole('combobox', { name: 'AI model' })).toBeDisabled();
     expect(screen.getAllByText('Why did checkout fail?')).toHaveLength(2);
     expect(screen.getByRole('button', { name: 'Delete conversation' })).toBeEnabled();
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'What next?' } });
@@ -267,7 +302,7 @@ describe('InvestiGenieAIPage', () => {
     expect(screen.getByText('planning: 120 total (100 prompt + 20 completion)')).toBeInTheDocument();
     expect(screen.getByText('analysis: 360 total (300 prompt + 60 completion)')).toBeInTheDocument();
     fireEvent.click(screen.getByText('Sources and query scope'));
-    expect(screen.getByText(/Last 30 minutes; error_type EQ/)).toBeInTheDocument();
+    expect(screen.getAllByText(/Last 30 minutes; error_type EQ/)).toHaveLength(2);
     expect(screen.getByText(/Analysis is limited to the last 30 minutes/)).toBeInTheDocument();
   });
 

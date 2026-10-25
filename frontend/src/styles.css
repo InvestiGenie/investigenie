@@ -453,6 +453,11 @@ th[aria-sort="ascending"] .column-sort-button, th[aria-sort="descending"] .colum
 .ai-error { margin: 0; }
 .ai-result { min-width: 0; padding: 16px 0 0; border-top: 1px solid var(--line); }
 .ai-result-label { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; color: var(--green-dark); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.ai-evidence-warning { margin: 10px 0; padding: 9px 11px; color: var(--text-soft); background: var(--surface-subtle); border-left: 2px solid #b28438; font-size: 12px; line-height: 1.6; }
+.ai-evidence-coverage { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 10px 0; margin-bottom: 12px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; }
+.ai-evidence-coverage strong { color: var(--ink); }
+.ai-saved-scope { color: var(--muted); font-size: 11px; }
+.ai-hypothesis-label { display: inline-block; margin-bottom: 7px; color: var(--muted); font-size: 11px; }
 .ai-knowledge-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); }
 .ai-knowledge-actions .quiet-button { max-width: 100%; min-height: 32px; height: auto; padding: 7px 10px; font-size: 12px; white-space: normal; }
 .ai-knowledge-actions > span { color: var(--muted); font-size: 11px; }

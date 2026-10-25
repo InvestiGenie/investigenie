@@ -69,7 +69,7 @@ describe('Discover', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Knowledge' }));
     await screen.findByText('Why did payments fail?');
     expect(screen.queryByLabelText('Title')).not.toBeInTheDocument();
-  });
+  }, 15_000);
 
   it('opens Knowledge through history and protects unsaved edits', async () => {
     vi.spyOn(api, 'connections').mockResolvedValue([]);

@@ -67,10 +67,10 @@ function investigationKnowledgeDraft(result: InvestigationResult, context: Knowl
     '## Findings',
     ...result.findings.flatMap((finding) => [
       `### ${finding.title}`, `Severity: ${finding.severity}; confidence: ${finding.confidence}.`, finding.detail,
-      ...finding.evidence.map((evidence) => `- Data View: ${evidence.data_view_name} (${evidence.data_view_id}); observed count: ${evidence.count}; record IDs: ${evidence.record_ids.join(', ') || 'None supplied'}.`),
+      ...finding.evidence.map((evidence) => `- Data View: ${evidence.data_view_name} (${evidence.data_view_id}); cited sample records: ${new Set(evidence.record_ids).size}; record IDs: ${evidence.record_ids.join(', ') || 'None supplied'}.`),
     ]),
     '## Sources and query scope',
-    ...result.sources.map((source) => `### ${source.name}\n\nData View: ${source.data_view_id}\n\nIndex/table: ${source.index}\n\nRecords examined: ${source.records_examined}\n\n${source.query_summary}`),
+    ...result.sources.map((source) => `### ${source.name}\n\nData View: ${source.data_view_id}\n\nIndex/table: ${source.index}\n\nSampled records reported: ${source.records_examined}\n\nRecords supplied to model: ${source.sample_records_available ?? 'Not recorded in this saved result'}\n\nQuery aggregation count: ${source.aggregate_records ?? 'Unavailable'}\n\n${source.query_summary}\n\n${source.evidence_queries?.map((query) => `${query.sampling}: ${query.records_returned} records returned; ${query.query_summary}`).join('\n\n') ?? ''}`),
     '## Caveats', ...(result.caveats.length ? result.caveats.map((caveat) => `- ${caveat}`) : ['No additional caveats recorded.']),
     '## Confirmed cause and resolution', 'Not confirmed. Add the verified cause, resolution, and recovery checks during review.',
   ].join('\n\n');
@@ -100,7 +100,7 @@ function InvestigationResultView({ result, label, draftContext, onOpenKnowledge 
   const saveInFlight = useRef(false);
 
   async function saveKnowledgeDraft() {
-    if (!draftContext || result.complete === false || saveInFlight.current || savedDraftId) return;
+    if (!draftContext || result.complete === false || result.evidence_status === 'insufficient_evidence' || saveInFlight.current || savedDraftId) return;
     saveInFlight.current = true;
     setSaving(true);
     setSaveError('');
@@ -117,6 +117,11 @@ function InvestigationResultView({ result, label, draftContext, onOpenKnowledge 
 
   return <article className="ai-result">
     <div className="ai-result-label"><BrainCircuit size={15} aria-hidden="true" /> {label}</div>
+    <p className="ai-evidence-warning">AI hypotheses, not verified causes. Citations identify supporting samples; they do not prove the conclusion.</p>
+    <section className="ai-evidence-coverage" aria-label="Evidence coverage"><strong>Evidence coverage</strong>
+      {result.sources.some((source) => source.evidence_queries !== undefined) ? <><span>{result.sources.reduce((total, source) => total + source.records_examined, 0).toLocaleString()} sampled records</span><span>{result.sources.reduce((total, source) => total + (source.evidence_queries?.length ?? 0), 0)} bounded evidence queries</span><span>Not an exhaustive or representative scan</span></> : <span>Detailed sampling coverage was not recorded in this saved result.</span>}
+    </section>
+    {result.evidence_status === 'insufficient_evidence' && <p className="ai-evidence-warning" role="status">Insufficient evidence for an incident hypothesis. An empty sample does not establish that no incident occurred.</p>}
     <p className="ai-summary">{result.summary}</p>
     <section className="ai-token-usage" aria-label="Token usage">
       <strong>Provider token usage</strong>
@@ -128,15 +133,21 @@ function InvestigationResultView({ result, label, draftContext, onOpenKnowledge 
       <h3>Findings</h3>
       {result.findings.map((finding, index) => <article className="ai-finding" key={`${finding.title}-${index}`}>
         <div className="ai-finding-heading"><h4>{finding.title}</h4><span className={`ai-severity severity-${finding.severity}`}>{finding.severity}</span></div>
+        <span className="ai-hypothesis-label">Hypothesis · requires verification</span>
         <p>{finding.detail}</p>
-        <div className="ai-finding-meta"><span>{finding.confidence} confidence</span>{finding.evidence.map((evidence) => <span key={`${evidence.data_view_id}-${evidence.record_ids.join('-')}`}>{evidence.data_view_name}: {evidence.count.toLocaleString()} records{evidence.record_ids.length ? ` · ${evidence.record_ids.join(', ')}` : ''}</span>)}</div>
+        <div className="ai-finding-meta"><span>{finding.confidence} confidence</span><span>Confidence is model judgment</span>{finding.evidence.map((evidence) => <span key={`${evidence.data_view_id}-${evidence.record_ids.join('-')}`}>{evidence.data_view_name}: {new Set(evidence.record_ids).size} cited sample records{evidence.record_ids.length ? ` · ${evidence.record_ids.join(', ')}` : ' · no validated sample citations'}</span>)}</div>
       </article>)}
     </section>}
     <details className="ai-sources-used"><summary>Sources and query scope</summary>
-      {result.sources.map((source) => <div className="ai-source-used" key={source.data_view_id}><strong>{source.name}</strong><span>{source.index} · {source.records_examined.toLocaleString()} records examined{source.batches_processed !== undefined ? ` · ${source.batches_processed.toLocaleString()} batches` : ''}</span><small>{source.query_summary}</small></div>)}
+      {result.sources.map((source) => <div className="ai-source-used" key={source.data_view_id}><strong>{source.name}</strong><span>{source.index} · {source.records_examined.toLocaleString()} {source.sample_limit === undefined ? 'records reported in saved result' : `sampled rows (limit ${source.sample_limit})`}</span>
+        {source.sample_records_available !== undefined && <span>{source.sample_records_available} sample records supplied to the model</span>}
+        {source.aggregate_records !== undefined && <span>{source.aggregate_records === null ? 'Query aggregation count unavailable' : `${source.aggregate_records.toLocaleString()} records counted by query aggregation (not a finding count)`}</span>}
+        <small>{source.query_summary}</small>
+        {source.evidence_queries?.map((query, index) => <small key={index}>{index + 1}. {query.sampling} sample · {query.records_returned} records returned · {query.query_summary}</small>)}
+      </div>)}
     </details>
     {result.caveats.length > 0 && <div className="ai-caveats"><strong>Limits</strong>{result.caveats.map((caveat, index) => <p key={index}>{caveat}</p>)}</div>}
-    {draftContext && result.complete !== false && <div className="ai-knowledge-actions">
+    {draftContext && result.complete !== false && result.evidence_status !== 'insufficient_evidence' && <div className="ai-knowledge-actions">
       <button type="button" className="quiet-button" disabled={saving || savedDraftId !== null} onClick={() => void saveKnowledgeDraft()}>{savedDraftId ? <Check size={15} aria-hidden="true" /> : <Save size={15} aria-hidden="true" />}{saving ? 'Saving knowledge draft...' : savedDraftId ? 'Knowledge draft saved' : 'Save as knowledge draft'}</button>
       {savedDraftId && <span role="status">Saved as draft.</span>}
       {savedDraftId && onOpenKnowledge && <button type="button" className="quiet-button" onClick={() => onOpenKnowledge(savedDraftId)}><BookOpen size={15} aria-hidden="true" /> Review knowledge draft</button>}
@@ -460,7 +471,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
       {conversationError && <div className="alert" role="alert"><span>{conversationError}</span><button type="button" aria-label="Dismiss history error" onClick={() => setConversationError('')}>×</button></div>}
       <div className="ai-controls-row">
       <div className="ai-dataview-picker" ref={pickerRef}>
-        <button ref={pickerTriggerRef} type="button" className={`ai-dataview-trigger${dataViewPickerOpen ? ' open' : ''}`} aria-label="Choose Data Views" aria-expanded={dataViewPickerOpen} aria-controls="ai-dataview-menu" disabled={dataViews.length === 0} onClick={() => setDataViewPickerOpen((open) => !open)}>
+        <button ref={pickerTriggerRef} type="button" className={`ai-dataview-trigger${dataViewPickerOpen ? ' open' : ''}`} aria-label="Choose Data Views" aria-expanded={dataViewPickerOpen} aria-controls="ai-dataview-menu" disabled={dataViews.length === 0 || busy || !!activeConversation} onClick={() => setDataViewPickerOpen((open) => !open)}>
           <Database size={14} aria-hidden="true"/><span>Data Views</span><span className="ai-dataview-count">{selectedIds.length}/5</span><span className="ai-dataview-chevron" aria-hidden="true">▾</span>
         </button>
         {dataViewPickerOpen && <div className="ai-dataview-menu" id="ai-dataview-menu" role="dialog" aria-label="Select Data Views">
@@ -476,9 +487,9 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
           })}{visibleDataViews.length === 0 && <p className="ai-empty-sources">No Data Views match that search.</p>}</div>
         </div>}
       </div>
-      <TimeRangePicker start={startDate} end={endDate} timeZone={timeZone} onTimeZoneChange={setTimeZone} onChange={(start, end) => { setStartDate(start); setEndDate(end); }} />
+      {activeConversation ? <span className="ai-saved-scope">Saved investigation scope</span> : <TimeRangePicker start={startDate} end={endDate} timeZone={timeZone} onTimeZoneChange={setTimeZone} onChange={(start, end) => { setStartDate(start); setEndDate(end); }} />}
       </div>
-      {selectedDataViews.length > 0 && <div className="ai-selected-views" aria-label="Selected Data Views">{selectedDataViews.map((view) => <span className="ai-selected-view" key={view.id}>{view.name}<button type="button" aria-label={`Remove ${view.name}`} title={`Remove ${view.name}`} onClick={() => toggleDataView(view.id)}><X size={12} /></button></span>)}</div>}
+      {selectedDataViews.length > 0 && <div className="ai-selected-views" aria-label="Selected Data Views">{selectedDataViews.map((view) => <span className="ai-selected-view" key={view.id}>{view.name}<button type="button" aria-label={`Remove ${view.name}`} title={`Remove ${view.name}`} disabled={busy || !!activeConversation} onClick={() => toggleDataView(view.id)}><X size={12} /></button></span>)}</div>}
       {dataViews.length === 0 && <p className="ai-empty-sources">Create a Data View before starting an investigation.</p>}
 
       <section className="ai-transcript" aria-live="polite" aria-label="Investigation result">
@@ -495,14 +506,14 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
           <span className="spinner dark" />
           <div className="ai-progress-text">
             <strong>{job.status === 'stopping' ? 'Stopping and keeping findings so far…' : job.progress.stage || 'Investigation in progress…'}</strong>
-            <small>{job.progress.records_examined.toLocaleString()} records · {job.progress.batches_processed.toLocaleString()} batches · {job.progress.analysis_cycles.toLocaleString()} analysis cycles · {elapsedLabel(job.progress.elapsed_ms)} elapsed</small>
+            <small>{job.progress.records_examined.toLocaleString()} distinct sample rows collected · {job.progress.batches_processed.toLocaleString()} bounded source queries · {job.progress.analysis_cycles.toLocaleString()} analysis cycles · {elapsedLabel(job.progress.elapsed_ms)} elapsed</small>
           </div>
           {job.status === 'running' && <button type="button" className="quiet-button ai-stop" disabled={deciding} onClick={() => void decide('terminate')}><Square size={12} aria-hidden="true" /> Stop</button>}
         </div>}
         {job?.status === 'awaiting_decision' && <section className="ai-decision" role="group" aria-label="Continue or stop the investigation">
           <div className="ai-decision-heading"><CirclePause size={16} aria-hidden="true" /><strong>Should InvestiGenie keep investigating?</strong></div>
           <p>{job.pause_reason}</p>
-          <small>{job.progress.records_examined.toLocaleString()} records examined in {job.progress.batches_processed.toLocaleString()} batches · {elapsedLabel(job.progress.elapsed_ms)} elapsed</small>
+          <small>{job.progress.records_examined.toLocaleString()} distinct sample rows collected in {job.progress.batches_processed.toLocaleString()} bounded source queries · {elapsedLabel(job.progress.elapsed_ms)} elapsed</small>
           <div className="ai-decision-actions">
             <button type="button" className="search-button" disabled={deciding} onClick={() => void decide('continue')}><Play size={13} aria-hidden="true" /> Continue investigation</button>
             <button type="button" className="quiet-button" disabled={deciding} onClick={() => void decide('terminate')}><Square size={12} aria-hidden="true" /> Stop and show findings</button>
@@ -521,7 +532,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
             {modelStatus === 'loading' && <span role="status">Loading AI models...</span>}
             {modelStatus === 'failed' && <div className="alert ai-error" role="alert"><CircleAlert size={16} aria-hidden="true" /><span>{modelError}</span><button type="button" className="icon-button" aria-label="Retry loading AI models" title="Retry loading AI models" onClick={() => setModelAttempt((attempt) => attempt + 1)}>↻</button></div>}
             {modelStatus === 'empty' && <><span>No saved AI models</span><button type="button" className="quiet-button" onClick={() => onManageModels?.()}>Manage AI models</button></>}
-            {modelStatus === 'ready' && <label className="ai-model-compact" htmlFor="ai-model-select"><span className="sr-only">Model</span><select id="ai-model-select" aria-label="AI model" value={selectedModelId} disabled={busy} onChange={(event) => selectModel(event.target.value)}>{models.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.model}</option>)}</select></label>}
+            {modelStatus === 'ready' && <label className="ai-model-compact" htmlFor="ai-model-select"><span className="sr-only">Model</span><select id="ai-model-select" aria-label="AI model" value={selectedModelId} disabled={busy || !!activeConversation} onChange={(event) => selectModel(event.target.value)}>{activeConversation && !models.some((model) => model.id === activeConversation.model_id) && <option value={activeConversation.model_id}>Saved model: {activeConversation.model_id}</option>}{models.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.model}</option>)}</select></label>}
             <label className="ai-run-setting" title="How long to wait for each AI provider response"><span>Timeout</span><select aria-label="AI response timeout" value={aiTimeout} disabled={busy} onChange={(event) => updateTimeout(Number(event.target.value))}>{TIMEOUT_OPTIONS.map((seconds) => <option key={seconds} value={seconds}>{durationLabel(seconds)}</option>)}</select></label>
             <label className="ai-run-setting" title="Ask whether to continue after the investigation runs this long"><span>Ask after</span><select aria-label="Ask to continue after" value={checkIn} disabled={busy} onChange={(event) => updateCheckIn(Number(event.target.value))}>{CHECK_IN_OPTIONS.map((seconds) => <option key={seconds} value={seconds}>{durationLabel(seconds)}</option>)}</select></label>
           </div>
