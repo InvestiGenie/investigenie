@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { api, type ConnectionSummary, type DataViewSummary, type FieldSummary, type IndexSummary } from './api';
+import IntegrationIcon from './IntegrationIcon';
 import SearchableSelect from './SearchableSelect';
 import { errorMessage, formatCount } from './format';
 import { ErrorAlert, StatusNotice } from './PageFeedback';
@@ -134,7 +135,7 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
         : <div className="connection-list">{dataViews.map((view) => {
           const connection = connections.find((item) => item.id === view.connection_id);
           return <article className="data-view-row" key={view.id}>
-            <span className={`source-mark ${connection?.integration.id ?? ''}`} aria-hidden="true">{connection?.integration.display_name[0] ?? '?'}</span>
+            <IntegrationIcon integration={connection?.integration} />
             <div className="connection-info"><strong>{view.name}</strong><span>{connection?.name ?? 'Unavailable connection'} · {view.index}</span></div>
             <span className="connection-kind">Time field · {view.time_field}</span>
             <div className="connection-actions"><button className="edit-connection" aria-label={`Edit ${view.name}`} title={`Edit ${view.name}`} onClick={() => configureDataView(view)}>✎</button><button className="remove-connection" aria-label={`Remove ${view.name}`} title={`Remove ${view.name}`} onClick={() => void removeDataView(view)}>×</button></div>

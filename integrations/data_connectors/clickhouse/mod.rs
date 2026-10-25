@@ -39,6 +39,7 @@ pub fn descriptor() -> IntegrationDescriptor {
     IntegrationDescriptor {
         id: "clickhouse",
         display_name: "ClickHouse",
+        icon: "clickhouse",
         query_language: "SQL",
         description: "SQL queries over databases and tables",
         connection_fields: vec![

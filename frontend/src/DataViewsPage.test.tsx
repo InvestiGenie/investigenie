@@ -199,6 +199,8 @@ describe('DataViewsPage', () => {
     render(<DataViewsPage connections={connections} dataViews={[{
       id: 'application-logs', revision: 'view-revision', name: 'Application logs', connection_id: 'logs-source', index: 'logs', time_field: 'event_time',
     }]} onDataViewsChange={refresh} />);
+    expect(document.querySelector('.data-view-row .source-mark img')).toBeInTheDocument();
+    expect(document.querySelector('.data-view-row .source-mark')).toHaveAttribute('data-icon', 'elasticsearch');
     expect(screen.queryByLabelText('Data view name')).not.toBeInTheDocument();
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: 'Edit Application logs' }));

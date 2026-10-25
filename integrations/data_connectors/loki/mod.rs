@@ -31,6 +31,7 @@ pub fn descriptor() -> IntegrationDescriptor {
     IntegrationDescriptor {
         id: "loki",
         display_name: "Grafana Loki",
+        icon: "loki",
         query_language: "LogQL",
         description: "Read-only log queries over Loki streams",
         connection_fields: vec![

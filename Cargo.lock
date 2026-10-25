@@ -1040,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "investigenie-api"
-version = "0.4.1-alpha"
+version = "0.4.1"
 dependencies = [
  "aes-gcm",
  "axum",

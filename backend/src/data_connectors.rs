@@ -55,6 +55,7 @@ include!(concat!(env!("OUT_DIR"), "/data_connectors.rs"));
 pub struct IntegrationDescriptor {
     pub id: &'static str,
     pub display_name: &'static str,
+    pub icon: &'static str,
     pub query_language: &'static str,
     pub description: &'static str,
     pub connection_fields: Vec<Value>,

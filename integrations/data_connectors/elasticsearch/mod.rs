@@ -34,6 +34,7 @@ pub fn descriptor() -> IntegrationDescriptor {
     IntegrationDescriptor {
         id: "elasticsearch",
         display_name: "Elasticsearch",
+        icon: "elasticsearch",
         query_language: "Lucene",
         description: "Lucene queries over indices and data streams",
         connection_fields: vec![

@@ -40,6 +40,7 @@ pub fn descriptor() -> IntegrationDescriptor {
     IntegrationDescriptor {
         id: "bigquery",
         display_name: "Google BigQuery",
+        icon: "bigquery",
         query_language: "SQL",
         description: "Read-only Standard SQL queries over one configured BigQuery dataset",
         connection_fields: vec![

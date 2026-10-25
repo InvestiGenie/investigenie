@@ -236,7 +236,7 @@ describe('ConnectionsPage', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
-  it('shows saved connections until Add connection is pressed, then returns on cancel', () => {
+  it('shows connector icons in saved connections and the source picker', async () => {
     render(<ConnectionsPage
       connections={[connectionFixture(clickhouseIntegration, {
         id: 'warehouse',
@@ -250,10 +250,14 @@ describe('ConnectionsPage', () => {
     />);
 
     expect(screen.getByText('Warehouse')).toBeInTheDocument();
+    expect(document.querySelectorAll('.connection-row .source-mark img')).toHaveLength(1);
+    expect(document.querySelector('.connection-row .source-mark')).toHaveAttribute('data-icon', 'clickhouse');
     expect(screen.queryByRole('button', { name: 'Use Warehouse in Discover' })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Add connection/ }));
     expect(screen.queryByText('Warehouse')).not.toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Choose a data source' })).toBeInTheDocument();
+    await screen.findByRole('button', { name: /ClickHouse/ });
+    expect([...document.querySelectorAll('.source-choice .source-mark')].map((mark) => mark.getAttribute('data-icon'))).toEqual(['elasticsearch', 'clickhouse']);
     expect(screen.queryByLabelText('Connection name')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(screen.getByText('Warehouse')).toBeInTheDocument();

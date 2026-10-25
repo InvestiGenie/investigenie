@@ -345,6 +345,7 @@ th[aria-sort="ascending"] .column-sort-button, th[aria-sort="descending"] .colum
 .connection-row { min-height: 66px; display: grid; grid-template-columns: 34px minmax(130px, 1fr) minmax(150px, auto) 100px minmax(185px, auto); align-items: center; gap: 10px; border-bottom: 1px solid #edf1ef; }
 .connection-row:last-child { border-bottom: 0; }
 .source-mark { width: 28px; height: 28px; display: inline-grid; place-items: center; color: #176e5b; background: #e7f4ef; border-radius: 7px; font-size: 12px; font-weight: 700; }
+.source-mark img, .source-mark svg { width: 20px; height: 20px; object-fit: contain; }
 .source-mark.clickhouse { color: #91612d; background: #fbf1e5; }
 .connection-info { min-width: 0; display: grid; gap: 4px; }
 .connection-info strong { overflow: hidden; color: #293b40; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }

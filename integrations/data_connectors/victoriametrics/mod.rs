@@ -31,6 +31,7 @@ pub fn descriptor() -> IntegrationDescriptor {
     IntegrationDescriptor {
         id: "victoriametrics",
         display_name: "VictoriaMetrics",
+        icon: "victoriametrics",
         query_language: "MetricsQL selector",
         description: "Read-only raw metric samples from VictoriaMetrics",
         connection_fields: vec![

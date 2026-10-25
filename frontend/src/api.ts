@@ -6,6 +6,8 @@ export type IndexSummary = {
 
 export type ConnectionType = string;
 
+export type IntegrationIconKey = 'elasticsearch' | 'clickhouse' | 'bigquery' | 'loki' | 'prometheus' | 'victorialogs' | 'victoriametrics';
+
 export type ConnectionStatus = 'connected' | 'not_connected';
 
 export type ConnectionConfiguration = Record<string, string | boolean | null>;
@@ -38,6 +40,7 @@ export type QueryDescriptor = {
 export type IntegrationDescriptor = {
   id: ConnectionType;
   display_name: string;
+  icon?: IntegrationIconKey;
   query_language: string;
   description: string;
   connection_fields: ConnectionField[];

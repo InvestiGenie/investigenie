@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { api, type ConnectionConfiguration, type ConnectionField, type ConnectionSummary, type IntegrationDescriptor } from './api';
 import ConnectionStatus from './ConnectionStatus';
+import IntegrationIcon from './IntegrationIcon';
 import { errorMessage } from './format';
 import { ErrorAlert, StatusNotice } from './PageFeedback';
 
@@ -173,7 +174,7 @@ export default function ConnectionsPage({ connections, onConnectionsChange }: Co
       {connections.length === 0
         ? <p className="connections-empty">No connections available</p>
         : <div className="connection-list">{connections.map((connection) => <article className="connection-row" key={connection.id}>
-          <span className={`source-mark ${connection.integration.id}`} aria-hidden="true">{connection.integration.display_name[0]}</span>
+          <IntegrationIcon integration={connection.integration} />
           <div className="connection-info"><strong>{connection.name}</strong><span>{connection.url}{connection.database ? ` · ${connection.database}` : ''}</span></div>
           <span className="connection-kind">{connection.integration.display_name} · {connection.integration.query_language}</span>
           <ConnectionStatus id={connection.id} revision={connection.revision} />
@@ -188,7 +189,7 @@ export default function ConnectionsPage({ connections, onConnectionsChange }: Co
         : integrations.length === 0
         ? <p className="connections-empty">No integrations are registered in the backend.</p>
         : <div className="source-choice-list">{integrations.map((integration) => <button className="source-choice" key={integration.id} onClick={() => chooseIntegration(integration)}>
-          <span className={`source-mark ${integration.id}`} aria-hidden="true">{integration.display_name[0]}</span><span><strong>{integration.display_name}</strong><small>{integration.query_language} · {integration.description}</small></span><span className="source-choice-arrow" aria-hidden="true">›</span>
+          <IntegrationIcon integration={integration} /><span><strong>{integration.display_name}</strong><small>{integration.query_language} · {integration.description}</small></span><span className="source-choice-arrow" aria-hidden="true">›</span>
         </button>)}</div>}
     </section>}
 

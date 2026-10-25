@@ -21,6 +21,7 @@ pub fn descriptor() -> IntegrationDescriptor {
     IntegrationDescriptor {
         id: "victorialogs",
         display_name: "VictoriaLogs",
+        icon: "victorialogs",
         query_language: "LogsQL",
         description: "LogsQL queries over VictoriaLogs log streams",
         connection_fields: vec![

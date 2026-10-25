@@ -29,6 +29,7 @@ pub fn descriptor() -> IntegrationDescriptor {
     IntegrationDescriptor {
         id: "prometheus",
         display_name: "Prometheus",
+        icon: "prometheus",
         query_language: "PromQL",
         description: "Read-only PromQL range queries over time series",
         connection_fields: vec![

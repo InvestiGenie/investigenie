@@ -5,7 +5,7 @@ function field(name: string, label: string, overrides: Partial<ConnectionField> 
 }
 
 export const elasticsearchIntegration: IntegrationDescriptor = {
-  id: 'elasticsearch', display_name: 'Elasticsearch', query_language: 'Lucene', description: 'indices and data streams',
+  id: 'elasticsearch', display_name: 'Elasticsearch', icon: 'elasticsearch', query_language: 'Lucene', description: 'indices and data streams',
   connection_fields: [
     field('url', 'HTTP endpoint', { input_type: 'url', required: true, placeholder: 'https://search.example.com:9200' }),
     field('auth_type', 'Authentication', { input_type: 'select', group: 'authentication', options: [
@@ -24,7 +24,7 @@ export const elasticsearchIntegration: IntegrationDescriptor = {
 };
 
 export const clickhouseIntegration: IntegrationDescriptor = {
-  id: 'clickhouse', display_name: 'ClickHouse', query_language: 'SQL', description: 'databases and tables',
+  id: 'clickhouse', display_name: 'ClickHouse', icon: 'clickhouse', query_language: 'SQL', description: 'databases and tables',
   connection_fields: [
     field('url', 'HTTP endpoint', { input_type: 'url', required: true, placeholder: 'http://clickhouse.example.com:8123' }),
     field('database', 'Database', { placeholder: 'default' }),
@@ -41,7 +41,7 @@ export const clickhouseIntegration: IntegrationDescriptor = {
 };
 
 export const thirdIntegration: IntegrationDescriptor = {
-  id: 'archive', display_name: 'Archive', query_language: 'ArchiveQL', description: 'stored event collections',
+  id: 'archive', display_name: 'Archive', icon: 'victorialogs', query_language: 'ArchiveQL', description: 'stored event collections',
   connection_fields: [
     field('url', 'Archive endpoint', { input_type: 'url', required: true, placeholder: 'https://archive.example.com' }),
     field('namespace', 'Namespace', { required: true, placeholder: 'events' }),
