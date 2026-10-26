@@ -1,7 +1,7 @@
 use super::{LokiClient, LokiError, LokiSettings};
 use crate::data_connectors::{
-    string_setting, ConnectionConfig, Connector, ConnectorError, ConnectorFuture, FieldSummary,
-    IndexSummary,
+    credential_setting, string_setting, ConnectionConfig, Connector, ConnectorError,
+    ConnectorFuture, FieldSummary, IndexSummary,
 };
 use crate::search::SearchRequest;
 use axum::http::StatusCode;
@@ -11,21 +11,31 @@ use std::sync::Arc;
 pub fn connect(config: &ConnectionConfig) -> Result<Arc<dyn Connector>, ConnectorError> {
     let raw_url = string_setting(config, "url")?.ok_or_else(ConnectorError::invalid_connection)?;
     let url = url::Url::parse(&raw_url).map_err(|_| ConnectorError::invalid_connection())?;
+    let username = credential_setting(config, "username")?;
+    let password = string_setting(config, "password")?.filter(|value| !value.is_empty());
+    let bearer_token = credential_setting(config, "bearer_token")?;
     let auth_type = string_setting(config, "auth_type")?.unwrap_or_else(|| {
-        if config.contains_key("bearer_token") {
+        if bearer_token.is_some() {
             "bearer".to_owned()
-        } else if config.contains_key("username") || config.contains_key("password") {
+        } else if username.is_some() || password.is_some() {
             "basic".to_owned()
         } else {
             "none".to_owned()
         }
     });
+    // Hidden credential inputs for other modes may be submitted empty; only the selected mode's values matter.
+    let (username, password, bearer_token) = match auth_type.as_str() {
+        "none" => (None, None, None),
+        "basic" => (username, password, None),
+        "bearer" => (None, None, bearer_token),
+        _ => (username, password, bearer_token),
+    };
     Ok(Arc::new(LokiClient::new(LokiSettings {
         url,
         auth_type,
-        username: string_setting(config, "username")?,
-        password: string_setting(config, "password")?,
-        bearer_token: string_setting(config, "bearer_token")?,
+        username,
+        password,
+        bearer_token,
         tenant_id: string_setting(config, "tenant_id")?,
     })?))
 }

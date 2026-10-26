@@ -1,7 +1,7 @@
 use super::{PrometheusClient, PrometheusError, PrometheusSettings};
 use crate::data_connectors::{
-    string_setting, ConnectionConfig, Connector, ConnectorError, ConnectorFuture, FieldSummary,
-    IndexSummary,
+    basic_credentials, string_setting, ConnectionConfig, Connector, ConnectorError,
+    ConnectorFuture, FieldSummary, IndexSummary,
 };
 use crate::search::SearchRequest;
 use axum::http::StatusCode;
@@ -11,10 +11,11 @@ use std::sync::Arc;
 pub fn connect(config: &ConnectionConfig) -> Result<Arc<dyn Connector>, ConnectorError> {
     let raw_url = string_setting(config, "url")?.ok_or_else(ConnectorError::invalid_connection)?;
     let url = url::Url::parse(&raw_url).map_err(|_| ConnectorError::invalid_connection())?;
+    let (username, password) = basic_credentials(config)?.unzip();
     Ok(Arc::new(PrometheusClient::new(PrometheusSettings {
         url,
-        username: string_setting(config, "username")?,
-        password: string_setting(config, "password")?,
+        username,
+        password,
     })?))
 }
 
@@ -62,7 +63,12 @@ impl From<PrometheusError> for ConnectorError {
             PrometheusError::TooManyResults | PrometheusError::ResponseTooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "prometheus_result_limit_exceeded",
-                "Prometheus result exceeds the connector's bounded series, sample, or response limit; narrow the query or time range",
+                "Prometheus returned more samples than the connector reads at once; narrow the time range or selector",
+            ),
+            PrometheusError::SortTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "prometheus_result_limit_exceeded",
+                "Sorting by a label or value is limited to 50,000 samples; sort by time or narrow the time range or selector",
             ),
             PrometheusError::PartialResponse => (
                 StatusCode::BAD_GATEWAY,
@@ -79,17 +85,10 @@ impl From<PrometheusError> for ConnectorError {
                 "prometheus_unreachable",
                 "Could not complete the Prometheus request; it may have timed out",
             ),
-            PrometheusError::Rejected { status } => (
-                match status {
-                    400 | 422 => StatusCode::BAD_REQUEST,
-                    401 | 403 => StatusCode::BAD_GATEWAY,
-                    404 => StatusCode::NOT_FOUND,
-                    503 => StatusCode::GATEWAY_TIMEOUT,
-                    _ => StatusCode::BAD_GATEWAY,
-                },
-                "prometheus_rejected_request",
-                "Prometheus rejected the request",
-            ),
+            PrometheusError::Rejected { status, error_type } => {
+                let (status, message) = rejected_message(status, &error_type);
+                (status, "prometheus_rejected_request", message)
+            }
             PrometheusError::InvalidResponse => (
                 StatusCode::BAD_GATEWAY,
                 "prometheus_response_error",
@@ -101,5 +100,36 @@ impl From<PrometheusError> for ConnectorError {
             code,
             message: message.to_owned(),
         }
+    }
+}
+
+/// Maps Prometheus API error categories to curated messages; upstream error text is never returned.
+fn rejected_message(status: u16, error_type: &str) -> (StatusCode, &'static str) {
+    match (status, error_type) {
+        (_, "bad_data") | (400, _) => (
+            StatusCode::BAD_REQUEST,
+            "Prometheus could not parse the PromQL query; check the expression",
+        ),
+        (_, "execution") | (422, _) => (
+            StatusCode::BAD_REQUEST,
+            "Prometheus could not evaluate the query within its limits; narrow the time range or selector",
+        ),
+        (_, "timeout" | "canceled") | (503, _) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "Prometheus timed out evaluating the query; narrow the time range or selector",
+        ),
+        (401 | 403, _) => (
+            StatusCode::BAD_GATEWAY,
+            "Prometheus rejected the configured credentials",
+        ),
+        (404, _) => (
+            StatusCode::NOT_FOUND,
+            "Prometheus API was not found at this URL; check the connection URL",
+        ),
+        (429, _) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Prometheus is rate limiting requests; retry shortly",
+        ),
+        _ => (StatusCode::BAD_GATEWAY, "Prometheus rejected the request"),
     }
 }

@@ -82,36 +82,118 @@ impl Connector for ElasticsearchClient {
 impl From<ElasticsearchError> for ConnectorError {
     fn from(error: ElasticsearchError) -> Self {
         let (status, code, message) = match error {
-            ElasticsearchError::Rejected { status, .. } => (
-                match status {
-                    404 => StatusCode::NOT_FOUND,
-                    400 => StatusCode::BAD_REQUEST,
-                    _ => StatusCode::BAD_GATEWAY,
-                },
-                "elasticsearch_rejected_request",
-                "Elasticsearch rejected the request",
-            ),
+            ElasticsearchError::Rejected {
+                status,
+                kind,
+                detail,
+            } => {
+                let (status, message) = rejected_message(status, &kind, &detail);
+                (status, "elasticsearch_rejected_request", message.to_owned())
+            }
             ElasticsearchError::InvalidIndex => (
                 StatusCode::BAD_REQUEST,
                 "invalid_search_parameter",
-                "One or more search parameters are invalid or exceed configured limits",
+                "One or more search parameters are invalid or exceed configured limits".to_owned(),
+            ),
+            ElasticsearchError::UnsortableField(field) => (
+                StatusCode::BAD_REQUEST,
+                "elasticsearch_unsortable_field",
+                format!(
+                    "Field `{field}` cannot be sorted in every matched index; text and object fields are not sortable, so use a keyword field such as `{field}.keyword`"
+                ),
+            ),
+            ElasticsearchError::IncompatibleField(field) => (
+                StatusCode::BAD_REQUEST,
+                "elasticsearch_incompatible_field",
+                format!(
+                    "Field `{field}` has incompatible types across the indices matched by this pattern; sort by another field or narrow the pattern"
+                ),
+            ),
+            ElasticsearchError::TimeFieldConflict(field) => (
+                StatusCode::BAD_REQUEST,
+                "elasticsearch_time_field_conflict",
+                format!(
+                    "No usable index matched by this pattern maps `{field}` as a date; choose another time field or narrow the pattern"
+                ),
+            ),
+            ElasticsearchError::PartialResults => (
+                StatusCode::BAD_GATEWAY,
+                "elasticsearch_partial_results",
+                "Elasticsearch could not search every shard matched by this pattern; narrow the pattern or retry".to_owned(),
             ),
             ElasticsearchError::Request => (
                 StatusCode::BAD_GATEWAY,
                 "elasticsearch_unreachable",
-                "Could not complete the Elasticsearch request; it may have timed out",
+                "Could not complete the Elasticsearch request; it may have timed out".to_owned(),
             ),
             ElasticsearchError::ClientConfiguration | ElasticsearchError::InvalidResponse => (
                 StatusCode::BAD_GATEWAY,
                 "elasticsearch_response_error",
-                "Elasticsearch returned an unusable response",
+                "Elasticsearch returned an unusable response".to_owned(),
             ),
         };
         Self {
             status,
             code,
-            message: message.to_owned(),
+            message,
         }
+    }
+}
+
+/// Maps Elasticsearch error types to curated messages; upstream details are never returned.
+fn rejected_message(status: u16, kind: &str, detail: &str) -> (StatusCode, &'static str) {
+    let detail = detail.to_ascii_lowercase();
+    let fallback = match status {
+        404 => StatusCode::NOT_FOUND,
+        400 => StatusCode::BAD_REQUEST,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    match kind {
+        "index_not_found_exception" => (
+            StatusCode::NOT_FOUND,
+            "No Elasticsearch index matches this Data View pattern",
+        ),
+        "index_closed_exception" => (
+            StatusCode::BAD_REQUEST,
+            "The Data View pattern matches a closed index; exclude it or open it in Elasticsearch",
+        ),
+        "too_many_buckets_exception" => (
+            StatusCode::BAD_REQUEST,
+            "The histogram has too many buckets; choose a larger interval or a shorter time range",
+        ),
+        "search_timeout_exception" => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "Elasticsearch search timed out; narrow the time range, query, or pattern",
+        ),
+        "es_rejected_execution_exception" | "circuit_breaking_exception" => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Elasticsearch is overloaded; retry or narrow the time range",
+        ),
+        _ if status == 429 => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Elasticsearch is overloaded; retry or narrow the time range",
+        ),
+        _ if detail.contains("fielddata") || detail.contains("text fields are not optimised") => (
+            StatusCode::BAD_REQUEST,
+            "Text fields cannot be sorted or used for breakdowns; use a keyword field such as `<field>.keyword`",
+        ),
+        _ if detail.contains("no mapping found") => (
+            StatusCode::BAD_REQUEST,
+            "A sort or breakdown field is not mapped in every index matched by this pattern",
+        ),
+        _ if detail.contains("incompatible") || detail.contains("different type") => (
+            StatusCode::BAD_REQUEST,
+            "A field has different types across the indices matched by this pattern; choose another field or narrow the pattern",
+        ),
+        "query_shard_exception" | "parse_exception" | "query_parsing_exception"
+            if detail.contains("query") =>
+        {
+            (
+                StatusCode::BAD_REQUEST,
+                "Elasticsearch could not parse the query; check the Lucene syntax",
+            )
+        }
+        _ => (fallback, "Elasticsearch rejected the request"),
     }
 }
 
@@ -177,12 +259,35 @@ mod tests {
         ] {
             let error: ConnectorError = ElasticsearchError::Rejected {
                 status: upstream,
+                kind: "some_exception".to_owned(),
                 detail: "password=secret".to_owned(),
             }
             .into();
             assert_eq!(error.status, expected);
             assert_eq!(error.code, "elasticsearch_rejected_request");
             assert!(!error.message.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn rejected_errors_use_curated_messages_by_error_type() {
+        for (status, kind, detail, expected_status, expected) in [
+            (404, "index_not_found_exception", "no such index [x]", StatusCode::NOT_FOUND, "No Elasticsearch index"),
+            (400, "illegal_argument_exception", "Text fields are not optimised for operations", StatusCode::BAD_REQUEST, "Text fields cannot be sorted"),
+            (400, "query_shard_exception", "No mapping found for [x] in order to sort on", StatusCode::BAD_REQUEST, "not mapped in every index"),
+            (400, "query_shard_exception", "Failed to parse query [a AND]", StatusCode::BAD_REQUEST, "could not parse the query"),
+            (429, "", "", StatusCode::SERVICE_UNAVAILABLE, "overloaded"),
+            (500, "search_timeout_exception", "Time exceeded", StatusCode::GATEWAY_TIMEOUT, "timed out"),
+        ] {
+            let error: ConnectorError = ElasticsearchError::Rejected {
+                status,
+                kind: kind.to_owned(),
+                detail: detail.to_owned(),
+            }
+            .into();
+            assert_eq!(error.status, expected_status, "{kind}: {detail}");
+            assert!(error.message.contains(expected), "{}", error.message);
+            assert!(!error.message.contains(detail) || detail.is_empty());
         }
     }
 }

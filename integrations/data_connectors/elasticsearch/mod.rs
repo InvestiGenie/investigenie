@@ -1,3 +1,4 @@
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -29,6 +30,7 @@ pub enum ElasticsearchAuthentication {
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const SEARCH_TIMEOUT: &str = "10s";
 const MAX_ERROR_DETAIL_CHARS: usize = 400;
+const MAX_SCOPED_INDICES_BYTES: usize = 4096;
 
 pub fn descriptor() -> IntegrationDescriptor {
     IntegrationDescriptor {
@@ -63,12 +65,32 @@ pub enum ElasticsearchError {
     #[error("Elasticsearch request could not be completed")]
     Request,
     #[error("Elasticsearch returned HTTP {status}: {detail}")]
-    Rejected { status: u16, detail: String },
+    Rejected {
+        status: u16,
+        kind: String,
+        detail: String,
+    },
     #[error("Elasticsearch returned an invalid response")]
     InvalidResponse,
     #[error("Index pattern contains unsupported characters")]
     InvalidIndex,
+    #[error("Field {0} cannot be sorted")]
+    UnsortableField(String),
+    #[error("Field {0} has incompatible types across matched indices")]
+    IncompatibleField(String),
+    #[error("Time field {0} is not a date in the matched indices")]
+    TimeFieldConflict(String),
+    #[error("Elasticsearch could not search every matched shard")]
+    PartialResults,
 }
+
+struct FieldCapability {
+    field_type: String,
+    aggregatable: bool,
+    indices: Option<Vec<String>>,
+}
+
+type FieldCapabilities = HashMap<String, Vec<FieldCapability>>;
 
 #[derive(Debug, Deserialize)]
 struct IndexRecord {
@@ -320,6 +342,9 @@ impl ElasticsearchClient {
         let mut histogram_options = request
             .histogram_options()
             .map_err(|_| ElasticsearchError::InvalidIndex)?;
+        let capabilities = self.field_capabilities(&request).await;
+        let scope = search_scope(&request, capabilities.as_ref())?;
+        let sort = sort_clause(&request, capabilities.as_ref())?;
 
         let query = if request.query.trim().is_empty() {
             json!({ "match_all": {} })
@@ -347,16 +372,6 @@ impl ElasticsearchClient {
             query
         };
 
-        let sort = request.sort_by.as_ref().map_or_else(
-            || json!([{"_score": {"order": "desc"}}]),
-            |field| {
-                let mut options = json!({"order": request.sort_order.as_deref().unwrap_or("asc")});
-                if request.histogram_field.as_ref() == Some(field) {
-                    options["unmapped_type"] = json!("date");
-                }
-                json!([{(field): options}])
-            },
-        );
         let body = json!({
             "query": query,
             "from": request.from,
@@ -377,7 +392,7 @@ impl ElasticsearchClient {
             let cursor = if token.is_empty() {
                 let response = self
                     .client
-                    .post(self.url_for(&[request.index.as_str(), "_pit"])?)
+                    .post(self.url_for(&[scope.as_str(), "_pit"])?)
                     .query(&[
                         ("keep_alive", "1m"),
                         ("allow_partial_search_results", "false"),
@@ -415,7 +430,7 @@ impl ElasticsearchClient {
             pit_id = Some(cursor.pit_id);
             self.url_for(&["_search"])?
         } else {
-            self.url_for(&[request.index.as_str(), "_search"])?
+            self.url_for(&[scope.as_str(), "_search"])?
         };
         if histogram_options.breakdown_field.is_some()
             && histogram_options.interval.is_none()
@@ -454,15 +469,16 @@ impl ElasticsearchClient {
                 pit_id = Some(id.to_owned());
                 body["pit"]["id"] = json!(id);
             }
-            if bounds.get("timed_out").and_then(Value::as_bool) != Some(false)
-                || bounds.pointer("/_shards/failed").and_then(Value::as_u64) != Some(0)
-            {
+            if bounds.pointer("/_shards/failed").and_then(Value::as_u64) != Some(0) {
                 if let Some(id) = pit_id.as_deref() {
                     self.close_pit(id).await;
                 }
-                return Err(ElasticsearchError::InvalidResponse);
+                return Err(ElasticsearchError::PartialResults);
             }
-            if let (Some(first), Some(last)) = (
+            // A timed-out bounds probe may miss documents, so keep the automatic histogram instead.
+            let bounds_complete = bounds.get("timed_out").and_then(Value::as_bool) == Some(false);
+            if let (true, Some(first), Some(last)) = (
+                bounds_complete,
                 bounds
                     .pointer("/aggregations/first_timestamp/value")
                     .and_then(Value::as_f64),
@@ -475,13 +491,13 @@ impl ElasticsearchClient {
                 body["aggs"] = histogram_aggregations(field, &request, &histogram_options);
             }
         }
-        let search_request = self.client.post(url).json(&body);
-        let search_request = if pit_id.is_some() {
-            search_request.query(&[("allow_partial_search_results", "false")])
-        } else {
-            search_request
-        };
-        let response = search_request.send().await;
+        let response = self
+            .client
+            .post(url)
+            .query(&[("allow_partial_search_results", "false")])
+            .json(&body)
+            .send()
+            .await;
         let decoded = match response {
             Ok(response) => decode::<SearchEnvelope>(response).await,
             Err(_) => Err(ElasticsearchError::Request),
@@ -495,21 +511,21 @@ impl ElasticsearchClient {
                 return Err(error);
             }
         };
+        let shards_failed = envelope
+            .shards
+            .as_ref()
+            .and_then(|shards| shards.get("failed"))
+            .and_then(Value::as_u64);
+        let timed_out = envelope.timed_out.unwrap_or(false);
         let mut next_cursor = None;
         if let Some(opened_id) = pit_id {
             let id = envelope.pit_id.as_deref().unwrap_or(&opened_id);
-            let complete_response = envelope.timed_out == Some(false)
-                && envelope
-                    .shards
-                    .as_ref()
-                    .and_then(|shards| shards.get("failed"))
-                    .and_then(Value::as_u64)
-                    == Some(0);
-            if !complete_response {
+            if shards_failed != Some(0) {
                 self.close_pit(id).await;
-                return Err(ElasticsearchError::InvalidResponse);
+                return Err(ElasticsearchError::PartialResults);
             }
-            if envelope.hits.hits.len() >= request.size {
+            // Continuing after a timed-out page could skip documents, so return it without a cursor.
+            if !timed_out && envelope.hits.hits.len() >= request.size {
                 let cursor = SearchCursor {
                     pit_id: id.to_owned(),
                     sort: envelope.hits.hits.last().unwrap().sort.clone(),
@@ -524,6 +540,8 @@ impl ElasticsearchClient {
             } else {
                 self.close_pit(id).await;
             }
+        } else if shards_failed.is_some_and(|failed| failed > 0) {
+            return Err(ElasticsearchError::PartialResults);
         }
         let (total, total_relation) = match envelope.hits.total {
             Some(TotalHits::Detailed { value, relation }) => (value, relation),
@@ -542,13 +560,75 @@ impl ElasticsearchClient {
         Ok(SearchResult {
             next_cursor,
             took: envelope.took,
-            timed_out: envelope.timed_out.unwrap_or(false),
+            timed_out,
             total,
             total_relation,
             hits: envelope.hits.hits,
             histogram,
             histogram_interval,
         })
+    }
+
+    async fn field_capabilities(&self, request: &SearchRequest) -> Option<FieldCapabilities> {
+        let mut fields = Vec::new();
+        if let Some(field) = request.histogram_field.as_deref() {
+            fields.push(field);
+        }
+        if let Some(field) = request
+            .sort_by
+            .as_deref()
+            .filter(|field| !matches!(*field, "_score" | "_shard_doc" | "_doc"))
+            .filter(|field| !fields.contains(field))
+        {
+            fields.push(field);
+        }
+        if fields.is_empty() {
+            return None;
+        }
+        let url = self
+            .url_for(&[request.index.as_str(), "_field_caps"])
+            .ok()?;
+        let response = self
+            .client
+            .get(url)
+            .query(&[
+                ("fields", fields.join(",")),
+                ("include_unmapped", "true".to_owned()),
+            ])
+            .send()
+            .await
+            .ok()?;
+        // Capabilities only refine scope and sorting; the search itself still reports real failures.
+        let response: Value = decode(response).await.ok()?;
+        let mapped = response.get("fields")?.as_object()?;
+        Some(
+            fields
+                .into_iter()
+                .filter_map(|field| {
+                    let types = mapped.get(field)?.as_object()?;
+                    let capabilities = types
+                        .iter()
+                        .map(|(field_type, details)| FieldCapability {
+                            field_type: field_type.clone(),
+                            aggregatable: details
+                                .get("aggregatable")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            indices: details.get("indices").and_then(Value::as_array).map(
+                                |indices| {
+                                    indices
+                                        .iter()
+                                        .filter_map(Value::as_str)
+                                        .map(str::to_owned)
+                                        .collect()
+                                },
+                            ),
+                        })
+                        .collect();
+                    Some((field.to_owned(), capabilities))
+                })
+                .collect(),
+        )
     }
 
     async fn close_pit(&self, id: &str) {
@@ -689,6 +769,98 @@ fn authorization_header(value: String) -> Result<header::HeaderMap, Elasticsearc
     Ok(headers)
 }
 
+fn is_date_type(field_type: &str) -> bool {
+    matches!(field_type, "date" | "date_nanos")
+}
+
+fn sort_family(field_type: &str) -> &str {
+    match field_type {
+        "long" | "integer" | "short" | "byte" | "double" | "float" | "half_float"
+        | "scaled_float" | "unsigned_long" => "number",
+        "date" | "date_nanos" => "date",
+        "keyword" | "constant_keyword" | "wildcard" => "keyword",
+        other => other,
+    }
+}
+
+/// Restricts a pattern to indices whose time field is a date when other indices map it differently.
+fn search_scope(
+    request: &SearchRequest,
+    capabilities: Option<&FieldCapabilities>,
+) -> Result<String, ElasticsearchError> {
+    let Some((field, types)) = request
+        .histogram_field
+        .as_deref()
+        .and_then(|field| Some((field, capabilities?.get(field)?)))
+    else {
+        return Ok(request.index.clone());
+    };
+    if types
+        .iter()
+        .all(|capability| is_date_type(&capability.field_type) || capability.field_type == "unmapped")
+    {
+        return Ok(request.index.clone());
+    }
+    let indices = types
+        .iter()
+        .filter(|capability| is_date_type(&capability.field_type))
+        .flat_map(|capability| capability.indices.iter().flatten().cloned())
+        .collect::<BTreeSet<_>>();
+    let scope = indices.iter().cloned().collect::<Vec<_>>().join(",");
+    if indices.is_empty()
+        || scope.len() > MAX_SCOPED_INDICES_BYTES
+        || indices.iter().any(|index| validate_index(index).is_err())
+    {
+        return Err(ElasticsearchError::TimeFieldConflict(field.to_owned()));
+    }
+    Ok(scope)
+}
+
+fn sort_clause(
+    request: &SearchRequest,
+    capabilities: Option<&FieldCapabilities>,
+) -> Result<Value, ElasticsearchError> {
+    let Some(field) = request.sort_by.as_ref() else {
+        return Ok(json!([{"_score": {"order": "desc"}}]));
+    };
+    let mut options = json!({"order": request.sort_order.as_deref().unwrap_or("asc")});
+    if request.histogram_field.as_ref() == Some(field) {
+        options["unmapped_type"] = json!("date");
+    } else if let Some(types) = capabilities.and_then(|capabilities| capabilities.get(field)) {
+        let mapped = types
+            .iter()
+            .filter(|capability| capability.field_type != "unmapped")
+            .collect::<Vec<_>>();
+        if mapped.iter().any(|capability| !capability.aggregatable) {
+            return Err(ElasticsearchError::UnsortableField(field.clone()));
+        }
+        let families = mapped
+            .iter()
+            .map(|capability| sort_family(&capability.field_type))
+            .collect::<BTreeSet<_>>();
+        if families.len() > 1 {
+            return Err(ElasticsearchError::IncompatibleField(field.clone()));
+        }
+        if let (Some(first), Some(family)) = (mapped.first(), families.first()) {
+            let mixed = mapped.len() > 1;
+            if mapped.len() < types.len() {
+                options["unmapped_type"] = json!(match *family {
+                    "number" if mixed => "double",
+                    "date" => "date",
+                    "keyword" => "keyword",
+                    _ => first.field_type.as_str(),
+                });
+            }
+            match *family {
+                "number" if mixed => options["numeric_type"] = json!("double"),
+                "date" if mixed => options["numeric_type"] = json!("date_nanos"),
+                _ => {}
+            }
+        }
+    }
+    Ok(json!([{(field): options}]))
+}
+
 fn validate_index(index: &str) -> Result<(), ElasticsearchError> {
     if index.is_empty()
         || index.len() > 255
@@ -763,7 +935,15 @@ fn collect_fields(
             .and_then(Value::as_str)
             .unwrap_or("object")
             .to_owned();
-        fields.insert(field_name.clone(), field_type);
+        // Patterns can map a field differently per index; keep a date type so it remains a time field.
+        fields
+            .entry(field_name.clone())
+            .and_modify(|existing: &mut String| {
+                if is_date_type(&field_type) && !is_date_type(existing) {
+                    existing.clone_from(&field_type);
+                }
+            })
+            .or_insert(field_type);
         if let Some(children) = definition.get("properties") {
             collect_fields(children, &field_name, fields);
         }
@@ -777,18 +957,28 @@ async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, Elasticsea
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        let detail = serde_json::from_str::<Value>(&body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .pointer("/error/reason")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| "Elasticsearch request failed".to_owned());
+        let error = serde_json::from_str::<Value>(&body).unwrap_or_default();
+        let text = |pointers: [&str; 3]| {
+            pointers
+                .into_iter()
+                .find_map(|pointer| error.pointer(pointer).and_then(Value::as_str))
+                .unwrap_or_default()
+                .chars()
+                .take(MAX_ERROR_DETAIL_CHARS)
+                .collect::<String>()
+        };
         return Err(ElasticsearchError::Rejected {
             status: status.as_u16(),
-            detail: detail.chars().take(MAX_ERROR_DETAIL_CHARS).collect(),
+            kind: text([
+                "/error/failed_shards/0/reason/type",
+                "/error/root_cause/0/type",
+                "/error/type",
+            ]),
+            detail: text([
+                "/error/failed_shards/0/reason/reason",
+                "/error/root_cause/0/reason",
+                "/error/reason",
+            ]),
         });
     }
 
@@ -1025,7 +1215,7 @@ mod tests {
     async fn cursor_search_rejects_partial_pages_and_closes_empty_pages() {
         for (timed_out, failed, succeeds) in [
             (false, Some(0), true),
-            (true, Some(0), false),
+            (true, Some(0), true),
             (false, Some(1), false),
             (false, None, false),
         ] {
@@ -1061,8 +1251,122 @@ mod tests {
             assert_eq!(result.is_ok(), succeeds);
             if let Ok(result) = result {
                 assert!(result.next_cursor.is_none());
+                assert_eq!(result.timed_out, timed_out);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn mixed_pattern_scopes_time_field_and_adds_sort_fallbacks() {
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path("/mix-*/_field_caps"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"fields":{
+                "@timestamp":{
+                    "date":{"type":"date","aggregatable":true,"indices":["mix-a","mix-b"]},
+                    "date_nanos":{"type":"date_nanos","aggregatable":true,"indices":["mix-c"]},
+                    "keyword":{"type":"keyword","aggregatable":true,"indices":["mix-d"]}
+                },
+                "duration_ms":{
+                    "long":{"type":"long","aggregatable":true,"indices":["mix-a"]},
+                    "integer":{"type":"integer","aggregatable":true,"indices":["mix-c"]},
+                    "unmapped":{"type":"unmapped","aggregatable":false,"indices":["mix-b","mix-d"]}
+                }
+            }})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/mix-a,mix-b,mix-c/_search"))
+            .and(matchers::query_param("allow_partial_search_results", "false"))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                body["sort"]
+                    == json!([{"duration_ms":{"order":"desc","unmapped_type":"double","numeric_type":"double"}}])
+            })
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"timed_out":false,"_shards":{"failed":0},"hits":{"total":0,"hits":[]}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = ElasticsearchClient::new(ElasticsearchSettings {
+            url: Url::parse(&server.uri()).unwrap(),
+            authentication: None,
+            tls_insecure: false,
+        })
+        .unwrap();
+        let request: SearchRequest = serde_json::from_value(json!({
+            "index": "mix-*", "from": 0, "size": 2, "include_histogram": false,
+            "sort_by": "duration_ms", "sort_order": "desc", "histogram_field": "@timestamp"
+        }))
+        .unwrap();
+        client.search(request).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mixed_pattern_rejects_unsortable_and_incompatible_fields_before_searching() {
+        for (types, unsortable) in [
+            (json!({"text":{"type":"text","aggregatable":false}}), true),
+            (
+                json!({
+                    "keyword":{"type":"keyword","aggregatable":true,"indices":["mix-a"]},
+                    "boolean":{"type":"boolean","aggregatable":true,"indices":["mix-b"]}
+                }),
+                false,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(matchers::method("GET"))
+                .and(matchers::path("/mix-*/_field_caps"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"fields":{"service":types}})),
+                )
+                .mount(&server)
+                .await;
+            let client = ElasticsearchClient::new(ElasticsearchSettings {
+                url: Url::parse(&server.uri()).unwrap(),
+                authentication: None,
+                tls_insecure: false,
+            })
+            .unwrap();
+            let request: SearchRequest = serde_json::from_value(json!({
+                "index": "mix-*", "from": 0, "size": 2, "sort_by": "service"
+            }))
+            .unwrap();
+            let error = client.search(request).await.unwrap_err();
+            assert_eq!(
+                matches!(error, super::ElasticsearchError::UnsortableField(_)),
+                unsortable
+            );
+            assert_eq!(
+                matches!(error, super::ElasticsearchError::IncompatibleField(_)),
+                !unsortable
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn time_field_without_date_mapping_is_a_clear_error() {
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path("/logs/_field_caps"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"fields":{
+                "created_at":{"keyword":{"type":"keyword","aggregatable":true}}
+            }})))
+            .mount(&server)
+            .await;
+        let client = ElasticsearchClient::new(ElasticsearchSettings {
+            url: Url::parse(&server.uri()).unwrap(),
+            authentication: None,
+            tls_insecure: false,
+        })
+        .unwrap();
+        assert!(matches!(
+            client.search(cursor_request("")).await,
+            Err(super::ElasticsearchError::TimeFieldConflict(_))
+        ));
     }
 
     #[test]

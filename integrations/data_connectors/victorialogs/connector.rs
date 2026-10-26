@@ -2,8 +2,8 @@ use super::{
     VictoriaLogsClient, VictoriaLogsError, VictoriaLogsSettings,
 };
 use crate::data_connectors::{
-    string_setting, ConnectionConfig, Connector, ConnectorError, ConnectorFuture, FieldSummary,
-    IndexSummary,
+    basic_credentials, string_setting, ConnectionConfig, Connector, ConnectorError,
+    ConnectorFuture, FieldSummary, IndexSummary,
 };
 use crate::search::SearchRequest;
 use axum::http::StatusCode;
@@ -13,8 +13,7 @@ use std::sync::Arc;
 pub fn connect(config: &ConnectionConfig) -> Result<Arc<dyn Connector>, ConnectorError> {
     let raw_url = string_setting(config, "url")?.ok_or_else(ConnectorError::invalid_connection)?;
     let url = url::Url::parse(&raw_url).map_err(|_| ConnectorError::invalid_connection())?;
-    let username = string_setting(config, "username")?;
-    let password = string_setting(config, "password")?;
+    let (username, password) = basic_credentials(config)?.unzip();
     let account_id = string_setting(config, "account_id")?;
     let project_id = string_setting(config, "project_id")?;
     Ok(Arc::new(VictoriaLogsClient::new(VictoriaLogsSettings {

@@ -21,7 +21,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const QUERY_TIMEOUT: &str = "10s";
 const MAX_QUERY_BYTES: usize = 8192;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_SERIES: usize = 500;
+const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_SAMPLES: usize = 50_000;
 const MAX_PAGE_SIZE: usize = 100;
 
@@ -64,8 +64,10 @@ pub enum PrometheusError {
     InvalidConfiguration,
     #[error("PromQL query or search parameters are invalid or exceed configured limits")]
     InvalidQuery,
-    #[error("Prometheus returned more series or samples than this connector can safely display")]
+    #[error("Prometheus returned more samples than this connector can safely read at once")]
     TooManyResults,
+    #[error("Sorting by a label or value needs every sample, which exceeds the connector limit")]
+    SortTooLarge,
     #[error("Prometheus response exceeded the configured size limit")]
     ResponseTooLarge,
     #[error("Prometheus returned warnings, so the result may be incomplete")]
@@ -75,7 +77,7 @@ pub enum PrometheusError {
     #[error("Prometheus request could not be completed")]
     Request,
     #[error("Prometheus rejected the request with HTTP {status}")]
-    Rejected { status: u16 },
+    Rejected { status: u16, error_type: String },
     #[error("Prometheus returned an invalid response")]
     InvalidResponse,
 }
@@ -91,6 +93,13 @@ struct EvaluatedSample {
 struct BucketCounts {
     count: u64,
     breakdown: BTreeMap<String, u64>,
+}
+
+/// Number of evaluated samples at one query step, optionally for one breakdown label value.
+struct StepCount {
+    timestamp: i64,
+    key: Option<String>,
+    count: u64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -136,8 +145,8 @@ impl PrometheusClient {
 
     pub async fn test_connection(&self) -> Result<(), PrometheusError> {
         let response = self
-            .request("api/v1/labels")?
-            .query(&[("limit", "1"), ("timeout", QUERY_TIMEOUT)])
+            .request("api/v1/query")?
+            .form(&[("query", "vector(1)"), ("timeout", QUERY_TIMEOUT)])
             .send()
             .await
             .map_err(|_| PrometheusError::Request)?;
@@ -241,73 +250,85 @@ impl PrometheusClient {
             .or_else(|| HistogramInterval::automatic(span as f64))
             .ok_or(PrometheusError::InvalidQuery)?;
         let step_millis = interval.approximate_millis();
-        let step = format!("{step_millis}ms");
-        let start = range.start as f64 / 1000.0;
-        let end = range.end as f64 / 1000.0;
+        if step_millis <= 0 {
+            return Err(PrometheusError::InvalidQuery);
+        }
 
         let started = Instant::now();
-        let response = self
-            .request("api/v1/query_range")?
-            .form(&[
-                ("query", query.to_owned()),
-                ("start", start.to_string()),
-                ("end", end.to_string()),
-                ("step", step),
-                ("timeout", QUERY_TIMEOUT.to_owned()),
-                ("limit", (MAX_SERIES + 1).to_string()),
-            ])
-            .send()
-            .await
-            .map_err(|_| PrometheusError::Request)?;
-        let body = read_bounded(response).await?;
-        let response: Value =
-            serde_json::from_slice(&body).map_err(|_| PrometheusError::InvalidResponse)?;
-        validate_success(&response)?;
-        if response
-            .get("warnings")
-            .and_then(Value::as_array)
-            .is_some_and(|warnings| !warnings.is_empty())
-        {
-            return Err(PrometheusError::PartialResponse);
-        }
-        let data = response
-            .get("data")
-            .ok_or(PrometheusError::InvalidResponse)?;
-        if data.get("resultType").and_then(Value::as_str) != Some("matrix") {
-            return Err(PrometheusError::InvalidResponse);
-        }
-        let series = data
-            .get("result")
-            .and_then(Value::as_array)
-            .ok_or(PrometheusError::InvalidResponse)?;
-        if series.len() > MAX_SERIES {
-            return Err(PrometheusError::TooManyResults);
-        }
-        let mut samples = parse_matrix(series)?;
-        if samples.len() > MAX_SAMPLES {
-            return Err(PrometheusError::TooManyResults);
-        }
-        samples.retain(|sample| sample.timestamp >= range.start && sample.timestamp <= range.end);
-        samples.sort_by(|left, right| compare_samples(left, right, &request));
-        let total = samples.len() as u64;
+        let first_page = request.cursor.as_deref().is_none_or(str::is_empty);
+        let wants_histogram = first_page
+            && request.histogram_field.is_some()
+            && request.include_histogram.unwrap_or(true);
+        let breakdown_field = options
+            .breakdown_field
+            .as_deref()
+            .filter(|_| wants_histogram);
+        let time_sorted = request.sort_by.as_deref().is_none_or(|field| field == "_time");
+        let descending =
+            request.sort_by.is_none() || request.sort_order.as_deref() == Some("desc");
+
+        // Count evaluated samples per step on the server so totals and histograms never need every row.
+        let counts = match breakdown_field {
+            Some(field) if !is_label_name(field) => None,
+            _ => {
+                let count_query = match breakdown_field {
+                    Some(label) => format!("count by ({label}) ({query})"),
+                    None => format!("count({query})"),
+                };
+                match self.query_range(&count_query, range, step_millis).await {
+                    Ok(series) => Some(parse_step_counts(&series, breakdown_field)?),
+                    // Expressions that are not instant vectors, such as scalars, cannot be counted.
+                    Err(PrometheusError::Rejected { status: 400, .. }) => None,
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+
+        let mut histogram = Vec::new();
+        let (total, page) = match counts {
+            Some(counts) => {
+                let total = counts.iter().map(|entry| entry.count).sum::<u64>();
+                if wants_histogram {
+                    histogram = weighted_histogram(
+                        range,
+                        step_millis,
+                        breakdown_field.is_some(),
+                        counts
+                            .iter()
+                            .map(|entry| (entry.timestamp, entry.key.clone(), entry.count)),
+                    )?;
+                }
+                let page = if offset >= total {
+                    Vec::new()
+                } else if time_sorted {
+                    self.time_window_page(query, &counts, step_millis, offset, descending, &request)
+                        .await?
+                } else if total > MAX_SAMPLES as u64 {
+                    return Err(PrometheusError::SortTooLarge);
+                } else {
+                    let samples = self
+                        .evaluated_samples(query, range, step_millis, &request)
+                        .await?;
+                    page_of(samples, offset, request.size)
+                };
+                (total, page)
+            }
+            None => {
+                let samples = self
+                    .evaluated_samples(query, range, step_millis, &request)
+                    .await?;
+                if wants_histogram {
+                    histogram = sample_histogram(&samples, range, step_millis, breakdown_field)?;
+                }
+                (samples.len() as u64, page_of(samples, offset, request.size))
+            }
+        };
         let end_offset = offset
             .checked_add(request.size as u64)
             .ok_or(PrometheusError::InvalidQuery)?;
         let next_cursor = (end_offset < total).then(|| end_offset.to_string());
-        let first_page = request.cursor.as_deref().is_none_or(str::is_empty);
-        let mut histogram = Vec::new();
-        let mut histogram_interval = None;
-        if first_page
-            && request.histogram_field.is_some()
-            && request.include_histogram.unwrap_or(true)
-        {
-            histogram = sample_histogram(&samples, range, step_millis, options.breakdown_field.as_deref())?;
-            histogram_interval = Some(format!("{}{}", interval.count, interval.suffix()));
-        }
-        let hits = samples
+        let hits = page
             .into_iter()
-            .skip(offset as usize)
-            .take(request.size)
             .map(|sample| {
                 json!({
                     "index": request.index,
@@ -326,13 +347,109 @@ impl PrometheusClient {
             "hits": hits,
             "histogram": histogram,
         });
-        if let Some(interval) = histogram_interval {
-            result["histogram_interval"] = json!(interval);
+        if wants_histogram {
+            result["histogram_interval"] = json!(format!("{}{}", interval.count, interval.suffix()));
         }
         if let Some(cursor) = next_cursor {
             result["next_cursor"] = json!(cursor);
         }
         Ok(result)
+    }
+
+    /// Fetches only the query steps that contain the requested time-sorted page.
+    async fn time_window_page(
+        &self,
+        query: &str,
+        counts: &[StepCount],
+        step_millis: i64,
+        offset: u64,
+        descending: bool,
+        request: &crate::search::SearchRequest,
+    ) -> Result<Vec<EvaluatedSample>, PrometheusError> {
+        let mut per_step = BTreeMap::<i64, u64>::new();
+        for entry in counts {
+            *per_step.entry(entry.timestamp).or_default() += entry.count;
+        }
+        let steps: Vec<(i64, u64)> = if descending {
+            per_step.into_iter().rev().collect()
+        } else {
+            per_step.into_iter().collect()
+        };
+        let end_offset = offset.saturating_add(request.size as u64);
+        let mut seen = 0u64;
+        let mut before = 0u64;
+        let mut window: Option<(i64, i64)> = None;
+        for (timestamp, count) in steps {
+            let next = seen.saturating_add(count);
+            if next > offset && seen < end_offset {
+                window = Some(match window {
+                    None => {
+                        before = seen;
+                        (timestamp, timestamp)
+                    }
+                    Some((low, high)) => (low.min(timestamp), high.max(timestamp)),
+                });
+            }
+            if next >= end_offset {
+                break;
+            }
+            seen = next;
+        }
+        let Some((start, end)) = window else {
+            return Ok(Vec::new());
+        };
+        let samples = self
+            .evaluated_samples(query, TimeRange { start, end }, step_millis, request)
+            .await?;
+        Ok(page_of(samples, offset - before, request.size))
+    }
+
+    async fn evaluated_samples(
+        &self,
+        query: &str,
+        range: TimeRange,
+        step_millis: i64,
+        request: &crate::search::SearchRequest,
+    ) -> Result<Vec<EvaluatedSample>, PrometheusError> {
+        let series = self.query_range(query, range, step_millis).await?;
+        let mut samples = parse_matrix(&series)?;
+        samples.retain(|sample| sample.timestamp >= range.start && sample.timestamp <= range.end);
+        samples.sort_by(|left, right| compare_samples(left, right, request));
+        Ok(samples)
+    }
+
+    async fn query_range(
+        &self,
+        query: &str,
+        range: TimeRange,
+        step_millis: i64,
+    ) -> Result<Vec<Value>, PrometheusError> {
+        let response = self
+            .request("api/v1/query_range")?
+            .form(&[
+                ("query", query.to_owned()),
+                ("start", seconds(range.start)),
+                ("end", seconds(range.end)),
+                ("step", format!("{step_millis}ms")),
+                ("timeout", QUERY_TIMEOUT.to_owned()),
+            ])
+            .send()
+            .await
+            .map_err(|_| PrometheusError::Request)?;
+        let body = read_bounded(response).await?;
+        let mut response: Value =
+            serde_json::from_slice(&body).map_err(|_| PrometheusError::InvalidResponse)?;
+        validate_success(&response)?;
+        let data = response
+            .get_mut("data")
+            .ok_or(PrometheusError::InvalidResponse)?;
+        if data.get("resultType").and_then(Value::as_str) != Some("matrix") {
+            return Err(PrometheusError::InvalidResponse);
+        }
+        match data.get_mut("result").map(Value::take) {
+            Some(Value::Array(series)) => Ok(series),
+            _ => Err(PrometheusError::InvalidResponse),
+        }
     }
 
     fn request(&self, path: &str) -> Result<reqwest::RequestBuilder, PrometheusError> {
@@ -365,15 +482,65 @@ fn cursor_offset(cursor: Option<&str>, from: usize) -> Result<u64, PrometheusErr
     match cursor {
         None if from <= 10_000 => Ok(from as u64),
         Some("") => Ok(0),
-        Some(token) if token.len() <= 6 && token.bytes().all(|byte| byte.is_ascii_digit()) => {
-            token
-                .parse::<u64>()
-                .ok()
-                .filter(|offset| *offset <= MAX_SAMPLES as u64)
-                .ok_or(PrometheusError::InvalidQuery)
+        Some(token) if token.len() <= 15 && token.bytes().all(|byte| byte.is_ascii_digit()) => {
+            token.parse::<u64>().map_err(|_| PrometheusError::InvalidQuery)
         }
         _ => Err(PrometheusError::InvalidQuery),
     }
+}
+
+fn seconds(millis: i64) -> String {
+    format!("{}.{:03}", millis.div_euclid(1000), millis.rem_euclid(1000))
+}
+
+fn is_label_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    !matches!(name, "_time" | "_value")
+        && chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|next| next.is_ascii_alphanumeric() || next == '_')
+}
+
+fn page_of(samples: Vec<EvaluatedSample>, offset: u64, size: usize) -> Vec<EvaluatedSample> {
+    samples
+        .into_iter()
+        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+        .take(size)
+        .collect()
+}
+
+fn parse_step_counts(
+    series: &[Value],
+    label: Option<&str>,
+) -> Result<Vec<StepCount>, PrometheusError> {
+    let mut counts = Vec::new();
+    for series in series {
+        let key = label
+            .and_then(|label| series.get("metric")?.get(label)?.as_str())
+            .map(str::to_owned);
+        let values = series
+            .get("values")
+            .and_then(Value::as_array)
+            .ok_or(PrometheusError::InvalidResponse)?;
+        for point in values {
+            let point = point
+                .as_array()
+                .filter(|point| point.len() == 2)
+                .ok_or(PrometheusError::InvalidResponse)?;
+            let count = point[1]
+                .as_str()
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .ok_or(PrometheusError::InvalidResponse)?;
+            counts.push(StepCount {
+                timestamp: timestamp_millis(&point[0])?,
+                key: key.clone(),
+                count: count as u64,
+            });
+        }
+    }
+    Ok(counts)
 }
 
 fn parse_matrix(series: &[Value]) -> Result<Vec<EvaluatedSample>, PrometheusError> {
@@ -383,10 +550,14 @@ fn parse_matrix(series: &[Value]) -> Result<Vec<EvaluatedSample>, PrometheusErro
             .get("metric")
             .and_then(Value::as_object)
             .ok_or(PrometheusError::InvalidResponse)?;
-        let values = series
-            .get("values")
-            .and_then(Value::as_array)
-            .ok_or(PrometheusError::InvalidResponse)?;
+        // Native-histogram-only series carry `histograms` without `values`.
+        let values = match series.get("values") {
+            Some(values) => values
+                .as_array()
+                .ok_or(PrometheusError::InvalidResponse)?
+                .as_slice(),
+            None => &[],
+        };
         for point in values {
             let point = point.as_array().ok_or(PrometheusError::InvalidResponse)?;
             if point.len() != 2 {
@@ -394,7 +565,7 @@ fn parse_matrix(series: &[Value]) -> Result<Vec<EvaluatedSample>, PrometheusErro
             }
             let timestamp = timestamp_millis(&point[0])?;
             let value = parse_sample_value(&point[1])?;
-            samples.push(make_sample(labels, timestamp, value, samples.len()));
+            samples.push(make_sample(labels, timestamp, value));
             if samples.len() > MAX_SAMPLES {
                 return Err(PrometheusError::TooManyResults);
             }
@@ -409,7 +580,6 @@ fn parse_matrix(series: &[Value]) -> Result<Vec<EvaluatedSample>, PrometheusErro
                     labels,
                     timestamp_millis(&point[0])?,
                     point[1].clone(),
-                    samples.len(),
                 ));
                 if samples.len() > MAX_SAMPLES {
                     return Err(PrometheusError::TooManyResults);
@@ -420,7 +590,8 @@ fn parse_matrix(series: &[Value]) -> Result<Vec<EvaluatedSample>, PrometheusErro
     Ok(samples)
 }
 
-fn make_sample(labels: &Map<String, Value>, timestamp: i64, value: Value, ordinal: usize) -> EvaluatedSample {
+/// Sample ids depend only on labels, time, and value so paging windows sort identically.
+fn make_sample(labels: &Map<String, Value>, timestamp: i64, value: Value) -> EvaluatedSample {
     let mut source = labels.clone();
     source.insert("_time".to_owned(), json!(timestamp));
     source.insert("_value".to_owned(), value);
@@ -428,7 +599,7 @@ fn make_sample(labels: &Map<String, Value>, timestamp: i64, value: Value, ordina
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     source.to_string().hash(&mut hasher);
     EvaluatedSample {
-        id: format!("sample-{:016x}-{ordinal}", hasher.finish()),
+        id: format!("sample-{:016x}", hasher.finish()),
         timestamp,
         source,
     }
@@ -494,6 +665,29 @@ fn sample_histogram(
     step_millis: i64,
     breakdown_field: Option<&str>,
 ) -> Result<Vec<HistogramBucket>, PrometheusError> {
+    weighted_histogram(
+        range,
+        step_millis,
+        breakdown_field.is_some(),
+        samples.iter().map(|sample| {
+            let key = breakdown_field
+                .and_then(|field| sample.source.get(field))
+                .filter(|value| !value.is_null())
+                .map(|value| match value {
+                    Value::String(value) => value.clone(),
+                    other => other.to_string(),
+                });
+            (sample.timestamp, key, 1)
+        }),
+    )
+}
+
+fn weighted_histogram(
+    range: TimeRange,
+    step_millis: i64,
+    with_breakdown: bool,
+    entries: impl IntoIterator<Item = (i64, Option<String>, u64)>,
+) -> Result<Vec<HistogramBucket>, PrometheusError> {
     if step_millis <= 0 {
         return Err(PrometheusError::InvalidQuery);
     }
@@ -507,22 +701,16 @@ fn sample_histogram(
         buckets.insert(timestamp, BucketCounts::default());
     }
     let mut key_totals = HashMap::<String, u64>::new();
-    for sample in samples {
-        let offset = sample.timestamp.saturating_sub(range.start).max(0);
+    for (timestamp, key, weight) in entries {
+        let offset = timestamp.saturating_sub(range.start).max(0);
         let timestamp = range
             .start
             .saturating_add(offset.div_euclid(step_millis).saturating_mul(step_millis));
         let bucket = buckets.entry(timestamp).or_default();
-        bucket.count += 1;
-        if let Some(field) = breakdown_field {
-            if let Some(value) = sample.source.get(field).filter(|value| !value.is_null()) {
-                let key = match value {
-                    Value::String(value) => value.clone(),
-                    other => other.to_string(),
-                };
-                *bucket.breakdown.entry(key.clone()).or_default() += 1;
-                *key_totals.entry(key).or_default() += 1;
-            }
+        bucket.count += weight;
+        if let Some(key) = key.filter(|_| with_breakdown) {
+            *bucket.breakdown.entry(key.clone()).or_default() += weight;
+            *key_totals.entry(key).or_default() += weight;
         }
     }
     let mut top_keys = key_totals.into_iter().collect::<Vec<_>>();
@@ -531,7 +719,7 @@ fn sample_histogram(
     Ok(buckets
         .into_iter()
         .map(|(timestamp, bucket)| {
-            let breakdown = breakdown_field.map(|_| {
+            let breakdown = with_breakdown.then(|| {
                 let mut values = top_keys
                     .iter()
                     .map(|(key, _)| BreakdownCount {
@@ -573,8 +761,22 @@ fn validate_success(response: &Value) -> Result<(), PrometheusError> {
 async fn read_bounded(response: Response) -> Result<Vec<u8>, PrometheusError> {
     let status = response.status();
     if !status.is_success() {
+        // Only Prometheus's error category is kept; upstream error text is never returned to clients.
+        let mut response = response;
+        let mut body = Vec::new();
+        while body.len() < MAX_ERROR_BYTES {
+            match response.chunk().await {
+                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                _ => break,
+            }
+        }
+        let error_type = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|error| error.get("errorType")?.as_str().map(str::to_owned))
+            .unwrap_or_default();
         return Err(PrometheusError::Rejected {
             status: status.as_u16(),
+            error_type,
         });
     }
     if response
@@ -602,6 +804,7 @@ async fn read_bounded(response: Response) -> Result<Vec<u8>, PrometheusError> {
 mod tests {
     use super::*;
     use crate::data_connectors::Connector;
+    use axum::http::StatusCode;
     use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
     fn client(url: &str) -> PrometheusClient {
@@ -650,9 +853,13 @@ mod tests {
         let matrix = json!([{
             "metric":{"__name__":"up","job":"api"},
             "values":[[86400.0,"1"],[86401.25,"NaN"]]
+        }, {
+            "metric":{"__name__":"latency"},
+            "histograms":[[86400.0,{"count":"2","sum":"3"}]]
         }]);
         let samples = parse_matrix(matrix.as_array().unwrap()).unwrap();
-        assert_eq!(samples.len(), 2);
+        assert_eq!(samples.len(), 3);
+        assert_eq!(samples[2].source["_value"]["count"], "2");
         assert_eq!(samples[0].timestamp, 86_400_000);
         assert_eq!(samples[0].source["_value"], 1.0);
         assert_eq!(samples[0].source["job"], "api");
@@ -660,23 +867,58 @@ mod tests {
         assert_ne!(samples[0].id, samples[1].id);
     }
 
+    fn form_contains(parts: &'static [&'static str]) -> impl Fn(&wiremock::Request) -> bool {
+        move |request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body);
+            parts.iter().all(|part| body.contains(part)) && !body.contains("limit=")
+        }
+    }
+
     #[tokio::test]
-    async fn search_returns_bounded_pages_and_histogram_with_prometheus_shape() {
+    async fn search_counts_on_the_server_and_fetches_only_the_page_window() {
         let server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/api/v1/query_range"))
-            .and(|request: &wiremock::Request| {
-                let body = String::from_utf8_lossy(&request.body);
-                body.contains("query=up") && body.contains("step=1000ms") && body.contains("limit=501")
-            })
+            .and(form_contains(&["query=count+by+%28job%29+%28up%29", "step=1000ms"]))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "status":"success","data":{"resultType":"matrix","result":[
-                    {"metric":{"__name__":"up","job":"api"},"values":[
-                        [86400.0,"1"],[86401.0,"0"],[86402.0,"1"]
-                    ]}
+                    {"metric":{"job":"api"},"values":[[86400.0,"1"],[86401.0,"1"],[86402.0,"1"]]}
                 ]}
             })))
-            .expect(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/api/v1/query_range"))
+            .and(form_contains(&["query=count%28up%29"]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"resultType":"matrix","result":[
+                    {"metric":{},"values":[[86400.0,"1"],[86401.0,"1"],[86402.0,"1"]]}
+                ]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/api/v1/query_range"))
+            .and(form_contains(&["query=up&", "start=86401.000", "end=86402.000"]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"resultType":"matrix","result":[
+                    {"metric":{"__name__":"up","job":"api"},"values":[[86401.0,"0"],[86402.0,"1"]]}
+                ]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/api/v1/query_range"))
+            .and(form_contains(&["query=up&", "start=86400.000", "end=86400.000"]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"resultType":"matrix","result":[
+                    {"metric":{"__name__":"up","job":"api"},"values":[[86400.0,"1"]]}
+                ]}
+            })))
+            .expect(1)
             .mount(&server)
             .await;
         let client = client(&server.uri());
@@ -695,17 +937,106 @@ mod tests {
         assert_eq!(first["hits"].as_array().unwrap().len(), 2);
         assert_eq!(first["hits"][0]["source"]["_time"], 86402000);
         assert_eq!(first["hits"][0]["source"]["_value"], 1.0);
+        assert_eq!(first["hits"][1]["source"]["_time"], 86401000);
         assert_eq!(first["next_cursor"], "2");
         assert_eq!(first["histogram"].as_array().unwrap().len(), 3);
+        assert_eq!(first["histogram"][0]["count"], 1);
         assert_eq!(first["histogram"][0]["breakdown"][0]["key"], "api");
+        assert_eq!(first["histogram_interval"], "1s");
 
         let mut next_request = request();
         next_request.cursor = Some(first["next_cursor"].as_str().unwrap().to_owned());
         let second = Connector::search(&client, next_request).await.unwrap();
+        assert_eq!(second["total"], 3);
         assert_eq!(second["hits"].as_array().unwrap().len(), 1);
         assert_eq!(second["hits"][0]["source"]["_time"], 86400000);
         assert_eq!(second["histogram"], json!([]));
         assert!(second.get("next_cursor").is_none());
+    }
+
+    #[tokio::test]
+    async fn uncountable_expressions_fall_back_and_large_value_sorts_fail_clearly() {
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/api/v1/query_range"))
+            .and(form_contains(&["query=count%28time%28%29%29"]))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                json!({"status":"error","errorType":"bad_data","error":"expected instant vector"}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/api/v1/query_range"))
+            .and(form_contains(&["query=time%28%29&"]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"resultType":"matrix","result":[
+                    {"metric":{},"values":[[86400.0,"86400"],[86401.0,"86401"]]}
+                ]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/api/v1/query_range"))
+            .and(form_contains(&["query=count%28up%29"]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"resultType":"matrix","result":[
+                    {"metric":{},"values":[[86400.0,"30000"],[86401.0,"30000"]]}
+                ]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client(&server.uri());
+        let request = |query: &str, sort: Option<&str>| {
+            serde_json::from_value(json!({
+                "index":"metrics","query":query,"size":10,"cursor":"","sort_by":sort,
+                "histogram_field":"_time","histogram_interval":"1s",
+                "time_range":{"start":86400000i64,"end":86401000i64}
+            }))
+            .unwrap()
+        };
+        let scalar = client.search(request("time()", None)).await.unwrap();
+        assert_eq!(scalar["total"], 2);
+        assert_eq!(scalar["histogram"][1]["count"], 1);
+        assert!(matches!(
+            client.search(request("up", Some("_value"))).await,
+            Err(PrometheusError::SortTooLarge)
+        ));
+    }
+
+    #[test]
+    fn rejections_use_curated_messages_by_prometheus_error_type() {
+        for (status, error_type, expected_status, expected) in [
+            (400, "bad_data", StatusCode::BAD_REQUEST, "could not parse"),
+            (422, "execution", StatusCode::BAD_REQUEST, "within its limits"),
+            (503, "timeout", StatusCode::GATEWAY_TIMEOUT, "timed out"),
+            (401, "", StatusCode::BAD_GATEWAY, "credentials"),
+        ] {
+            let error: crate::data_connectors::ConnectorError = PrometheusError::Rejected {
+                status,
+                error_type: error_type.to_owned(),
+            }
+            .into();
+            assert_eq!(error.status, expected_status);
+            assert!(error.message.contains(expected), "{}", error.message);
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_test_evaluates_a_constant_query() {
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/api/v1/query"))
+            .and(form_contains(&["query=vector%281%29"]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"resultType":"vector","result":[]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client(&server.uri()).test_connection().await.unwrap();
     }
 
     #[tokio::test]

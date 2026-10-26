@@ -73,6 +73,26 @@ pub fn string_setting(
     }
 }
 
+/// Reads an optional credential. Forms submit untouched secret inputs as empty strings, so blank means unset.
+pub fn credential_setting(
+    config: &ConnectionConfig,
+    name: &str,
+) -> Result<Option<String>, ConnectorError> {
+    Ok(string_setting(config, name)?.filter(|value| !value.trim().is_empty()))
+}
+
+/// Reads optional basic credentials: no username means no authentication, and a username may use an empty password.
+pub fn basic_credentials(
+    config: &ConnectionConfig,
+) -> Result<Option<(String, String)>, ConnectorError> {
+    let password = string_setting(config, "password")?.filter(|value| !value.is_empty());
+    match (credential_setting(config, "username")?, password) {
+        (Some(username), password) => Ok(Some((username, password.unwrap_or_default()))),
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(ConnectorError::invalid_connection()),
+    }
+}
+
 pub fn editable_configuration(
     descriptor: &IntegrationDescriptor,
     existing: &ConnectionConfig,
@@ -146,6 +166,39 @@ mod tests {
         assert!(ids.contains(&"clickhouse"));
         assert!(!ids.contains(&"openai"));
         assert!(connect("openai", &ConnectionConfig::new()).is_err());
+    }
+
+    #[test]
+    fn blank_credentials_mean_no_authentication_for_every_optional_auth_connector() {
+        for (id, url) in [
+            ("prometheus", "http://localhost:9090"),
+            ("victoriametrics", "http://localhost:8428"),
+            ("victorialogs", "http://localhost:9428"),
+            ("loki", "http://localhost:3100"),
+            ("clickhouse", "http://localhost:8123"),
+            ("elasticsearch", "http://localhost:9200"),
+        ] {
+            for credentials in [
+                json!({"username":"","password":""}),
+                json!({"username":"  ","password":""}),
+                json!({"username":"","password":"","bearer_token":"","api_key":""}),
+            ] {
+                let mut config = credentials.as_object().unwrap().clone();
+                config.insert("url".to_owned(), json!(url));
+                assert!(connect(id, &config).is_ok(), "{id}: {credentials}");
+            }
+            if id != "elasticsearch" && id != "loki" {
+                let config = json!({"url":url,"username":"reader","password":""});
+                assert!(connect(id, config.as_object().unwrap()).is_ok(), "{id}");
+            }
+        }
+        let config = json!({"username":"","password":"secret"});
+        assert!(basic_credentials(config.as_object().unwrap()).is_err());
+        let config = json!({"username":"reader","password":""});
+        assert_eq!(
+            basic_credentials(config.as_object().unwrap()).unwrap(),
+            Some(("reader".to_owned(), String::new()))
+        );
     }
 
     #[test]
