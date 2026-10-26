@@ -9,9 +9,9 @@ target/
 .agents/
 .vscode/
 *.log
+.data/
 data/
 *_data/
-investigenie_data/
 configuration.snapshot
 configuration.lock
 

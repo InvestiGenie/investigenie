@@ -9,7 +9,7 @@ frontend/dist
 .env.*
 !.env.example
 investigenie_data
-northstar_data
+.data
 **/configuration.snapshot
 **/configuration.lock
 **/encryption.key
