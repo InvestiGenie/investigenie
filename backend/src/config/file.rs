@@ -33,7 +33,6 @@ struct FileConfiguration {
 #[serde(default, deny_unknown_fields)]
 struct ServerConfiguration {
     bind: Option<String>,
-    web_origin: Option<String>,
     web_dir: Option<String>,
 }
 
@@ -130,7 +129,6 @@ impl Configuration {
         }
         match name {
             "RUST_API_BIND" => self.file.server.bind.clone(),
-            "WEB_ORIGIN" => self.file.server.web_origin.clone(),
             "WEB_DIR" => self.path_value(self.file.server.web_dir.as_deref()),
             "PERSISTENCE_MODE" => self.file.storage.mode.clone(),
             "FILESYSTEM_PATH" => self.path_value(self.file.storage.path.as_deref()),
@@ -236,6 +234,13 @@ mod tests {
         let configuration = load(directory.path(), &[]).unwrap();
         let read = |key| configuration.value_with(key, |_| None);
         assert_eq!(read("RUST_API_BIND").as_deref(), Some("127.0.0.1:3100"));
+        assert!(read("WEB_ORIGIN").is_none());
+        assert_eq!(
+            configuration
+                .value_with("WEB_ORIGIN", |_| Some("http://localhost:5173".to_owned()))
+                .as_deref(),
+            Some("http://localhost:5173")
+        );
         assert_eq!(read("LOG_MODE").as_deref(), Some("console"));
         assert_eq!(read("LOG_MAX_FILES").as_deref(), Some("3"));
         assert_eq!(
@@ -283,6 +288,7 @@ mod tests {
             .is_none());
         for text in [
             "[logging]\nto_file='true'",
+            "[server]\nweb_origin='http://127.0.0.1:5173'",
             "[server]\nunknown='private-value'",
             "[unknown]\nsecret='private-value'",
             "private-value=",

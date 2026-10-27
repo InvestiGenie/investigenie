@@ -4,7 +4,7 @@ Concrete data connectors live in `data_connectors/<source_id>/`; concrete AI tra
 
 For the complete implementation workflow, security restrictions, paging contract, AI compatibility requirements, and test checklist, use the [build-integration skill](../.github/skills/build-integration/SKILL.md).
 
-`logging.level = "debug"` in `investigenie.toml` (or `LOG_LEVEL=debug`) enables shared operation details for every datasource and the default AI transport; failures are visible at `error`, client rejections at `warn`. `logging.mode` selects `console`, `file`, or `both`; `logging.path = "logs"` resolves beside the file. No per-connector setup is needed. Only safe status/timing/count metadata is logged. See [logging configuration](../docs/backend.md#application-logs).
+`logging.level = "debug"` in `investigenie.toml` (or `LOG_LEVEL=debug`) enables shared operation details for every datasource and the default AI transport; failures are visible at `error`, client rejections at `warn`. `logging.mode` selects `console`, `file`, or `both`; `logging.path = "logs"` resolves beside the file. No per-connector setup is needed. Logs contain safe status/timing/count metadata. Elasticsearch decode failures also include status, content type, byte count, serde category, and schema path, never request or response bodies. See [logging configuration](../docs/backend.md#application-logs).
 
 Your data connector converts native datasource responses into InvestiGenie's shared JSON shape. Start from [ClickHouse](data_connectors/clickhouse/mod.rs) and its [connector](data_connectors/clickhouse/connector.rs), the [Elasticsearch connector](data_connectors/elasticsearch/connector.rs), or the [VictoriaLogs connector](data_connectors/victorialogs/mod.rs) for a LogsQL API.
 

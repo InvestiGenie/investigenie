@@ -1,26 +1,35 @@
-# Copy to investigenie.toml. Environment variables override these values.
-# Relative paths resolve beside this file; absolute paths are used unchanged.
+## Copy this file to investigenie.toml.
+## Environment variables override these values. Relative paths use this file's folder.
 
+## The API and bundled UI share this port.
 [server]
 bind = "127.0.0.1:3000"
-web_origin = "http://127.0.0.1:5173"
-# web_dir = "web"
 
+## Log files rotate daily and are kept by file count.
+## Levels: error, warn, info, debug. Destinations: console, file, both.
 [logging]
-level = "info" # error, warn, info, debug
-mode = "both" # console, file, both
+mode = "both"
+level = "info"
 path = "logs"
 max_files = 7
 
+## Quickstart uses encrypted local files and generates the key automatically.
 [storage]
+## To configure filesystem mode explicitly, uncomment this line and set a key below.
+## Quickstart stores data beside this file. Change the path if needed.
+# mode = "filesystem"
 path = "data"
-# Omitting mode/key/database_url uses single-instance quickstart storage.
-# For explicitly configured storage, supply the existing encryption key securely.
-# mode = "filesystem" # filesystem or database
-# encryption_key = "" # base64-encoded 32-byte key; prefer CONFIG_ENCRYPTION_KEY
-encryption_key_id = "v1"
-# database_url = "" # prefer DATABASE_URL for credentials
-max_connections = 10
 
+## To use PostgreSQL instead, uncomment these settings.
+# mode = "database"
+# database_url = "" # Or set DATABASE_URL in the environment.
+# max_connections = 10
+
+## Explicit filesystem and PostgreSQL modes need an encryption key.
+# Set a real Base64-encoded key here or use CONFIG_ENCRYPTION_KEY; do not leave it blank.
+# encryption_key = "..."
+# encryption_key_id = "v1"
+
+## Maximum wait for AI provider checks, in seconds (5-600).
 [ai]
 probe_timeout_seconds = 15

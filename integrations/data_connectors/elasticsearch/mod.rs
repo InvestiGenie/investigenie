@@ -982,10 +982,40 @@ async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, Elasticsea
         });
     }
 
-    response
-        .json::<T>()
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_owned();
+    let bytes = response
+        .bytes()
         .await
-        .map_err(|_| ElasticsearchError::InvalidResponse)
+        .map_err(|_| ElasticsearchError::Request)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    serde_path_to_error::deserialize::<_, T>(&mut deserializer).map_err(|error| {
+        log_decode_failure(status.as_u16(), &content_type, bytes.len(), &error);
+        ElasticsearchError::InvalidResponse
+    })
+}
+
+fn log_decode_failure(
+    status: u16,
+    content_type: &str,
+    response_bytes: usize,
+    error: &serde_path_to_error::Error<serde_json::Error>,
+) {
+    let source = error.inner();
+    tracing::debug!(
+        upstream_status = status,
+        content_type,
+        response_bytes,
+        decode_category = ?source.classify(),
+        decode_path = %error.path(),
+        line = source.line(),
+        column = source.column(),
+        "Elasticsearch response could not be decoded"
+    );
 }
 
 #[cfg(test)]
@@ -1007,6 +1037,26 @@ mod tests {
             "sort_by": "created_at", "sort_order": "asc", "histogram_field": "created_at"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn response_decode_debug_log_reports_schema_path_without_values() {
+        let response_body = json!({"took":"private-response-value"}).to_string();
+        let mut deserializer = serde_json::Deserializer::from_str(&response_body);
+        let error = serde_path_to_error::deserialize::<_, super::SearchEnvelope>(&mut deserializer)
+            .unwrap_err();
+        let captured = crate::logging::tests::capture();
+        tracing::dispatcher::with_default(&captured.subscriber, || {
+            super::log_decode_failure(200, "application/json", response_body.len(), &error);
+        });
+        let log = String::from_utf8(captured.bytes.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("upstream_status=200"));
+        assert!(log.contains("application/json"));
+        assert!(log.contains("decode_category=Data"));
+        assert!(log.contains("decode_path"));
+        assert!(log.contains("took"));
+        assert!(log.contains(&response_body.len().to_string()));
+        assert!(!log.contains("private-response-value"));
     }
 
     #[tokio::test]
