@@ -7,6 +7,11 @@ services:
       - "127.0.0.1:3000:3000"
     volumes:
       - investigenie-data:/data
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_MODE: ${LOG_MODE:-both}
+      LOG_PATH: /data/logs
+      LOG_MAX_FILES: ${LOG_MAX_FILES:-7}
     # For shared or production use, set PERSISTENCE_MODE and CONFIG_ENCRYPTION_KEY here or in an env file.
     # environment:
     #   PERSISTENCE_MODE: filesystem

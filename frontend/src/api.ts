@@ -421,6 +421,9 @@ export const api = {
   },
 };
 
+export const SEARCH_PAGE_SIZE = 50;
+export const MAX_SEARCH_RECORDS = 100;
+
 export function makeSearchRequest(
   index: string,
   query: string,
@@ -446,7 +449,7 @@ export function makeSearchRequest(
     index,
     query,
     from,
-    size: 50,
+    size: SEARCH_PAGE_SIZE,
     ...(sortBy ? { sort_by: sortBy, sort_order: sortOrder } : {}),
     ...(histogramField ? { histogram_field: histogramField } : {}),
     ...(timeRange ? { time_range: timeRange } : {}),

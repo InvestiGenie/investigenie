@@ -182,6 +182,7 @@ describe('Discover', () => {
     fireEvent.pointerDown(plot, { clientX: 60, button: 0 });
     fireEvent.pointerUp(plot, { clientX: 60 });
     await waitFor(() => expect(search.mock.calls.at(-1)?.[1].time_range).toEqual({ start, end: start + 3_600_000 - 1 }));
+    expect(search.mock.calls.at(-1)?.[1]).toMatchObject({ size: 50, cursor: '', from: 0 });
     expect(screen.getByRole('button', { name: 'Edit time window' })).toHaveTextContent(/08:00 - .*08:59/);
 
     fireEvent.click(screen.getByRole('button', { name: 'Hide chart' }));
@@ -193,11 +194,11 @@ describe('Discover', () => {
   });
 
   it('pages using the applied query, reuses histograms, caches previous pages, and resets on search', async () => {
-    const page = (id: string, cursor: string | null) => ({ took: 2, timed_out: false, total: 101, total_relation: 'eq', hits: [{ index: 'events', id, score: null, source: { message: `${id} message` } }], histogram: [], next_cursor: cursor });
+    const page = (id: string, cursor: string | null) => ({ took: 2, timed_out: false, total: 101, total_relation: 'gte', hits: [{ index: 'events', id, score: null, source: { message: `${id} message` } }], histogram: [], next_cursor: cursor });
     vi.spyOn(api, 'connections').mockResolvedValue([connectionFixture(elasticsearchIntegration)]);
     vi.spyOn(api, 'dataViews').mockResolvedValue([{ id: 'view', revision: 'r1', name: 'Events', connection_id: 'source', index: 'events', time_field: '@timestamp' }]);
     vi.spyOn(api, 'fields').mockResolvedValue([{ name: '@timestamp', field_type: 'date' }]);
-    const search = vi.spyOn(api, 'search').mockResolvedValueOnce({ ...page('first-page', 'cursor-one'), histogram: [{ timestamp: 1000, label: null, count: 101 }] }).mockResolvedValueOnce(page('second-page', null)).mockResolvedValueOnce(page('fresh-search', null));
+    const search = vi.spyOn(api, 'search').mockResolvedValueOnce({ ...page('first-page', 'cursor-one'), histogram: [{ timestamp: 1000, label: null, count: 101 }] }).mockResolvedValueOnce(page('second-page', 'cursor-two')).mockResolvedValueOnce(page('fresh-search', null));
     renderExplore();
     expect(await screen.findByText('first-page')).toBeInTheDocument();
     expect(search.mock.calls[0][1]).toMatchObject({ cursor: '', from: 0, size: 50 });
@@ -207,6 +208,8 @@ describe('Discover', () => {
     expect(search.mock.calls[1][1]).toMatchObject({ cursor: 'cursor-one', include_histogram: false, query: '' });
     expect(screen.getByText('Page 2 · 1 documents')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled();
+    expect(document.querySelector('.results-heading')).toHaveTextContent('101+ matching documents');
+    expect(document.querySelector('.histogram-heading')).toHaveTextContent('101+ matching documents');
     expect(await screen.findByRole('img', { name: 'Document counts over time' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Previous page' }));
     expect(screen.getByText('first-page')).toBeInTheDocument();
@@ -217,6 +220,36 @@ describe('Discover', () => {
     expect(await screen.findByText('fresh-search')).toBeInTheDocument();
     expect(search.mock.calls[2][1]).toMatchObject({ cursor: '', query: 'unsent edit' });
     expect(screen.getByRole('button', { name: 'Previous page' })).toBeDisabled();
+  });
+
+  it('starts a fresh two-page window when a histogram bucket is clicked from page two', async () => {
+    if (!window.PointerEvent) Object.defineProperty(window, 'PointerEvent', { value: MouseEvent, configurable: true });
+    vi.spyOn(api, 'connections').mockResolvedValue([connectionFixture(elasticsearchIntegration)]);
+    vi.spyOn(api, 'dataViews').mockResolvedValue([{ id: 'view', revision: 'r1', name: 'Events', connection_id: 'source', index: 'events', time_field: '@timestamp' }]);
+    vi.spyOn(api, 'fields').mockResolvedValue([{ name: '@timestamp', field_type: 'date' }]);
+    const search = vi.spyOn(api, 'search').mockImplementation(async (_connection, body) => ({
+      took: 1, timed_out: false, total: 20_000, total_relation: 'eq',
+      hits: Array.from({ length: 50 }, (_, index) => ({ index: 'events', id: `${body.cursor ? 'second' : 'first'}-${index}`, score: null, source: { message: 'sample' } })),
+      histogram: [{ timestamp: body.time_range!.start, label: null, count: 20_000 }],
+      histogram_interval: '1m', next_cursor: 'more-records',
+    }));
+    renderExplore();
+    await screen.findByText('first-0');
+    const start = search.mock.calls[0][1].time_range!.start;
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    await screen.findByText('second-0');
+    expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled();
+    expect(document.querySelector('.histogram-heading')).toHaveTextContent('20,000 matching documents');
+    await screen.findByRole('img', { name: 'Document counts over time' });
+    const plot = document.querySelector('.histogram-interaction') as SVGRectElement;
+    fireEvent.pointerDown(plot, { clientX: 60, button: 0 });
+    fireEvent.pointerUp(plot, { clientX: 60 });
+    await screen.findByText('first-0');
+    expect(search).toHaveBeenCalledTimes(3);
+    expect(search.mock.calls[2][1]).toMatchObject({ size: 50, cursor: '', from: 0, time_range: { start, end: start + 60_000 - 1 } });
+    expect(screen.getByText('Page 1 · 50 documents')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Previous page' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Next page' })).toBeEnabled();
   });
 
   it('retains the current page when continuation fails and allows retry', async () => {

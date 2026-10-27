@@ -1,0 +1,26 @@
+# Copy to investigenie.toml. Environment variables override these values.
+# Relative paths resolve beside this file; absolute paths are used unchanged.
+
+[server]
+bind = "127.0.0.1:3000"
+web_origin = "http://127.0.0.1:5173"
+# web_dir = "web"
+
+[logging]
+level = "info" # error, warn, info, debug
+mode = "both" # console, file, both
+path = "logs"
+max_files = 7
+
+[storage]
+path = "data"
+# Omitting mode/key/database_url uses single-instance quickstart storage.
+# For explicitly configured storage, supply the existing encryption key securely.
+# mode = "filesystem" # filesystem or database
+# encryption_key = "" # base64-encoded 32-byte key; prefer CONFIG_ENCRYPTION_KEY
+encryption_key_id = "v1"
+# database_url = "" # prefer DATABASE_URL for credentials
+max_connections = 10
+
+[ai]
+probe_timeout_seconds = 15

@@ -12,7 +12,7 @@ cargo run -p investigenie-api     # API on http://127.0.0.1:3000 (quickstart sto
 npm run dev:web                   # UI on http://127.0.0.1:5173
 ```
 
-You don't need a database: quickstart stores encrypted data in `investigenie_data/` next to the binary. Datasource and AI credentials are entered in the UI. Never put them in `.env`, code, tests, or logs.
+You don't need a database: copy `investigenie.example.toml` to ignored `investigenie.toml` for quickstart storage in `data/` beside the file. Without a file, quickstart uses `investigenie_data/` next to the binary. `--config <path>` selects a file, environment variables override it, and `.env` is not loaded. Datasource and AI credentials are entered in the UI, never in TOML, code, tests, or logs.
 
 ## Quality gates
 
@@ -53,7 +53,9 @@ npm run build:web
 - Data connectors import `crate::data_connectors` and are auto-discovered by `backend/build.rs`. AI transports implement `crate::ai_connectors::AiConnector` and are explicitly registered in the backend AI contract; do not mix the two registries.
 
 - **Security first:** datasources stay read-only. Never return or log secrets. Every limit (size, time, concurrency) stays bounded.
+- **Diagnostics:** `logging.rs` resolves `logging.level` / `LOG_LEVEL` and independent `logging.mode` / `LOG_MODE` (`console`/`file`/`both`, default `both`). `logging.path` / `LOG_PATH` is a folder; relative paths resolve beside the selected TOML file. Use error/warn for failures/rejections, info for lifecycle, debug for detailed metadata. Keep safe correlation spans at every threshold; never log raw requests, config, queries, documents, replies, or upstream errors. New connectors receive logging through the registry; extend redaction tests for new fields.
 - **No datasource special-casing in shared code:** add the capability to the integration descriptor instead.
+- **Search windows:** public searches use shared `SearchWindow` handling: at most 50 records per response and 100 per result window across all connectors. Keep totals/histograms independent of this display cap, preserve lower-bound totals, and reset the window on a new query or graph-selected range. Native connector paging and AI evidence have separate bounds.
 - **Errors:** `{"error":{"code","message"}}` with a stable `code`, and no upstream bodies or credentials.
 - **Saved objects:** writes use revisions (`If-Match`); keep them that way.
 - **Knowledge:** manual entries are encrypted in both storage modes and bounded to 128 entries with 32 KiB content each. Completed-result promotion is user-triggered and always creates an unverified draft through existing CRUD; never auto-publish findings. Keep Markdown previews free of raw HTML and external images. Publication is not verification; retrieval and investigation citation snapshots are a separate milestone. PostgreSQL upgrades require the new knowledge migration.

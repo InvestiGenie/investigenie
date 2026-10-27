@@ -144,7 +144,8 @@ jobs:
           mkdir -p "$DIST_DIR/web"
           cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "$DIST_DIR/"
           cp -r frontend/dist/* "$DIST_DIR/web/"
-          cp .env.example README.md LICENSE "$DIST_DIR/"
+          cp investigenie.example.toml "$DIST_DIR/investigenie.toml"
+          cp README.md LICENSE "$DIST_DIR/"
           cd dist_pkg
           zip -r "../investigenie-${{ matrix.platform }}-${{ matrix.arch }}-${TAG}.zip" investigenie
           cd ..
@@ -160,7 +161,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$distDir/web" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "$distDir/"
           Copy-Item -Recurse "frontend/dist/*" "$distDir/web/"
-          Copy-Item ".env.example", "README.md", "LICENSE" "$distDir/"
+          Copy-Item "investigenie.example.toml" "$distDir/investigenie.toml"
+          Copy-Item "README.md", "LICENSE" "$distDir/"
           Compress-Archive -Path "dist_pkg/investigenie" -DestinationPath "investigenie-${{ matrix.platform }}-${{ matrix.arch }}-$tag.zip" -Force
 
       - name: Upload Release Asset

@@ -6,9 +6,11 @@ target/
 .env
 .env.*
 !.env.example
+investigenie.toml
 .agents/
 .vscode/
 *.log
+logs/
 .data/
 data/
 *_data/

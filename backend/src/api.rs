@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
+use tracing::Instrument;
 
 use crate::ai::{self, InvestigationRequest};
 use crate::ai_connectors::AiSettings;
@@ -24,7 +25,7 @@ use crate::data_connectors::{
     connect, editable_configuration, public_configuration, registered, validate_registry,
     ConnectionConfig, Connector, ConnectorError, IntegrationDescriptor,
 };
-use crate::search::SearchRequest;
+use crate::search::{SearchRequest, SearchWindow};
 use crate::storage::{
     AiConversationSummary, AiModelSummary, DataView, ResolvedConnection, Storage, StorageError,
     StoredAiConversation, StoredAiConversationMessage, StoredAiModel, StoredConnection,
@@ -45,6 +46,7 @@ struct AppState {
     upstream_slots: Arc<Semaphore>,
     ai_slots: Arc<Semaphore>,
     investigations: InvestigationJobs,
+    ai_probe_timeout: Duration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,13 +87,14 @@ struct ConnectionSummary {
     configuration: ConnectionConfig,
 }
 
-pub fn router(web_origin: HeaderValue, storage: Storage) -> Router {
+pub fn router(web_origin: HeaderValue, storage: Storage, ai_probe_timeout: Duration) -> Router {
     validate_registry();
     let state = AppState {
         storage,
         upstream_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_UPSTREAM_REQUESTS)),
         ai_slots: Arc::new(Semaphore::new(4)),
         investigations: Arc::default(),
+        ai_probe_timeout,
     };
     let cors = CorsLayer::new()
         .allow_origin(web_origin)
@@ -225,8 +228,8 @@ async fn prepare_ai_call(
     Ok((settings, permit))
 }
 
-async fn probe_ai_model(model: &StoredAiModel) -> Result<(), ApiError> {
-    ai::test_model(&model_settings(model, ai::probe_timeout()))
+async fn probe_ai_model(model: &StoredAiModel, timeout: Duration) -> Result<(), ApiError> {
+    ai::test_model(&model_settings(model, timeout))
         .await
         .map_err(ApiError::AiModelTest)
 }
@@ -302,53 +305,58 @@ async fn start_investigation(
     let conversation_storage = state.storage.clone();
     let conversation_id = conversation.id.clone();
     let conversation_revision = conversation.revision.clone();
-    tokio::spawn(async move {
-        let _permit = permit;
-        let control = ai::Control::for_job(task_job.clone());
-        let result = ai::investigate(
-            &state.storage,
-            &settings,
-            request,
-            &state.upstream_slots,
-            &control,
-        )
-        .await;
-        let message = match &result {
-            Ok(result) => {
-                let result_value = serde_json::to_value(result).unwrap_or(Value::Null);
-                let summary = result_value
-                    .get("summary")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Investigation complete")
-                    .to_owned();
-                StoredAiConversationMessage {
-                    role: "assistant".to_owned(),
-                    content: summary,
-                    result: Some(result_value),
-                }
-            }
-            Err(error) => StoredAiConversationMessage {
-                role: "assistant".to_owned(),
-                content: error.message.clone(),
-                result: None,
-            },
-        };
-        if let Err(error) = conversation_storage
-            .append_ai_conversation_messages(
-                &conversation_id,
-                &conversation_revision,
-                vec![message],
+    let job_span = tracing::error_span!("investigation", job_id = %job.id);
+    tokio::spawn(
+        async move {
+            let _permit = permit;
+            let control = ai::Control::for_job(task_job.clone());
+            let result = ai::investigate(
+                &state.storage,
+                &settings,
+                request,
+                &state.upstream_slots,
+                &control,
             )
-            .await
-        {
-            tracing::warn!(
-                conversation_id,
-                ?error,
-                "Could not persist AI investigation result"
-            );
+            .await;
+            let message = match &result {
+                Ok(result) => {
+                    let result_value = serde_json::to_value(result).unwrap_or(Value::Null);
+                    let summary = result_value
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Investigation complete")
+                        .to_owned();
+                    StoredAiConversationMessage {
+                        role: "assistant".to_owned(),
+                        content: summary,
+                        result: Some(result_value),
+                    }
+                }
+                Err(error) => StoredAiConversationMessage {
+                    role: "assistant".to_owned(),
+                    content: error.message.clone(),
+                    result: None,
+                },
+            };
+            if conversation_storage
+                .append_ai_conversation_messages(
+                    &conversation_id,
+                    &conversation_revision,
+                    vec![message],
+                )
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    conversation_id,
+                    error_code = "conversation_persistence_failed",
+                    "Could not persist AI investigation result"
+                );
+            }
+            task_job.finish(result);
         }
-        task_job.finish(result);
-    });
+        .instrument(job_span),
+    );
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({ "investigation": job.snapshot() })),
@@ -522,7 +530,7 @@ async fn create_ai_model(
         request.model,
         request.api_key,
     )?;
-    probe_ai_model(&model).await?;
+    probe_ai_model(&model, state.ai_probe_timeout).await?;
     let saved = state
         .storage
         .create_ai_model(model)
@@ -545,7 +553,7 @@ async fn update_ai_model(
     let api_key = request.api_key.unwrap_or(current.api_key);
     let mut model = provider_settings(request.name, request.api_url, request.model, api_key)?;
     model.id = id.clone();
-    probe_ai_model(&model).await?;
+    probe_ai_model(&model, state.ai_probe_timeout).await?;
     let saved = state
         .storage
         .update_ai_model(&id, &expected, model)
@@ -734,6 +742,7 @@ enum ApiError {
     Storage(StorageError),
     Unavailable,
     InvalidTimeRange,
+    InvalidSearchWindow(&'static str),
     InvalidConnection,
     InvalidDataView,
     Connector(ConnectorError),
@@ -778,6 +787,11 @@ impl IntoResponse for ApiError {
                 "invalid_time_range",
                 "A time window requires valid start/end dates, a time field, and start no later than end".to_owned(),
             ),
+            Self::InvalidSearchWindow(message) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_search_window",
+                message.to_owned(),
+            ),
             Self::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "upstream_capacity_unavailable",
@@ -804,6 +818,19 @@ impl IntoResponse for ApiError {
             Self::InvestigationDecision(message) => (StatusCode::CONFLICT, "investigation_not_paused", message.to_owned()),
         };
 
+        if status.is_server_error() {
+            tracing::error!(
+                status = status.as_u16(),
+                error_code = code,
+                "API request rejected"
+            );
+        } else {
+            tracing::warn!(
+                status = status.as_u16(),
+                error_code = code,
+                "API request rejected"
+            );
+        }
         (
             status,
             Json(json!({ "error": { "code": code, "message": message } })),
@@ -979,12 +1006,15 @@ async fn connection_document(
 async fn connection_search(
     State(state): State<AppState>,
     Path(connection_id): Path<String>,
-    Json(request): Json<SearchRequest>,
+    Json(mut request): Json<SearchRequest>,
 ) -> Result<Json<Value>, ApiError> {
     validate_search(&request)?;
+    let window = SearchWindow::prepare(&mut request).map_err(ApiError::InvalidSearchWindow)?;
     let _permit = acquire(&state).await?;
     let connection = get_connection(&state, &connection_id).await?;
-    Ok(Json(connection.connector.search(request).await?))
+    let mut result = connection.connector.search(request).await?;
+    window.finish(&mut result);
+    Ok(Json(result))
 }
 
 fn validate_search(request: &SearchRequest) -> Result<(), ApiError> {

@@ -48,10 +48,12 @@ RUN apt-get update \
 COPY --from=api /investigenie-api /app/investigenie-api
 COPY --from=web /src/frontend/dist /app/web
 COPY LICENSE /app/LICENSE
+COPY investigenie.example.toml /app/investigenie.toml
 WORKDIR /app
 ENV RUST_API_BIND=0.0.0.0:3000 \
     WEB_DIR=/app/web \
-    FILESYSTEM_PATH=/data
+    FILESYSTEM_PATH=/data \
+    LOG_PATH=/data/logs
 USER 10001:10001
 VOLUME /data
 EXPOSE 3000

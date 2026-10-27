@@ -44,7 +44,9 @@ fn main() {
     }
     generated.push_str("}\npub fn connect(id: &str, config: &ConnectionConfig) -> Result<std::sync::Arc<dyn Connector>, ConnectorError> { validate_registry(); match id {\n");
     for (name, _) in &integrations {
-        generated.push_str(&format!("{name:?} => {name}::connect(config),\n"));
+        generated.push_str(&format!(
+            "{name:?} => {name}::connect(config).map(|inner| logged_connector({name:?}, inner)),\n"
+        ));
     }
     generated.push_str("_ => Err(ConnectorError::invalid_connection()), } }\n");
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("data_connectors.rs");

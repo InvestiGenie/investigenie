@@ -8,6 +8,9 @@ frontend/dist
 .env
 .env.*
 !.env.example
+investigenie.toml
+logs
+data
 investigenie_data
 .data
 **/configuration.snapshot

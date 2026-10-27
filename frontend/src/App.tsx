@@ -1,6 +1,6 @@
 import { Fragment, lazy, Suspense, useEffect, useRef, useState, type FormEvent } from 'react';
 import { ArrowDown, ArrowUp, ArrowUpDown, BookOpen, BrainCircuit, ChevronLeft, ChevronRight, Eye, EyeOff } from 'lucide-react';
-import { api, makeSearchRequest, type ConnectionSummary, type DataViewSummary, type DocumentResult, type FieldSummary, type SearchHit, type SearchRequest, type SearchResult } from './api';
+import { api, makeSearchRequest, MAX_SEARCH_RECORDS, SEARCH_PAGE_SIZE, type ConnectionSummary, type DataViewSummary, type DocumentResult, type FieldSummary, type SearchHit, type SearchRequest, type SearchResult } from './api';
 import type { DocumentInvestigationSeed } from './InvestiGenieAIPage';
 import ConnectionsPage from './ConnectionsPage';
 import DataViewsPage from './DataViewsPage';
@@ -351,10 +351,10 @@ export default function App() {
   }
 
   async function nextPage() {
-    if (!results || !appliedSearch.current || loading) return;
+    if (!results || !appliedSearch.current || loading || pageNumber >= MAX_SEARCH_RECORDS / SEARCH_PAGE_SIZE) return;
     const cached = forwardPages.at(-1);
     if (cached) {
-      setPreviousPages((pages) => [...pages, { number: pageNumber, result: results }].slice(-5));
+      setPreviousPages((pages) => [...pages, { number: pageNumber, result: results }].slice(-1));
       setResults(cached.result);
       setPageNumber(cached.number);
       setForwardPages((pages) => pages.slice(0, -1));
@@ -372,12 +372,12 @@ export default function App() {
       const response = await api.search(selectedConnectionId, { ...appliedSearch.current, cursor: current.next_cursor!, include_histogram: false }, controller.signal);
       if (controller.signal.aborted) return;
       if (!response.hits.length) {
-        setResults({ ...current, next_cursor: null, ...(current.total_relation === 'gte' ? { total: pageNumber * appliedSearch.current!.size, total_relation: 'eq' } : {}) });
+        setResults({ ...current, next_cursor: null });
         return;
       }
-      setPreviousPages((pages) => [...pages, { number: pageNumber, result: current }].slice(-5));
+      setPreviousPages((pages) => [...pages, { number: pageNumber, result: current }].slice(-1));
       const total = current.total_relation === 'eq' ? current.total : Math.max(current.total, response.total, pageNumber * appliedSearch.current!.size + response.hits.length);
-      const relation = current.total_relation === 'eq' || !response.next_cursor ? 'eq' : 'gte';
+      const relation = current.total_relation === 'eq' || response.total_relation === 'eq' ? 'eq' : 'gte';
       setResults({ ...response, histogram: current.histogram, total, total_relation: relation, histogram_unavailable_reason: current.histogram_unavailable_reason });
       setPageNumber((number) => number + 1);
       setExpandedHit(null);
@@ -392,7 +392,7 @@ export default function App() {
     const page = previousPages.at(-1);
     if (!page || loading) return;
     setResults(page.result);
-    if (results) setForwardPages((pages) => [...pages, { number: pageNumber, result: results }].slice(-5));
+    if (results) setForwardPages((pages) => [...pages, { number: pageNumber, result: results }].slice(-1));
     setPageNumber(page.number);
     setPreviousPages((pages) => pages.slice(0, -1));
     setExpandedHit(null);
@@ -624,7 +624,7 @@ export default function App() {
                 <nav className="pagination" aria-label="Document pages">
                   <button className="icon-button" aria-label="Previous page" title="Previous page" disabled={loading || !previousPages.length} onClick={previousPage}><ChevronLeft size={16} aria-hidden="true" /></button>
                   <span>Page {pageNumber} · {results.hits.length} documents</span>
-                  <button className="icon-button" aria-label="Next page" title="Next page" disabled={loading || (!results.next_cursor && !forwardPages.length)} onClick={() => void nextPage()}><ChevronRight size={16} aria-hidden="true" /></button>
+                  <button className="icon-button" aria-label="Next page" title="Next page" disabled={loading || pageNumber >= MAX_SEARCH_RECORDS / SEARCH_PAGE_SIZE || (!results.next_cursor && !forwardPages.length)} onClick={() => void nextPage()}><ChevronRight size={16} aria-hidden="true" /></button>
                 </nav>
               </>}
             </section>

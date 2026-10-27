@@ -3,56 +3,68 @@ mod ai_connectors;
 mod api;
 mod config;
 mod data_connectors;
+mod logging;
 mod search;
 mod storage;
 
 use std::error::Error;
 
-use config::Settings;
+use config::{Command, Configuration, Settings};
 use storage::Storage;
 use tokio::net::TcpListener;
-use tower_http::trace::TraceLayer;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
-    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
-        return healthcheck().await;
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("InvestiGenie failed: {error}");
+            std::process::ExitCode::FAILURE
+        }
     }
-    let settings = Settings::from_env()?;
-    match std::env::args().nth(1).as_deref() {
-        Some("migrate") => {
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
+    let configuration = Configuration::load(std::env::args_os().skip(1))?;
+    if configuration.command == Command::Healthcheck {
+        return healthcheck(&configuration).await;
+    }
+    let logging_settings = logging::LoggingSettings::from_configuration(&configuration)?;
+    let _log_guard = logging::initialize(&logging_settings)?;
+    tracing::info!(
+        log_level = %logging_settings.level,
+        log_mode = logging_settings.mode.as_str(),
+        "Application logging initialized"
+    );
+    let settings = Settings::from_configuration(&configuration)?;
+    match configuration.command {
+        Command::Migrate => {
             Storage::migrate(&settings.storage).await?;
             tracing::info!("Configuration schema migrated");
             return Ok(());
         }
-        Some(_) => {
-            return Err("Unsupported command; use migrate, healthcheck, or no arguments".into())
+        Command::Serve => {}
+        Command::Healthcheck => {
+            unreachable!("healthcheck is handled before application initialization")
         }
-        None => {}
     }
     let web_origin = settings.web_origin.parse()?;
     if settings.quickstart {
         if let storage::PersistenceOptions::Filesystem { path, .. } = &settings.storage {
             tracing::warn!(
                 directory = %path.display(),
-                "No storage settings found; using local quickstart storage with a generated encryption key. Set CONFIG_ENCRYPTION_KEY and PERSISTENCE_MODE for production"
+                "No explicit persistence mode or key configured; using local quickstart storage. Configure storage.mode and an encryption key for production"
             );
         }
     }
+    let mut storage_operation = logging::Operation::new("storage", "open");
     let storage = Storage::open(settings.storage).await?;
-    let mut app = api::router(web_origin, storage.clone());
+    storage_operation.complete(200, None, None);
+    let mut app = api::router(web_origin, storage.clone(), settings.ai_probe_timeout);
     if let Some(directory) = &settings.web_dir {
         app = api::with_web(app, directory);
     }
-    let app = app.layer(TraceLayer::new_for_http());
+    let app = app.layer(axum::middleware::from_fn(logging::http_request));
     let listener = TcpListener::bind(settings.bind).await?;
 
     tracing::info!(address = %settings.bind, "InvestiGenie API listening");
@@ -107,13 +119,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("API server stopped unexpectedly".into());
     }
 
+    tracing::info!("Application shutdown complete");
     Ok(())
 }
 
 /// Probes the local readiness endpoint; used by container health checks.
-async fn healthcheck() -> Result<(), Box<dyn Error>> {
-    let mut address: std::net::SocketAddr = std::env::var("RUST_API_BIND")
-        .unwrap_or_else(|_| "127.0.0.1:3000".to_owned())
+async fn healthcheck(configuration: &Configuration) -> Result<(), Box<dyn Error>> {
+    let mut address: std::net::SocketAddr = configuration
+        .value("RUST_API_BIND")
+        .unwrap_or_else(|| "127.0.0.1:3000".to_owned())
         .parse()?;
     if address.ip().is_unspecified() {
         address.set_ip(std::net::Ipv4Addr::LOCALHOST.into());

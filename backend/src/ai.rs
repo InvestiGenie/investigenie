@@ -29,7 +29,6 @@ const MAX_EVIDENCE_BUCKETS: usize = 16;
 const MAX_FINDINGS: usize = 8;
 const MAX_EVIDENCE_IDS: usize = 5;
 const MAX_REPAIR_ATTEMPTS: usize = 1;
-pub const AI_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_TIME_BUDGET_SECS: u64 = 120;
 const DECISION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -1678,6 +1677,7 @@ pub struct InvestigationJob {
 impl InvestigationJob {
     pub fn new(id: String, budget: Duration) -> Arc<Self> {
         let started = Instant::now();
+        tracing::info!(job_id = %id, budget_seconds = budget.as_secs(), "Investigation created");
         Arc::new(Self {
             id,
             started,
@@ -1749,6 +1749,7 @@ impl InvestigationJob {
                 state.terminate_requested = true;
             }
         }
+        tracing::info!(job_id = %self.id, terminate = decision == Decision::Terminate, "Investigation decision accepted");
         self.changed.notify_waiters();
         Ok(())
     }
@@ -1757,6 +1758,7 @@ impl InvestigationJob {
         let mut state = self.lock();
         match result {
             Ok(response) => {
+                tracing::info!(job_id = %self.id, complete = response.complete, elapsed_ms = self.started.elapsed().as_millis() as u64, "Investigation finished");
                 state.status = if response.complete {
                     JobStatus::Completed
                 } else {
@@ -1765,6 +1767,11 @@ impl InvestigationJob {
                 state.result = serde_json::to_value(response).ok();
             }
             Err(error) => {
+                if error.code == "investigation_terminated" {
+                    tracing::info!(job_id = %self.id, "Investigation stopped");
+                } else {
+                    tracing::error!(job_id = %self.id, error_code = error.code, elapsed_ms = self.started.elapsed().as_millis() as u64, "Investigation failed");
+                }
                 state.status = if error.code == "investigation_terminated" {
                     JobStatus::Terminated
                 } else {
@@ -1810,7 +1817,11 @@ impl Control {
 
     fn report(&self, update: impl FnOnce(&mut Progress)) {
         if let Some(job) = &self.job {
-            update(&mut job.lock().progress);
+            let mut state = job.lock();
+            update(&mut state.progress);
+            tracing::debug!(job_id = %job.id, sampled_records = state.progress.records_examined,
+                source_queries = state.progress.batches_processed, analysis_cycles = state.progress.analysis_cycles,
+                "Investigation progress");
         }
     }
 
@@ -1837,6 +1848,7 @@ impl Control {
     }
 
     async fn pause(&self, job: &InvestigationJob, reason: String, partial: Option<Value>) -> bool {
+        tracing::info!(job_id = %job.id, has_partial_result = partial.is_some(), "Investigation paused for a decision");
         {
             let mut state = job.lock();
             state.status = JobStatus::AwaitingDecision;
@@ -1921,15 +1933,6 @@ impl Control {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn probe_timeout_accepts_only_bounded_whole_seconds() {
-        assert_eq!(parse_probe_timeout(None), AI_TIMEOUT);
-        assert_eq!(parse_probe_timeout(Some(" 120 ")), Duration::from_secs(120));
-        for invalid in ["", "4", "601", "-1", "1.5", "slow"] {
-            assert_eq!(parse_probe_timeout(Some(invalid)), AI_TIMEOUT, "{invalid}");
-        }
-    }
 
     fn view(id: &str, name: &str) -> DataView {
         DataView {
@@ -2636,7 +2639,6 @@ async fn call_model<T: for<'de> Deserialize<'de>>(
             Err(problem) => {
                 tracing::warn!(
                     attempt,
-                    problem = %problem,
                     reply_bytes = reply.content.len(),
                     "AI reply did not match the expected JSON"
                 );
@@ -2684,29 +2686,13 @@ pub async fn continue_conversation(
     Ok(reply.content.trim().to_owned())
 }
 
-/// Timeout for the save-time provider probe. Local models can need longer than the default to load
-/// on first use, so `AI_PROBE_TIMEOUT_SECONDS` (5-600) may raise it; invalid values keep the default.
-pub fn probe_timeout() -> Duration {
-    parse_probe_timeout(std::env::var("AI_PROBE_TIMEOUT_SECONDS").ok().as_deref())
-}
-
-fn parse_probe_timeout(value: Option<&str>) -> Duration {
-    value
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| (5..=600).contains(seconds))
-        .map(Duration::from_secs)
-        .unwrap_or(AI_TIMEOUT)
-}
-
 pub async fn test_model(settings: &AiSettings) -> Result<(), &'static str> {
-    let mut probe_settings = settings.clone();
-    probe_settings.timeout = probe_timeout();
     let messages = [
         json!({"role":"system","content":"Return exactly a JSON object with the boolean field ok set to true."}),
         json!({"role":"user","content":"{\"probe\":true}"}),
     ];
     let response = default_connector()
-        .complete(&probe_settings, &messages, true, Some(32))
+        .complete(settings, &messages, true, Some(32))
         .await
         .map_err(|_| "The provider test returned an unusable response")?;
     let content: Value = parse_model_json(&response.content)

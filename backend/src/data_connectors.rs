@@ -1,7 +1,8 @@
 use axum::http::StatusCode;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, sync::Arc};
+use tracing::Instrument;
 
 pub type ConnectionConfig = Map<String, Value>;
 pub type ConnectorFuture<'a, T> =
@@ -50,6 +51,101 @@ pub struct FieldSummary {
 }
 
 include!(concat!(env!("OUT_DIR"), "/data_connectors.rs"));
+
+struct LoggedConnector {
+    integration: &'static str,
+    inner: Arc<dyn Connector>,
+}
+
+fn logged_connector(integration: &'static str, inner: Arc<dyn Connector>) -> Arc<dyn Connector> {
+    tracing::debug!(integration, "Datasource connector initialized");
+    Arc::new(LoggedConnector { integration, inner })
+}
+
+impl LoggedConnector {
+    fn observe<'a, T: Send + 'a>(
+        &'a self,
+        operation: &'static str,
+        future: ConnectorFuture<'a, T>,
+        count: fn(&T) -> Option<usize>,
+    ) -> ConnectorFuture<'a, T> {
+        Box::pin(
+            async move {
+                let mut observed = crate::logging::Operation::new("datasource", operation);
+                let result = future.await;
+                match &result {
+                    Ok(value) => observed.complete(200, None, count(value)),
+                    Err(error) => observed.complete(error.status.as_u16(), Some(error.code), None),
+                }
+                result
+            }
+            .instrument(tracing::error_span!(
+                "datasource",
+                integration = self.integration
+            )),
+        )
+    }
+}
+
+impl Connector for LoggedConnector {
+    fn public_configuration(&self) -> ConnectionConfig {
+        self.inner.public_configuration()
+    }
+
+    fn test_connection(&self) -> ConnectorFuture<'_, ()> {
+        self.observe("test_connection", self.inner.test_connection(), |_| None)
+    }
+
+    fn indices(&self) -> ConnectorFuture<'_, Vec<IndexSummary>> {
+        self.observe("indices", self.inner.indices(), |items| Some(items.len()))
+    }
+
+    fn fields<'a>(&'a self, index: &'a str) -> ConnectorFuture<'a, Vec<FieldSummary>> {
+        self.observe("fields", self.inner.fields(index), |items| {
+            Some(items.len())
+        })
+    }
+
+    fn search(&self, request: crate::search::SearchRequest) -> ConnectorFuture<'_, Value> {
+        tracing::debug!(
+            integration = self.integration,
+            page_size = request.size,
+            offset = request.from,
+            continuation = request
+                .cursor
+                .as_deref()
+                .is_some_and(|cursor| !cursor.is_empty()),
+            histogram = request.include_histogram.unwrap_or(true),
+            bounded_time_range = request.time_range.is_some(),
+            "Datasource search requested"
+        );
+        self.observe("search", self.inner.search(request), |value| {
+            let total = value.get("total").and_then(Value::as_u64);
+            let lower_bound = value.get("total_relation").and_then(Value::as_str) == Some("gte");
+            let histogram_buckets = value
+                .get("histogram")
+                .and_then(Value::as_array)
+                .map(Vec::len);
+            let timed_out = value.get("timed_out").and_then(Value::as_bool);
+            tracing::debug!(
+                total,
+                lower_bound,
+                histogram_buckets,
+                timed_out,
+                "Datasource search coverage"
+            );
+            value.get("hits").and_then(Value::as_array).map(Vec::len)
+        })
+    }
+
+    fn document<'a>(&'a self, index: &'a str, id: &'a str) -> ConnectorFuture<'a, Value> {
+        self.observe("document", self.inner.document(index, id), |value| {
+            Some(usize::from(
+                value.get("found").and_then(Value::as_bool).unwrap_or(false),
+            ))
+        })
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IntegrationDescriptor {
@@ -150,6 +246,106 @@ pub fn public_configuration(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn debug_connector_logs_all_operations_without_private_values() {
+        use tracing::instrument::WithSubscriber;
+        struct TestConnector;
+        impl Connector for TestConnector {
+            fn test_connection(&self) -> ConnectorFuture<'_, ()> {
+                Box::pin(async {
+                    Err(ConnectorError {
+                        status: StatusCode::BAD_GATEWAY,
+                        code: "source_unavailable",
+                        message: "private-upstream-body".to_owned(),
+                    })
+                })
+            }
+            fn indices(&self) -> ConnectorFuture<'_, Vec<IndexSummary>> {
+                Box::pin(async {
+                    Ok(vec![IndexSummary {
+                        name: "private-index".to_owned(),
+                        document_count: None,
+                        health: None,
+                    }])
+                })
+            }
+            fn fields<'a>(&'a self, _: &'a str) -> ConnectorFuture<'a, Vec<FieldSummary>> {
+                Box::pin(async {
+                    Ok(vec![FieldSummary {
+                        name: "private-field".to_owned(),
+                        field_type: "String".to_owned(),
+                        is_time_field: false,
+                    }])
+                })
+            }
+            fn search(&self, _: crate::search::SearchRequest) -> ConnectorFuture<'_, Value> {
+                Box::pin(async {
+                    Ok(
+                        json!({"hits":[{"source":{"message":"private-document"}}],"total":500,"histogram":[{"count":500}],"timed_out":false}),
+                    )
+                })
+            }
+            fn document<'a>(&'a self, _: &'a str, _: &'a str) -> ConnectorFuture<'a, Value> {
+                Box::pin(async {
+                    Ok(json!({"found":true,"source":{"message":"private-document"}}))
+                })
+            }
+        }
+        let captured = crate::logging::tests::capture();
+        async {
+            let connector = logged_connector("clickhouse", Arc::new(TestConnector));
+            assert!(connector.test_connection().await.is_err());
+            assert_eq!(connector.indices().await.unwrap().len(), 1);
+            assert_eq!(connector.fields("private-index").await.unwrap().len(), 1);
+            let response = connector
+                .search(crate::search::SearchRequest {
+                    index: "private-index".to_owned(),
+                    query: "private-query".to_owned(),
+                    size: 50,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(response["total"], 500);
+            assert_eq!(
+                connector
+                    .document("private-index", "private-document-id")
+                    .await
+                    .unwrap()["found"],
+                true
+            );
+        }
+        .with_subscriber(captured.subscriber.clone())
+        .await;
+        let text = String::from_utf8(captured.bytes.lock().unwrap().clone()).unwrap();
+        for operation in [
+            "test_connection",
+            "indices",
+            "fields",
+            "search",
+            "document",
+            "source_unavailable",
+            "clickhouse",
+        ] {
+            assert!(
+                text.contains(operation),
+                "Missing operation metadata: {operation}"
+            );
+        }
+        for secret in [
+            "private-upstream-body",
+            "private-index",
+            "private-field",
+            "private-document",
+            "private-query",
+        ] {
+            assert!(
+                !text.contains(secret),
+                "Unexpected private content in datasource logs"
+            );
+        }
+    }
 
     #[test]
     fn registry_ids_are_unique_and_match_folders() {

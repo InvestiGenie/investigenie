@@ -117,7 +117,12 @@ fn state(storage: Storage) -> AppState {
         upstream_slots: Arc::new(Semaphore::new(4)),
         ai_slots: Arc::new(Semaphore::new(4)),
         investigations: Arc::default(),
+        ai_probe_timeout: Duration::from_secs(15),
     }
+}
+
+fn router(web_origin: HeaderValue, storage: Storage) -> Router {
+    super::router(web_origin, storage, Duration::from_secs(15))
 }
 
 fn json_request(path: &str, body: Value) -> axum::http::Request<axum::body::Body> {
@@ -943,13 +948,11 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
         analysis_inputs[0]["sources"][0]["aggregations"][0]["count"],
         60
     );
-    assert!(body["caveats"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|caveat| caveat
+    assert!(body["caveats"].as_array().unwrap().iter().any(|caveat| {
+        caveat
             .as_str()
-            .is_some_and(|text| text.contains("not an exhaustive scan"))));
+            .is_some_and(|text| text.contains("not an exhaustive scan"))
+    }));
     let all_provider_input = provider_requests
         .iter()
         .filter_map(|request| std::str::from_utf8(&request.body).ok())
@@ -988,6 +991,70 @@ async fn save_status_connection(storage: &Storage, integration_id: &str, url: &s
         })
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn search_window_routes_cap_continuations_and_reject_deep_offsets() {
+    let (_directory, storage) = status_storage().await;
+    let server = MockServer::start().await;
+    save_status_connection(&storage, "clickhouse", &server.uri()).await;
+    let app = router("http://localhost".parse().unwrap(), storage);
+    for offset in [0, 50] {
+        Mock::given(matchers::method("POST"))
+            .and(move |request: &wiremock::Request| {
+                String::from_utf8_lossy(&request.body)
+                    .contains(&format!("LIMIT 50 OFFSET {offset} FORMAT JSON"))
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta":[{"name":"message","type":"String"}],
+                "data":vec![json!({"message":"sample"}); 50],
+                "rows":50,
+                "rows_before_limit_at_least":20_000
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let mut body = json!({"index":"events","query":"SELECT * FROM events","size":100,"cursor":""});
+    for page in [1, 2] {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "/api/connections/clickhouse/search",
+                body.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 65_536)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["hits"].as_array().unwrap().len(), 50);
+        if page == 1 {
+            assert!(result["next_cursor"].is_string());
+            body["cursor"] = result["next_cursor"].clone();
+        } else {
+            assert!(result["next_cursor"].is_null());
+        }
+    }
+    server.verify().await;
+    for integration in registered() {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                &format!("/api/connections/{}/search", integration.id),
+                json!({"index":"events","size":50,"from":100}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"]["code"], "invalid_search_window");
+    }
 }
 
 async fn status_response(app: &Router, id: &str) -> (StatusCode, Value) {
@@ -1758,6 +1825,7 @@ async fn api_preserves_redaction_authentication_preconditions_and_capacity() {
         upstream_slots: Arc::new(Semaphore::new(1)),
         ai_slots: Arc::new(Semaphore::new(1)),
         investigations: Arc::default(),
+        ai_probe_timeout: Duration::from_secs(15),
     };
     let permit = acquire(&single).await.unwrap();
     assert!(matches!(

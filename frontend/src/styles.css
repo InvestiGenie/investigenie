@@ -659,6 +659,7 @@ th[aria-sort="ascending"] .column-sort-button, th[aria-sort="descending"] .colum
 :root[data-theme="dark"] .connection-kind,
 :root[data-theme="dark"] .connection-health,
 :root[data-theme="dark"] .connection-form-footer > span { color: var(--muted); }
+:root[data-theme="dark"] .connection-info strong { color: var(--ink); }
 :root[data-theme="dark"] .doc-id,
 :root[data-theme="dark"] .source-field-value { color: #a4e2cf; }
 :root[data-theme="dark"] .source-fields { border-color: var(--line); }

@@ -1,8 +1,94 @@
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const MAX_HISTOGRAM_BUCKETS: i64 = 1_000;
 pub const MAX_BREAKDOWN_VALUES: usize = 3;
 pub const BREAKDOWN_OTHER_KEY: &str = "__other__";
+pub const SEARCH_PAGE_SIZE: usize = 50;
+pub const MAX_SEARCH_RECORDS: usize = 100;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SearchPageCursor {
+    offset: usize,
+    native: String,
+}
+
+pub struct SearchWindow {
+    offset: usize,
+    size: usize,
+}
+
+impl SearchWindow {
+    pub fn prepare(request: &mut SearchRequest) -> Result<Self, &'static str> {
+        if request.size == 0 {
+            return Err("Search page size must be positive");
+        }
+        let offset = match request
+            .cursor
+            .as_deref()
+            .filter(|cursor| !cursor.is_empty())
+        {
+            Some(cursor) => {
+                if cursor.len() > 65_536 {
+                    return Err("Invalid search cursor; start a new search");
+                }
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(cursor)
+                    .map_err(|_| "Invalid search cursor; start a new search")?;
+                let cursor: SearchPageCursor = serde_json::from_slice(&bytes)
+                    .map_err(|_| "Invalid search cursor; start a new search")?;
+                if cursor.offset == 0 || cursor.native.is_empty() {
+                    return Err("Invalid search cursor; start a new search");
+                }
+                request.cursor = Some(cursor.native);
+                request.from = 0;
+                cursor.offset
+            }
+            None => {
+                if request.cursor.is_some() && request.from != 0 {
+                    return Err("A new cursor search must start at offset zero");
+                }
+                request.from
+            }
+        };
+        if offset >= MAX_SEARCH_RECORDS {
+            return Err("Only the first 100 records are available; narrow the search time range");
+        }
+        request.size = request
+            .size
+            .min(SEARCH_PAGE_SIZE)
+            .min(MAX_SEARCH_RECORDS - offset);
+        Ok(Self {
+            offset,
+            size: request.size,
+        })
+    }
+
+    pub fn finish(self, result: &mut Value) {
+        let returned = match result.get_mut("hits").and_then(Value::as_array_mut) {
+            Some(hits) => {
+                hits.truncate(self.size);
+                hits.len()
+            }
+            None => 0,
+        };
+        let offset = self.offset + returned;
+        result["next_cursor"] = match result.get("next_cursor").and_then(Value::as_str) {
+            Some(native) if !native.is_empty() && returned > 0 && offset < MAX_SEARCH_RECORDS => {
+                let cursor = SearchPageCursor {
+                    offset,
+                    native: native.to_owned(),
+                };
+                serde_json::to_vec(&cursor)
+                    .map(|bytes| Value::String(URL_SAFE_NO_PAD.encode(bytes)))
+                    .unwrap_or(Value::Null)
+            }
+            _ => Value::Null,
+        };
+    }
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub struct SearchRequest {
@@ -33,7 +119,7 @@ pub struct SearchRequest {
 }
 
 fn default_page_size() -> usize {
-    50
+    SEARCH_PAGE_SIZE
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,6 +313,82 @@ impl TimeRange {
 #[cfg(test)]
 mod tests {
     use super::{HistogramInterval, IntervalUnit, SearchRequest, TimeRange};
+    use base64::Engine;
+
+    #[test]
+    fn search_window_caps_records_without_changing_totals_or_histograms() {
+        let mut request = SearchRequest {
+            size: 100,
+            cursor: Some(String::new()),
+            ..Default::default()
+        };
+        let first = super::SearchWindow::prepare(&mut request).unwrap();
+        assert_eq!(request.size, 50);
+        let hits = vec![serde_json::json!({"id":"sample"}); 50];
+        let histogram = serde_json::json!([{"timestamp":1,"count":20_000}]);
+        let mut result = serde_json::json!({"hits":hits,"total":20_000,"total_relation":"gte","histogram":histogram,"next_cursor":"native-page-two"});
+        first.finish(&mut result);
+        let cursor = result["next_cursor"].as_str().unwrap().to_owned();
+        request.cursor = Some(cursor);
+        let second = super::SearchWindow::prepare(&mut request).unwrap();
+        assert_eq!(request.cursor.as_deref(), Some("native-page-two"));
+        assert_eq!(request.size, 50);
+        result["next_cursor"] = serde_json::json!("native-page-three");
+        second.finish(&mut result);
+        assert!(result["next_cursor"].is_null());
+        assert_eq!(result["hits"].as_array().unwrap().len(), 50);
+        assert_eq!(result["total"], 20_000);
+        assert_eq!(result["total_relation"], "gte");
+        assert_eq!(result["histogram"], histogram);
+    }
+
+    #[test]
+    fn search_window_rejects_exhausted_or_invalid_requests_and_caps_offsets() {
+        for request in [
+            SearchRequest {
+                size: 0,
+                ..Default::default()
+            },
+            SearchRequest {
+                size: 50,
+                from: 100,
+                ..Default::default()
+            },
+            SearchRequest {
+                size: 50,
+                cursor: Some("not-a-cursor".to_owned()),
+                ..Default::default()
+            },
+            SearchRequest {
+                size: 50,
+                from: 50,
+                cursor: Some(String::new()),
+                ..Default::default()
+            },
+        ] {
+            let mut request = request;
+            assert!(super::SearchWindow::prepare(&mut request).is_err());
+        }
+        let cursor = super::SearchPageCursor {
+            offset: 100,
+            native: "third-page".to_owned(),
+        };
+        let mut request = SearchRequest {
+            size: 50,
+            cursor: Some(super::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor).unwrap())),
+            ..Default::default()
+        };
+        assert!(super::SearchWindow::prepare(&mut request).is_err());
+        request.cursor = None;
+        request.from = 75;
+        let window = super::SearchWindow::prepare(&mut request).unwrap();
+        assert_eq!(request.size, 25);
+        let mut result =
+            serde_json::json!({"hits":vec![serde_json::json!({}); 50],"next_cursor":"more"});
+        window.finish(&mut result);
+        assert_eq!(result["hits"].as_array().unwrap().len(), 25);
+        assert!(result["next_cursor"].is_null());
+    }
 
     #[test]
     fn automatic_histogram_intervals_are_shared_bounded_and_valid() {

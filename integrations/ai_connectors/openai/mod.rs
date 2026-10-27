@@ -62,6 +62,10 @@ async fn request_completion(
     let mut response = send_completion(&client, &endpoint, &settings.api_key, &body).await?;
     if !response.status().is_success() {
         let status = response.status();
+        tracing::debug!(
+            upstream_status = status.as_u16(),
+            "AI provider rejected completion request"
+        );
         let error_preview = response_error_preview(response).await;
         if !json_mode || !response_format_unsupported(status, &error_preview) {
             return Err(AiConnectorError::upstream(
@@ -72,6 +76,7 @@ async fn request_completion(
         body.as_object_mut()
             .expect("completion request is an object")
             .remove("response_format");
+        tracing::debug!("Retrying AI completion without JSON response format");
         response = send_completion(&client, &endpoint, &settings.api_key, &body).await?;
         if !response.status().is_success() {
             return Err(AiConnectorError::upstream(

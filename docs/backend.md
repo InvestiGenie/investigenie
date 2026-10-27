@@ -1,13 +1,14 @@
 # Backend
 
-Rust crate `investigenie-api` in `backend/` (Axum + Tokio). One binary: `investigenie-api [migrate | healthcheck]`.
+Rust crate `investigenie-api` in `backend/` (Axum + Tokio). One binary: `investigenie-api [migrate | healthcheck] [--config <path>]`.
 
 ## Modules (`backend/src`)
 
 | File | What it does |
 |---|---|
 | `main.rs` | Startup, the `migrate` and `healthcheck` commands, serving the UI, graceful shutdown; declares backend-owned data/AI contract modules. |
-| `config.rs` | Reads environment settings; picks quickstart storage when nothing is configured. |
+| `config.rs`, `config/file.rs` | Strict typed TOML loading, command parsing, environment overrides, path resolution, and validated settings/quickstart storage. |
+| `logging.rs` | Log-level and destination settings, console/daily file output, safe HTTP metadata, and operation timing/cancellation. |
 | `api.rs` | All HTTP routes, error mapping, concurrency limits, background AI jobs, static UI serving. |
 | `search.rs` | `SearchRequest` and validation of time ranges, histogram intervals, breakdown fields, and timezones. |
 | `data_connectors.rs` | The datasource `Connector` trait, descriptors, secret-handling helpers, and generated registry. Implementations import `crate::data_connectors`. |
@@ -48,7 +49,9 @@ Explore Elasticsearch searches request exact matching totals across all selected
 
 Elasticsearch and ClickHouse use `HistogramInterval::automatic(span_millis)` in `search.rs` for automatic breakdown intervals. Keep the candidate intervals and target bucket count in that helper, not separate connector-specific lists. Elasticsearch tolerates unmapped time fields when sorting multi-index patterns; ClickHouse histogram failures preserve valid rows and report an unavailable reason. SQL `LIMIT` bounds returned rows, while ClickHouse server profiles control memory limits; fixed memory/result/overflow URL overrides are not sent.
 
-`SearchRequest` fields: `index`, `query`, `size` (≤100), `cursor` (`""` starts a paged scan), `sort_by`/`sort_order`, `histogram_field`, `time_range` (inclusive epoch ms), `histogram_interval` (`30s`, `5m`, `1d`, `1w`, `1M`, `1y`; requires a time range, ≤1000 buckets), `histogram_breakdown_field` (top 3 values + `__other__`), `time_zone`.
+`SearchRequest` fields: `index`, `query`, `size` (positive; public API clamps to 50, default 50), `cursor` (`""` starts a result window), `sort_by`/`sort_order`, `histogram_field`, `time_range` (inclusive epoch ms), `histogram_interval` (`30s`, `5m`, `1d`, `1w`, `1M`, `1y`; requires a time range, ≤1000 buckets), `histogram_breakdown_field` (top 3 values + `__other__`), `time_zone`.
+
+Every public connector search exposes at most 100 records per result window: two 50-record pages in Explore. Shared `SearchWindow` logic wraps native continuation cursors, bounds legacy offsets to 0-99, and removes `next_cursor` at the ceiling without changing totals or histogram buckets. An invalid/exhausted cursor or offset returns 400 `invalid_search_window`; restart older cursor searches after upgrading. No continuation can mean the display cap, not source exhaustion. Narrowing the query or clicking/dragging the graph starts a fresh window for the selected time range. Native connector paging remains bounded to 100 records per call; internal AI evidence limits are unchanged. Aggregate queries and some source sorts may still examine more than 100 records upstream.
 
 ## AI conversation history
 
@@ -93,18 +96,42 @@ Jobs (`InvestigationJob`, `Control`) pause at the user's check-in interval or on
 
 ## Configuration
 
-| Variable | Default | Notes |
-|---|---|---|
-| `RUST_API_BIND` | `127.0.0.1:3000` | `0.0.0.0:3000` in Docker. |
-| `WEB_ORIGIN` | `http://127.0.0.1:5173` | Only for the separate Vite dev server (CORS). |
-| `WEB_DIR` | `web/` next to the binary | Built UI to serve. |
-| `PERSISTENCE_MODE` | quickstart | `filesystem` or `database`. |
-| `FILESYSTEM_PATH` | `investigenie_data/` next to the binary | One API instance per directory. |
-| `DATABASE_URL`, `DB_MAX_CONNECTIONS` | none, `10` | PostgreSQL; use `sslmode=verify-full` outside loopback. |
-| `CONFIG_ENCRYPTION_KEY`, `CONFIG_ENCRYPTION_KEY_ID` | generated in quickstart, `v1` | Base64 of 32 random bytes. Keep it; a wrong key fails closed. |
-| `AI_PROBE_TIMEOUT_SECONDS` | `15` | Timeout (5-600) for the test call made when an AI model is saved. Raise it for slow local models. |
+Use `investigenie.toml`, starting from [investigenie.example.toml](../investigenie.example.toml). The API no longer loads `.env`. Selection is explicit `--config <path>` first; otherwise it looks in the working directory, then beside the executable. No discovered file means built-in defaults; a missing explicit file, unreadable/oversized file, malformed TOML, unknown key, or wrong type fails startup without echoing configuration values. Files are limited to 1 MiB. Environment variables override TOML, which overrides defaults. Restart to apply changes.
 
-Quickstart (none of `PERSISTENCE_MODE`, `CONFIG_ENCRYPTION_KEY`, `DATABASE_URL` set) stores a generated key beside the data. That suits local use only.
+```toml
+[server]
+bind = "127.0.0.1:3000"
+
+[logging]
+level = "info"
+mode = "both"
+path = "logs"
+max_files = 7
+
+[storage]
+path = "data"
+```
+
+`path = "logs"` and `path = "data"` create those folders beside the selected TOML file; no `./` prefix is required. Relative subpaths and relative environment path overrides use the same base. Absolute paths are unchanged. Without a file, relative overrides use the working directory. Windows absolute paths can use TOML literal strings, for example `path = 'C:\InvestiGenie\logs'`.
+
+| TOML key | Environment override | Default / notes |
+|---|---|---|
+| `server.bind` | `RUST_API_BIND` | `127.0.0.1:3000`; Docker overrides to `0.0.0.0:3000`. |
+| `server.web_origin` | `WEB_ORIGIN` | `http://127.0.0.1:5173`, for split-Vite CORS; Vite reads the default project TOML too. |
+| `server.web_dir` | `WEB_DIR` | Auto-detect `web/` beside the executable; helpers override with built `frontend/dist`. |
+| `storage.mode` | `PERSISTENCE_MODE` | Omit for quickstart; explicit `filesystem` or `database` requires an encryption key. |
+| `storage.path` | `FILESYSTEM_PATH` | Example: `data`; without any path, quickstart uses `investigenie_data/` beside the executable. Single instance per directory. |
+| `storage.database_url` | `DATABASE_URL` | PostgreSQL only; prefer environment injection for credentials and `sslmode=verify-full` outside loopback. |
+| `storage.max_connections` | `DB_MAX_CONNECTIONS` | `10`, range 1-1000. |
+| `storage.encryption_key` | `CONFIG_ENCRYPTION_KEY` | Base64 of 32 random bytes. Prefer environment injection; preserve the existing key when migrating. |
+| `storage.encryption_key_id` | `CONFIG_ENCRYPTION_KEY_ID` | `v1`. |
+| `ai.probe_timeout_seconds` | `AI_PROBE_TIMEOUT_SECONDS` | `15`, range 5-600; invalid values fail startup. |
+| `logging.level` | `LOG_LEVEL` | `error`, `warn`, `info` (default), or `debug`. |
+| `logging.mode` | `LOG_MODE` | `console`, `file`, or `both` (default), independent of level. |
+| `logging.path` | `LOG_PATH` | `logs` beside the TOML file; Docker uses writable `/data/logs`. |
+| `logging.max_files` | `LOG_MAX_FILES` | `7`, range 1-365; validated when mode writes files. |
+
+Quickstart (no persistence mode, encryption key, or database URL) generates a key beside the data. The example uses `data/`; deployments without a file retain the executable-relative default. Keep private TOML files out of Git and Docker build contexts; datasource and AI credentials still belong in the UI/API, not TOML. `VITE_API_BASE_URL` remains an explicit process-environment build-time override, not a backend TOML field. Playground `.env` files configure Compose/seeding and are separate from application configuration.
 
 Run `investigenie-api migrate` after upgrading a PostgreSQL-backed deployment, including the `202610230001_knowledge.sql` migration for knowledge entries. Filesystem snapshots add optional history and knowledge maps compatibly when next written.
 
@@ -115,3 +142,25 @@ cargo test -p investigenie-api
 ```
 
 Upstreams are mocked with `wiremock`. PostgreSQL tests are `#[ignore]` and need a database.
+
+## Application logs
+
+Set the logging section in `investigenie.toml`, then restart the process:
+
+```toml
+[logging]
+level = "info"
+mode = "both"
+path = "logs"
+max_files = 7
+```
+
+Modes are `console` (terminal only, no log directory), `file` (daily files only), or `both` (default). `logging.path` is a folder, not a filename. With the local project TOML and `path = "logs"`, files are under `investigenie/logs/`, named `investigenie.YYYY-MM-DD.log` (UTC dates). Uncreatable/unwritable file-log paths and invalid settings fail startup with sanitized errors. The `healthcheck` subcommand reads the same config/bind but never opens storage or initializes file logging.
+
+Levels are cumulative: `error` records failures; `warn` adds warnings and rejected client requests; `info` adds startup/shutdown and investigation lifecycle events; `debug` adds detailed request/connector timing, counts, progress, and cancellation metadata. Server/connector failures remain visible at `error`, and request/provider/job context is retained at every level. User-requested stops are informational, not failures. To reproduce an issue, temporarily use `LOG_LEVEL=debug`, then return to `info`. There is one level control, not a separate debug toggle or dependency filter.
+
+Coverage includes request IDs, HTTP method and matched route templates, status/duration, all datasource test/list/field/search/document methods, requested page metadata, returned record and histogram counts, timeout flags, stable error codes, AI provider timing and reported token counts, JSON fallback/repair attempts, investigation progress/decisions, storage startup, and shutdown. Background investigations retain their request/job spans. Saved-object management activity is visible through its API route and result status, not through database wire dumps. Cancelled or interrupted operations are marked even when they do not return a result.
+
+Logging uses an allowlist of application-owned metadata at every level: no authorization headers, cookies, credentials, raw URLs/query strings, datasource query text, document IDs/content, configuration payloads, AI questions/prompts/replies, or raw upstream/database errors. Third-party HTTP/SQL events are suppressed even at `debug`. Do not add blanket `Debug` dumps of requests/settings/results. Browser-only rendering/navigation errors are not sent to this server log; use browser developer tools when a request never reaches the API.
+
+Files rotate daily, retaining at most `LOG_MAX_FILES` matching files. This is file-count retention, not a byte limit: a day's file can grow with traffic. A bounded 1,024-event non-blocking queue can drop events under sustained overload rather than stall searches. Graceful shutdown flushes queued output; force-killing the process can lose recent lines. Use debug verbosity temporarily, monitor disk space, protect the log directory, review logs before sharing, and mount it explicitly if container logs must survive replacement. Logs are diagnostic metadata, not an audit trail or encrypted saved-object storage.

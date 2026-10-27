@@ -32,7 +32,10 @@ services:
       RUST_API_BIND: 0.0.0.0:3000
       # Local models can take a while to answer the save-time probe on first load.
       AI_PROBE_TIMEOUT_SECONDS: ${AI_PROBE_TIMEOUT_SECONDS:-120}
-      RUST_LOG: ${RUST_LOG:-info}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_MODE: ${LOG_MODE:-both}
+      LOG_PATH: /data/logs
+      LOG_MAX_FILES: ${LOG_MAX_FILES:-7}
     ports:
       - "127.0.0.1:${INVESTIGENIE_PORT:-3000}:3000"
     volumes:

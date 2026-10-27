@@ -3,6 +3,7 @@ use std::{
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use crate::storage::{validate_encryption_key, PersistenceOptions, StorageOptions};
@@ -13,18 +14,28 @@ use url::Url;
 const QUICKSTART_DATA_DIRECTORY: &str = "investigenie_data";
 const QUICKSTART_KEY_FILE: &str = "encryption.key";
 
+mod file;
+pub use file::{Command, Configuration};
+
 #[derive(Clone)]
 pub struct Settings {
     pub bind: SocketAddr,
     pub web_origin: String,
     pub storage: PersistenceOptions,
     pub web_dir: Option<PathBuf>,
+    pub ai_probe_timeout: Duration,
     /// No storage settings were supplied, so a local filesystem store with a generated key is used.
     pub quickstart: bool,
 }
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("Could not read the selected configuration file")]
+    ConfigurationFile,
+    #[error("Configuration must be valid TOML with supported sections, keys, and value types")]
+    ConfigurationFormat,
+    #[error("Use [migrate | healthcheck] [--config <path>]; --config may be supplied once")]
+    Arguments,
     #[error("DATABASE_URL is required and must be a PostgreSQL URL")]
     Database,
     #[error("CONFIG_ENCRYPTION_KEY must be base64 encoding of 32 bytes and CONFIG_ENCRYPTION_KEY_ID must be a valid key identifier")]
@@ -35,6 +46,8 @@ pub enum ConfigError {
     FilesystemPath,
     #[error("DB_MAX_CONNECTIONS must be between 1 and 1000")]
     PoolSize,
+    #[error("ai.probe_timeout_seconds / AI_PROBE_TIMEOUT_SECONDS must be between 5 and 600")]
+    ProbeTimeout,
     #[error("Invalid RUST_API_BIND address")]
     BindAddress,
     #[error("WEB_ORIGIN must be a valid HTTP or HTTPS origin")]
@@ -44,14 +57,17 @@ pub enum ConfigError {
 }
 
 impl Settings {
-    pub fn from_env() -> Result<Self, ConfigError> {
-        let bind = env::var("RUST_API_BIND")
-            .unwrap_or_else(|_| "127.0.0.1:3000".to_owned())
+    pub fn from_configuration(configuration: &Configuration) -> Result<Self, ConfigError> {
+        Self::from_values(|name| configuration.value(name))
+    }
+
+    fn from_values(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let bind = get("RUST_API_BIND")
+            .unwrap_or_else(|| "127.0.0.1:3000".to_owned())
             .parse()
             .map_err(|_| ConfigError::BindAddress)?;
 
-        let web_origin =
-            env::var("WEB_ORIGIN").unwrap_or_else(|_| "http://127.0.0.1:5173".to_owned());
+        let web_origin = get("WEB_ORIGIN").unwrap_or_else(|| "http://127.0.0.1:5173".to_owned());
         let parsed_origin = Url::parse(&web_origin).map_err(|_| ConfigError::WebOrigin)?;
         if !matches!(parsed_origin.scheme(), "http" | "https")
             || parsed_origin.host_str().is_none()
@@ -66,22 +82,31 @@ impl Settings {
 
         let storage_configured = ["PERSISTENCE_MODE", "CONFIG_ENCRYPTION_KEY", "DATABASE_URL"]
             .iter()
-            .any(|name| env::var(name).is_ok_and(|value| !value.trim().is_empty()));
+            .any(|name| get(name).is_some_and(|value| !value.trim().is_empty()));
         let storage = if storage_configured {
-            persistence_from_values(|name| env::var(name).ok())?
+            persistence_from_values(&get)?
         } else {
-            quickstart_storage(&quickstart_directory())?
+            quickstart_storage(&quickstart_directory(get("FILESYSTEM_PATH")))?
         };
-        let web_dir = match env::var("WEB_DIR") {
-            Ok(path) if !path.trim().is_empty() => Some(PathBuf::from(path)),
+        let web_dir = match get("WEB_DIR") {
+            Some(path) if !path.trim().is_empty() => Some(PathBuf::from(path)),
             _ => Some(application_directory().join("web"))
                 .filter(|directory| directory.join("index.html").is_file()),
         };
+        let ai_probe_timeout = get("AI_PROBE_TIMEOUT_SECONDS")
+            .unwrap_or_else(|| "15".to_owned())
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| (5..=600).contains(seconds))
+            .map(Duration::from_secs)
+            .ok_or(ConfigError::ProbeTimeout)?;
         Ok(Self {
             bind,
             web_origin,
             storage,
             web_dir,
+            ai_probe_timeout,
             quickstart: !storage_configured,
         })
     }
@@ -95,9 +120,8 @@ fn application_directory() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn quickstart_directory() -> PathBuf {
-    env::var("FILESYSTEM_PATH")
-        .ok()
+fn quickstart_directory(value: Option<String>) -> PathBuf {
+    value
         .filter(|path| !path.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| application_directory().join(QUICKSTART_DATA_DIRECTORY))
@@ -188,6 +212,34 @@ fn persistence_from_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_timeout_configuration_accepts_only_bounded_whole_seconds() {
+        let key = STANDARD.encode([7u8; 32]);
+        let parse = |timeout: Option<&str>| {
+            Settings::from_values(|name| match name {
+                "PERSISTENCE_MODE" => Some("filesystem".to_owned()),
+                "FILESYSTEM_PATH" => Some("test-data".to_owned()),
+                "CONFIG_ENCRYPTION_KEY" => Some(key.clone()),
+                "AI_PROBE_TIMEOUT_SECONDS" => timeout.map(str::to_owned),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            parse(None).unwrap().ai_probe_timeout,
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            parse(Some(" 120 ")).unwrap().ai_probe_timeout,
+            Duration::from_secs(120)
+        );
+        for invalid in ["", "4", "601", "-1", "1.5", "slow"] {
+            assert!(matches!(
+                parse(Some(invalid)),
+                Err(ConfigError::ProbeTimeout)
+            ));
+        }
+    }
 
     #[test]
     fn quickstart_generates_a_key_once_and_reuses_it() {

@@ -10,7 +10,7 @@ Website: [investigenie.com](https://investigenie.com) · Releases: [GitHub Relea
 
 - **All sources, one UI:** connect as many datasources as you need and save Data Views over any index or table, including Elasticsearch wildcard and comma-separated index patterns.
 - **Supported datasources:** Elasticsearch, ClickHouse, BigQuery, Loki, Prometheus, VictoriaLogs, and VictoriaMetrics. Explore capabilities vary by connector; build-time registration alone does not enable AI investigations for a datasource.
-- **Explore:** query in each source's own language. You get time windows (last 15 minutes by default) and timezones, sorting, field columns, JSON inspection, and paging past 10,000 results. Elasticsearch counts matches across the entire selected pattern.
+- **Explore:** query in each source's own language. You get time windows (last 15 minutes by default) and timezones, sorting, field columns, JSON inspection, and two 50-record pages per search. Graph-selected ranges start a fresh capped search; totals and histograms retain the matching scope. Elasticsearch counts matches across the entire selected pattern.
 - **Histogram:** auto or fixed intervals, breakdown by field (including All time), and drag-to-zoom.
 - **InvestiGenie AI:** ask a question across 1–5 Elasticsearch or ClickHouse Data Views. The engine uses up to three bounded queries per view and retains up to eight sample rows; source aggregations may cover more records. Results distinguish those counts, show cited samples and caveats, and label conclusions as unverified hypotheses. Other connectors support Explore, but not AI query translation yet.
 - **AI history:** reopen or delete encrypted conversation history and ask follow-ups using saved findings. Follow-ups do not rescan sources; active scan jobs are not resumed after a restart.
@@ -47,7 +47,7 @@ Then:
 
 With no settings, InvestiGenie runs in **quickstart mode**: encrypted data and a generated key are stored in `investigenie_data/` (or `/data` in Docker). That is fine for one user on one machine.
 
-For shared use, set these as environment variables or in a `.env` file next to the binary:
+Application settings live in `investigenie.toml`; `.env` is not loaded. Releases include a safe default file, and local runners copy [investigenie.example.toml](investigenie.example.toml) when needed. Use `--config <path>` to select another file. Environment overrides remain available for containers and deployment secrets.
 
 | Variable | Use |
 |---|---|
@@ -55,8 +55,15 @@ For shared use, set these as environment variables or in a `.env` file next to t
 | `CONFIG_ENCRYPTION_KEY` | Base64 of 32 random bytes. Store it safely, because losing it means losing saved data. |
 | `FILESYSTEM_PATH` / `DATABASE_URL` | Where to store data. In database mode, run `investigenie-api migrate` once per release. |
 | `RUST_API_BIND` | Listen address, default `127.0.0.1:3000`. |
+| `LOG_LEVEL` | `error`, `warn`, `info` (default), or `debug`; applies to console and file output. Restart to change it. |
+| `LOG_MODE` | `console`, `file`, or `both` (default), independently of level. TOML: `logging.mode`. |
+| `LOG_PATH` / `LOG_MAX_FILES` | Log folder (`logs`, `/data/logs` in Docker) and retained daily files (`7`). TOML: `logging.path` / `logging.max_files`. |
 
 Full list: [Backend → Configuration](docs/backend.md#configuration). Datasource and AI credentials are entered only in the UI, never in configuration files.
+
+Relative paths such as `logging.path = "logs"` and `storage.path = "data"` resolve beside the selected TOML file; full absolute paths are used unchanged. Keep your existing data path and encryption key when migrating so saved connections/history remain readable. Private TOML files are ignored by Git; do not put deployment secrets into the public example.
+
+For troubleshooting, see [Application logs](docs/backend.md#application-logs). Set `LOG_LEVEL=debug` temporarily for request/connector details; failures remain visible at lower levels. Logs exclude raw payloads and credentials at every level; browser-only errors still need browser developer tools.
 
 ## Security notes
 

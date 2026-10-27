@@ -9,7 +9,6 @@ aes-gcm = "0.10"
 base64 = "0.22"
 chrono = "0.4"
 chrono-tz = "0.10"
-dotenvy = "0.15"
 fs2 = "0.4"
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
@@ -20,10 +19,12 @@ getrandom = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+toml = "0.9"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+tracing-subscriber = "0.3"
 url = "2"
 yup-oauth2 = { version = "12", default-features = false, features = ["hyper-rustls", "ring", "service-account"] }
 
