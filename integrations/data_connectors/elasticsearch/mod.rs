@@ -31,6 +31,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const SEARCH_TIMEOUT: &str = "10s";
 const MAX_ERROR_DETAIL_CHARS: usize = 400;
 const MAX_SCOPED_INDICES_BYTES: usize = 4096;
+const MAX_PIT_ID_BYTES: usize = 256 * 1024;
+const MAX_CURSOR_BYTES: usize = 512 * 1024;
 
 pub fn descriptor() -> IntegrationDescriptor {
     IntegrationDescriptor {
@@ -222,7 +224,7 @@ struct SearchCursor {
 impl SearchCursor {
     fn validate(&self) -> Result<(), ElasticsearchError> {
         if self.pit_id.is_empty()
-            || self.pit_id.len() > 16_384
+            || self.pit_id.len() > MAX_PIT_ID_BYTES
             || self.sort.is_empty()
             || self.sort.len() > 2
             || self.sort.iter().any(|value| match value {
@@ -241,7 +243,7 @@ impl SearchCursor {
     }
 
     fn decode(token: &str) -> Result<Self, ElasticsearchError> {
-        if token.len() > 32_768 {
+        if token.len() > MAX_CURSOR_BYTES {
             return Err(ElasticsearchError::InvalidIndex);
         }
         let bytes = BASE64
@@ -257,7 +259,11 @@ impl SearchCursor {
         self.validate()
             .map_err(|_| ElasticsearchError::InvalidResponse)?;
         let bytes = serde_json::to_vec(self).map_err(|_| ElasticsearchError::InvalidResponse)?;
-        Ok(BASE64.encode(bytes))
+        let token = BASE64.encode(bytes);
+        if token.len() > MAX_CURSOR_BYTES {
+            return Err(ElasticsearchError::InvalidResponse);
+        }
+        Ok(token)
     }
 }
 
@@ -399,8 +405,25 @@ impl ElasticsearchClient {
                 let id = opened
                     .get("id")
                     .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty() && id.len() <= 16_384)
-                    .ok_or(ElasticsearchError::InvalidResponse)?;
+                    .ok_or_else(|| {
+                        tracing::debug!(
+                            reason = "missing_pit_id",
+                            "Elasticsearch PIT response is invalid"
+                        );
+                        ElasticsearchError::InvalidResponse
+                    })?;
+                if id.is_empty() || id.len() > MAX_PIT_ID_BYTES {
+                    tracing::debug!(
+                        reason = "invalid_pit_id_size",
+                        pit_id_bytes = id.len(),
+                        max_pit_id_bytes = MAX_PIT_ID_BYTES,
+                        "Elasticsearch PIT response is invalid"
+                    );
+                    if !id.is_empty() {
+                        self.close_pit(id).await;
+                    }
+                    return Err(ElasticsearchError::InvalidResponse);
+                }
                 SearchCursor {
                     pit_id: id.to_owned(),
                     sort: Vec::new(),
@@ -585,6 +608,12 @@ impl ElasticsearchClient {
                 match cursor.encode() {
                     Ok(token) => next_cursor = Some(token),
                     Err(error) => {
+                        tracing::debug!(
+                            reason = "invalid_search_cursor",
+                            pit_id_bytes = id.len(),
+                            sort_values = cursor.sort.len(),
+                            "Elasticsearch response cannot produce a continuation cursor"
+                        );
                         self.close_pit(id).await;
                         return Err(error);
                     }
@@ -1426,6 +1455,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wildcard_search_pages_with_large_shard_pit_ids() {
+        let server = MockServer::start().await;
+        let pit = "p".repeat(50_000);
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/logs-*/_pit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":pit})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let expected_pit = pit.clone();
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/_search"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["pit"]["id"], expected_pit);
+                let hits = if body.get("search_after").is_some() {
+                    json!([{"_index":"logs-1","_id":"c","sort":[1001,3]}])
+                } else {
+                    json!([
+                        {"_index":"logs-1","_id":"a","sort":[1000,1]},
+                        {"_index":"logs-2","_id":"b","sort":[1000,2]}
+                    ])
+                };
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "timed_out":false,"_shards":{"failed":0},
+                    "pit_id":expected_pit,"hits":{"hits":hits}
+                }))
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("DELETE"))
+            .and(matchers::path("/_pit"))
+            .and(matchers::body_json(json!({"id":pit})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"succeeded":true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = ElasticsearchClient::new(ElasticsearchSettings {
+            url: Url::parse(&server.uri()).unwrap(),
+            authentication: None,
+            tls_insecure: false,
+        })
+        .unwrap();
+        let mut request = cursor_request("");
+        request.index = "logs-*".to_owned();
+        request.from = 0;
+        request.include_histogram = Some(false);
+        let window = crate::search::SearchWindow::prepare(&mut request).unwrap();
+        let first = client.search(request).await.unwrap();
+        assert_eq!(first.hits.len(), 2);
+        let mut first = serde_json::to_value(first).unwrap();
+        window.finish(&mut first);
+        let mut request = cursor_request(first["next_cursor"].as_str().unwrap());
+        request.index = "logs-*".to_owned();
+        request.include_histogram = Some(false);
+        crate::search::SearchWindow::prepare(&mut request).unwrap();
+        let last = client.search(request).await.unwrap();
+        assert_eq!(last.hits[0].id, "c");
+        assert!(last.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_pit_is_closed_and_logged_without_its_value() {
+        let server = MockServer::start().await;
+        let pit = format!("private-pit-secret{}", "p".repeat(super::MAX_PIT_ID_BYTES));
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/logs/_pit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":pit})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("DELETE"))
+            .and(matchers::path("/_pit"))
+            .and(matchers::body_json(json!({"id":pit})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"succeeded":true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = ElasticsearchClient::new(ElasticsearchSettings {
+            url: Url::parse(&server.uri()).unwrap(),
+            authentication: None,
+            tls_insecure: false,
+        })
+        .unwrap();
+        let captured = crate::logging::tests::capture();
+        let _guard = tracing::dispatcher::set_default(&captured.subscriber);
+        assert!(matches!(
+            client.search(cursor_request("")).await,
+            Err(super::ElasticsearchError::InvalidResponse)
+        ));
+        let log = String::from_utf8(captured.bytes.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("invalid_pit_id_size"));
+        assert!(log.contains(&format!("pit_id_bytes={}", pit.len())));
+        assert!(!log.contains("private-pit-secret"));
+    }
+
+    #[tokio::test]
     async fn cursor_search_rejects_partial_pages_and_closes_empty_pages() {
         for (timed_out, failed, succeeds) in [
             (false, Some(0), true),
@@ -1586,9 +1713,20 @@ mod tests {
     #[test]
     fn cursor_tokens_reject_oversized_or_invalid_payloads() {
         use base64::Engine;
-        for token in ["!".to_owned(), "a".repeat(32769)] {
+        for token in ["!".to_owned(), "a".repeat(super::MAX_CURSOR_BYTES + 1)] {
             assert!(super::SearchCursor::decode(&token).is_err());
         }
+        let mut cursor = super::SearchCursor {
+            pit_id: "p".repeat(super::MAX_PIT_ID_BYTES),
+            sort: vec![json!(1000), json!(1)],
+        };
+        let token = cursor.encode().unwrap();
+        assert!(token.len() <= super::MAX_CURSOR_BYTES);
+        assert_eq!(super::SearchCursor::decode(&token).unwrap().pit_id, cursor.pit_id);
+        cursor.pit_id.push('p');
+        assert!(cursor.encode().is_err());
+        let oversized = super::BASE64.encode(serde_json::to_vec(&cursor).unwrap());
+        assert!(super::SearchCursor::decode(&oversized).is_err());
         for payload in [
             json!({"pit_id":"","sort":[1]}),
             json!({"pit_id":1,"sort":[1]}),

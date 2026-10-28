@@ -7,6 +7,7 @@ pub const MAX_BREAKDOWN_VALUES: usize = 3;
 pub const BREAKDOWN_OTHER_KEY: &str = "__other__";
 pub const SEARCH_PAGE_SIZE: usize = 50;
 pub const MAX_SEARCH_RECORDS: usize = 100;
+const MAX_SEARCH_CURSOR_BYTES: usize = 1024 * 1024;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -31,7 +32,7 @@ impl SearchWindow {
             .filter(|cursor| !cursor.is_empty())
         {
             Some(cursor) => {
-                if cursor.len() > 65_536 {
+                if cursor.len() > MAX_SEARCH_CURSOR_BYTES {
                     return Err("Invalid search cursor; start a new search");
                 }
                 let bytes = URL_SAFE_NO_PAD
@@ -357,6 +358,11 @@ mod tests {
             SearchRequest {
                 size: 50,
                 cursor: Some("not-a-cursor".to_owned()),
+                ..Default::default()
+            },
+            SearchRequest {
+                size: 50,
+                cursor: Some("a".repeat(super::MAX_SEARCH_CURSOR_BYTES + 1)),
                 ..Default::default()
             },
             SearchRequest {
