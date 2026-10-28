@@ -43,7 +43,7 @@ Implement the [shared Connector](../backend/src/data_connectors.rs): `Send + Syn
 | --- | --- |
 | `test_connection` | Verify endpoint/access before the API saves the connection. |
 | `indices` | Return `IndexSummary`: dataset `name`, optional `document_count` string and `health` string. List the datasets users can select. |
-| `fields` | Return `FieldSummary`: `name`, `field_type`, `is_time_field`. Expose leaf fields, not object containers; flag actual dates/timestamps. A valid time field is required to create a usable Data View. |
+| `fields` | Return `FieldSummary`: `name`, `field_type`, `is_time_field`. Expose leaf fields, not object containers; flag actual dates/timestamps. A valid time field is required to create a usable Data View. Elasticsearch discovers wildcard-pattern fields through `_field_caps` and reports incompatible type families as `conflict`. |
 | `search` | Translate the [SearchRequest](../backend/src/search.rs) and return the JSON below. |
 | `document` | For `lookup`: return `index`, `id`, `found`, `source`; missing documents use `found: false`, `source: null`. For `inline`: the UI inspects the returned hit; this method may reject lookup. |
 

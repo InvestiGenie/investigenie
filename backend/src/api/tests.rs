@@ -664,13 +664,15 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
         {"_index":"events","_id":"event-2","_score":null,"_source":{"@timestamp":"2026-10-10T11:01:00Z","service":"checkout","message":"inventory timeout","internal_note":"not selected"}}
     ]);
     Mock::given(matchers::method("GET"))
-        .and(matchers::path("/events/_mapping"))
+        .and(matchers::path("/events/_field_caps"))
+        .and(matchers::query_param("fields", "*"))
+        .and(matchers::query_param("include_unmapped", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "events":{"mappings":{"properties":{
-                "@timestamp":{"type":"date"},
-                "service":{"type":"keyword"},
-                "message":{"type":"text"}
-            }}}
+            "fields":{
+                "@timestamp":{"date":{"type":"date","metadata_field":false,"searchable":true,"aggregatable":true}},
+                "service":{"keyword":{"type":"keyword","metadata_field":false,"searchable":true,"aggregatable":true}},
+                "message":{"text":{"type":"text","metadata_field":false,"searchable":true,"aggregatable":false}}
+            }
         })))
         .expect(1)
         .mount(&source)
@@ -1856,8 +1858,16 @@ async fn api_views_validate_before_writes_and_cascade_delete() {
         )
         .mount(&server)
         .await;
-    Mock::given(matchers::method("GET")).and(matchers::path("/logs/_mapping"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"logs":{"mappings":{"properties":{"timestamp":{"type":"date"},"message":{"type":"keyword"}}}}}))).mount(&server).await;
+    Mock::given(matchers::method("GET"))
+        .and(matchers::path("/logs/_field_caps"))
+        .and(matchers::query_param("fields", "*"))
+        .and(matchers::query_param("include_unmapped", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"fields":{
+            "timestamp":{"date":{"type":"date","metadata_field":false,"searchable":true,"aggregatable":true}},
+            "message":{"keyword":{"type":"keyword","metadata_field":false,"searchable":true,"aggregatable":true}}
+        }})))
+        .mount(&server)
+        .await;
     let source_revision = database
         .storage
         .create_connection(StoredConnection {
