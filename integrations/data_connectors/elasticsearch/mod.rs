@@ -491,11 +491,9 @@ impl ElasticsearchClient {
             }
         }
 
-        if histogram_requested.is_some()
-            && !separate_histogram
-            && histogram_unavailable_reason.is_none()
+        if let Some(field) = histogram_requested
+            .filter(|_| !separate_histogram && histogram_unavailable_reason.is_none())
         {
-            let field = histogram_requested.unwrap();
             body["aggs"] = histogram_aggregations(field, &request, &histogram_options);
         }
 
@@ -613,12 +611,10 @@ impl ElasticsearchClient {
             .map(|interval| format!("{}{}", interval.count, interval.suffix()));
         let histogram = histogram_envelope
             .and_then(|result| result.aggregations)
-            .or_else(|| {
-                if separate_histogram {
-                    None
-                } else {
-                    envelope.aggregations
-                }
+            .or(if separate_histogram {
+                None
+            } else {
+                envelope.aggregations
             })
             .map(histogram_buckets)
             .unwrap_or_default();
