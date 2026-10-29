@@ -46,7 +46,11 @@ export type IntegrationDescriptor = {
   connection_fields: ConnectionField[];
   query: QueryDescriptor;
   ai_investigation: boolean;
+  /** Languages Explore translates into `query_language`, native first; empty when untranslatable. */
+  query_languages?: QueryLanguage[];
 };
+
+export type QueryLanguage = { language: string; example: string };
 
 export type ConnectionSummary = {
   id: string;
@@ -223,6 +227,8 @@ export type SearchResult = {
   histogram_unavailable_reason?: string | null;
   histogram_interval?: string | null;
   columns?: string[];
+  query_language?: string;
+  translated_query?: string;
 };
 
 export const BREAKDOWN_OTHER_KEY = '__other__';
@@ -255,6 +261,8 @@ export type SearchRequest = {
   histogram_interval?: string;
   histogram_breakdown_field?: string;
   time_zone?: string;
+  /** Set when `query` is written in another language than the Data View's own. */
+  query_language?: string;
 };
 
 // Production builds are served by the API itself, so they default to the same origin.

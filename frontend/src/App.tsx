@@ -106,6 +106,8 @@ export default function App() {
   const [fieldFilter, setFieldFilter] = useState('');
   const [selectedFieldsByView, setSelectedFieldsByView] = useState<Record<string, string[]>>({});
   const [query, setQuery] = useState('');
+  // Empty means the Data View's native language; any other language is translated by the API.
+  const [queryLanguage, setQueryLanguage] = useState('');
   const [initialTime] = useState(() => Date.now());
   const [startDate, setStartDate] = useState(() => utcInput(initialTime - 15 * 60_000));
   const [endDate, setEndDate] = useState(() => utcInput(initialTime));
@@ -231,6 +233,10 @@ export default function App() {
   const selectedConnection = connections.find((connection) => connection.id === selectedConnectionId);
   const integration = selectedConnection?.integration;
   const queryMetadata = integration?.query;
+  const nativeLanguage = integration?.query_language ?? '';
+  const queryLanguages = integration?.query_languages ?? [];
+  const activeLanguage = queryLanguages.find((option) => option.language === queryLanguage) ?? null;
+  const crossLanguage = Boolean(activeLanguage && activeLanguage.language !== nativeLanguage);
 
   useEffect(() => {
     if (!selectedDataView || !selectedConnection) {
@@ -291,7 +297,7 @@ export default function App() {
     setLoading(true);
     setError('');
     try {
-      const body = firstPageRequest(makeSearchRequest(
+      const request = makeSearchRequest(
           selectedIndex,
           resolveSearchQuery(queryMetadata, selectedIndex, query),
           nextOffset,
@@ -300,7 +306,10 @@ export default function App() {
           overrides.sortOrder ?? sortOrder,
           overrides.startDate ?? startDate,
           overrides.endDate ?? endDate,
-        ), overrides.interval, overrides.breakdown);
+        );
+      // An empty query falls back to the native default query, so only typed queries are translated.
+      if (crossLanguage && activeLanguage && query.trim()) request.query_language = activeLanguage.language;
+      const body = firstPageRequest(request, overrides.interval, overrides.breakdown);
       const response = await api.search(
         selectedConnectionId,
         body,
@@ -528,7 +537,7 @@ export default function App() {
             <section className="query-panel" aria-label="Search controls">
               <div className="query-topline">
                 <label className="select-label" htmlFor="data-view-select">DATA VIEW</label>
-                <select id="data-view-select" value={selectedDataViewId} onChange={(event) => { setSelectedDataViewId(event.target.value); setQuery(''); setSortBy(''); setSortOrder('desc'); setBreakdownField(''); setResults(null); }}>
+                <select id="data-view-select" value={selectedDataViewId} onChange={(event) => { setSelectedDataViewId(event.target.value); setQuery(''); setQueryLanguage(''); setSortBy(''); setSortOrder('desc'); setBreakdownField(''); setResults(null); }}>
                   {dataViews.length === 0 && <option value="">No data views available</option>}
                   {dataViews.map((view) => <option key={view.id} value={view.id}>{view.name}</option>)}
                 </select>
@@ -537,10 +546,10 @@ export default function App() {
               <form id="discover-search-form" className="query-form" onSubmit={(event) => void runSearch(event)}>
                 <span className="query-prefix" aria-hidden="true">⌕</span>
                 <input
-                  aria-label={integration ? `${integration.query_language} query` : 'Query'}
+                  aria-label={integration ? `${crossLanguage ? activeLanguage!.language : integration.query_language} query` : 'Query'}
                   value={query}
                   onChange={(event) => setQuery(event.target.value)}
-                  placeholder={queryMetadata ? applyQueryTemplate(queryMetadata.placeholder, queryMetadata, { index: selectedIndex }) : ''}
+                  placeholder={crossLanguage ? activeLanguage!.example : queryMetadata ? applyQueryTemplate(queryMetadata.placeholder, queryMetadata, { index: selectedIndex }) : ''}
                   spellCheck={false}
                 />
                 <kbd>↵</kbd>
@@ -549,7 +558,15 @@ export default function App() {
                   {loading ? 'Searching' : 'Search'}
                 </button>
               </form>
-              <div className="query-footer"><span className="lucene-badge">{integration?.query_language.toUpperCase()}</span><span>{queryMetadata ? applyQueryTemplate(queryMetadata.help, queryMetadata, { index: selectedIndex, query }) : ''}</span></div>
+              <div className="query-footer">
+                {queryLanguages.length > 1
+                  ? <select className="query-language" aria-label="Query language" value={crossLanguage ? activeLanguage!.language : nativeLanguage} onChange={(event) => setQueryLanguage(event.target.value === nativeLanguage ? '' : event.target.value)}>
+                    {queryLanguages.map((option) => <option key={option.language} value={option.language}>{option.language === nativeLanguage ? `${option.language} (native)` : option.language}</option>)}
+                  </select>
+                  : <span className="lucene-badge">{integration?.query_language.toUpperCase()}</span>}
+                <span>{crossLanguage ? `Field comparisons joined by AND are translated to ${nativeLanguage} before searching.` : queryMetadata ? applyQueryTemplate(queryMetadata.help, queryMetadata, { index: selectedIndex, query }) : ''}</span>
+              </div>
+              {results?.translated_query && <div className="translated-query" role="status" aria-label={`Query sent as ${nativeLanguage}`}><span>Sent as {nativeLanguage}</span><code>{results.translated_query}</code></div>}
             </section>
 
             {error && <div className="alert" role="alert"><span className="alert-symbol">!</span><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError('')}>×</button></div>}
@@ -638,7 +655,7 @@ export default function App() {
             <div className="field-list">{[true, false].map((selected) => <section className="field-section" key={String(selected)} aria-label={selected ? 'Selected Fields' : 'Available Fields'}>
               <div className="field-section-heading"><h3>{selected ? 'Selected Fields' : 'Available Fields'}</h3><span className="field-count">{selected ? selectedSidebarFields.length : sidebarFields.length - selectedSidebarFields.length}</span></div>
               {matchingFields.filter((field) => selectedSidebarFields.includes(field.name) === selected).map((field) => <div className="field-row" key={field.name}>
-                <button className="field-item" title={field.name} disabled={!queryMetadata} onClick={() => { if (queryMetadata) setQuery((current) => applyQueryTemplate(queryMetadata.field_query, queryMetadata, { index: selectedIndex, field: field.name, query: current })); }}><span className="field-type">{field.field_type === 'date' ? '◷' : field.field_type === 'text' ? 'T' : '·'}</span><span className="field-name">{field.name}</span><span className="field-kind">{field.field_type}</span></button>
+                <button className="field-item" title={field.name} disabled={!queryMetadata} onClick={() => { if (queryMetadata && !crossLanguage) setQuery((current) => applyQueryTemplate(queryMetadata.field_query, queryMetadata, { index: selectedIndex, field: field.name, query: current })); }}><span className="field-type">{field.field_type === 'date' ? '◷' : field.field_type === 'text' ? 'T' : '·'}</span><span className="field-name">{field.name}</span><span className="field-kind">{field.field_type}</span></button>
                 {field.name === histogramField
                   ? <span className="field-selection-button" role="img" aria-label={`${field.name} is the required time field`} title="Configured time field; cannot be removed">◷</span>
                   : <button className="field-selection-button" aria-label={`${selected ? 'Remove' : 'Add'} ${field.name} ${selected ? 'from' : 'to'} selected fields`} title={`${selected ? 'Remove' : 'Add'} ${field.name} ${selected ? 'from' : 'to'} selected fields`} onClick={() => toggleField(field.name)}>{selected ? '-' : '+'}</button>}

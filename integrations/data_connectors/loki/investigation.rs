@@ -1,6 +1,8 @@
 use super::{valid_label_name, FieldKind, Parser, ValueType};
 use crate::investigation_dialect::{
-    FilterOperator, FilterPredicate, FilterValue, InvestigationDialect, TranslationError,
+    contains_regex, is_number, literal_value, read_contains_regex, read_string_literal,
+    string_literal, FilterOperator, FilterPredicate, FilterValue, InvestigationDialect,
+    ParsedFilter, TranslationError,
 };
 
 struct LogQlDialect;
@@ -26,7 +28,122 @@ const QUANTITY_OPERATORS: &[FilterOperator] = &[
 ];
 const BOOLEAN_OPERATORS: &[FilterOperator] = &[FilterOperator::Eq];
 
+const UNSUPPORTED: TranslationError = TranslationError(
+    "only {label=\"…\"} selectors, |= \"…\" line filters, | json, | logfmt, and | field op value label filters can be translated",
+);
+
 impl InvestigationDialect for LogQlDialect {
+    fn language(&self) -> &'static str {
+        "LogQL"
+    }
+
+    fn example(&self) -> &'static str {
+        "{service=\"checkout\"} |= \"timeout\" | json | status >= 500"
+    }
+
+    fn read(&self, query: &str) -> Result<Vec<ParsedFilter>, TranslationError> {
+        let mut rest = query.trim();
+        let mut filters = Vec::new();
+        if rest.is_empty() {
+            return Ok(filters);
+        }
+        rest = rest
+            .strip_prefix('{')
+            .ok_or(TranslationError("a LogQL query starts with a {stream selector}"))?;
+        let mut first = true;
+        loop {
+            rest = rest.trim_start();
+            if let Some(after) = rest.strip_prefix('}') {
+                rest = after;
+                break;
+            }
+            if !first {
+                rest = rest.strip_prefix(',').ok_or(UNSUPPORTED)?.trim_start();
+            }
+            first = false;
+            let (name, after) = read_name(rest)?;
+            let (operator, after) = read_operator(after.trim_start(), &["=~", "!=", "!~", "="])?;
+            let (value, after) = read_string_literal(after.trim_start()).ok_or(UNSUPPORTED)?;
+            rest = after;
+            match operator {
+                "=" => filters.push(ParsedFilter::new(name, FilterOperator::Eq, FilterValue::String(value))),
+                // The connector's match-all selector for an empty `{}`.
+                "=~" if name == "service_name" && value == ".+" => {}
+                "=~" => filters.push(contains(name, &value)?),
+                _ => return Err(TranslationError("negative matchers cannot be translated")),
+            }
+        }
+        loop {
+            rest = rest.trim_start();
+            if rest.is_empty() {
+                return Ok(filters);
+            }
+            if let Some(after) = rest.strip_prefix("|=") {
+                let (value, after) = read_string_literal(after.trim_start()).ok_or(UNSUPPORTED)?;
+                filters.push(ParsedFilter::new("_msg", FilterOperator::Contains, FilterValue::String(value)));
+                rest = after;
+                continue;
+            }
+            if rest.starts_with("|~") || rest.starts_with("!=") || rest.starts_with("!~") {
+                return Err(TranslationError("only |= line filters can be translated"));
+            }
+            let stage = rest.strip_prefix('|').ok_or(UNSUPPORTED)?.trim_start();
+            let (name, after) = read_name(stage)?;
+            if matches!(name, "json" | "logfmt") {
+                rest = after.trim_start();
+                if !(rest.is_empty() || rest.starts_with('|')) {
+                    return Err(TranslationError("parser stages with parameters cannot be translated"));
+                }
+                continue;
+            }
+            let (operator, after) =
+                read_operator(after.trim_start(), &["==", ">=", "<=", "=~", "!=", "!~", "=", ">", "<"])?;
+            let after = after.trim_start();
+            match operator {
+                "=" | "=~" => {
+                    let (value, after) = read_string_literal(after).ok_or(UNSUPPORTED)?;
+                    rest = after;
+                    if name == "__error__" && operator == "=" && value.is_empty() {
+                        continue; // Written after numeric comparisons; implied by the field type.
+                    }
+                    filters.push(if operator == "=" {
+                        ParsedFilter::new(name, FilterOperator::Eq, FilterValue::String(value))
+                    } else {
+                        contains(name, &value)?
+                    });
+                }
+                "!=" | "!~" => return Err(TranslationError("negative label filters cannot be translated")),
+                comparison => {
+                    let end = after
+                        .find(|character: char| character.is_whitespace() || character == '|')
+                        .unwrap_or(after.len());
+                    let literal = &after[..end];
+                    if literal.is_empty()
+                        || !literal
+                            .chars()
+                            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+' | 'µ'))
+                    {
+                        return Err(UNSUPPORTED);
+                    }
+                    let operator = match comparison {
+                        "==" => FilterOperator::Eq,
+                        ">" => FilterOperator::Gt,
+                        ">=" => FilterOperator::Gte,
+                        "<" => FilterOperator::Lt,
+                        _ => FilterOperator::Lte,
+                    };
+                    let value = if is_number(literal) {
+                        literal_value(literal)
+                    } else {
+                        FilterValue::String(literal.to_owned())
+                    };
+                    filters.push(ParsedFilter::new(name, operator, value));
+                    rest = &after[end..];
+                }
+            }
+        }
+    }
+
     fn operators(&self) -> &'static [FilterOperator] {
         &FilterOperator::ALL
     }
@@ -156,10 +273,7 @@ fn string_matcher(label: &str, filter: &FilterPredicate) -> Result<String, Trans
     let value = filter.value.text();
     match filter.operator {
         FilterOperator::Eq => Ok(format!("{label}={}", string_literal(&value))),
-        FilterOperator::Contains => Ok(format!(
-            "{label}=~{}",
-            string_literal(&format!(".*{}.*", quote_meta(&value)))
-        )),
+        FilterOperator::Contains => Ok(format!("{label}=~{}", string_literal(&contains_regex(&value)))),
         _ => Err(TranslationError("Unsupported filter operator")),
     }
 }
@@ -207,15 +321,6 @@ fn comparison(operator: FilterOperator) -> Result<&'static str, TranslationError
     })
 }
 
-fn is_number(text: &str) -> bool {
-    !text.is_empty()
-        && text.len() <= 32
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || b".-+eE".contains(&byte))
-        && text.parse::<f64>().is_ok_and(f64::is_finite)
-}
-
 /// A non-negative quantity such as `1.5s`, `2m30s`, or `10MB`; bytes take a single unit.
 fn is_quantity(text: &str, units: &[&str], single: bool) -> bool {
     let mut rest = text;
@@ -242,21 +347,32 @@ fn is_quantity(text: &str, units: &[&str], single: bool) -> bool {
     parts > 0 && text.len() <= 32 && (!single || parts == 1)
 }
 
-/// A LogQL double-quoted string; JSON escaping is a subset of the Go escapes Loki accepts.
-fn string_literal(value: &str) -> String {
-    serde_json::Value::from(value).to_string()
+fn read_name(input: &str) -> Result<(&str, &str), TranslationError> {
+    let end = input
+        .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .unwrap_or(input.len());
+    let name = &input[..end];
+    if !valid_label_name(name) {
+        return Err(UNSUPPORTED);
+    }
+    Ok((name, &input[end..]))
 }
 
-/// Escapes RE2 metacharacters, matching Go's `regexp.QuoteMeta`.
-fn quote_meta(value: &str) -> String {
-    let mut quoted = String::with_capacity(value.len());
-    for character in value.chars() {
-        if r"\.+*?()|[]{}^$".contains(character) {
-            quoted.push('\\');
-        }
-        quoted.push(character);
-    }
-    quoted
+/// The first of `operators` that `input` starts with; longer spellings are listed first.
+fn read_operator<'a>(
+    input: &'a str,
+    operators: &[&'static str],
+) -> Result<(&'static str, &'a str), TranslationError> {
+    operators
+        .iter()
+        .find_map(|operator| input.strip_prefix(operator).map(|rest| (*operator, rest)))
+        .ok_or(UNSUPPORTED)
+}
+
+fn contains(field: &str, regex: &str) -> Result<ParsedFilter, TranslationError> {
+    let text = read_contains_regex(regex)
+        .ok_or(TranslationError("only \".*text.*\" regexes (contains) can be translated"))?;
+    Ok(ParsedFilter::new(field, FilterOperator::Contains, FilterValue::String(text)))
 }
 
 #[cfg(test)]
@@ -360,6 +476,47 @@ mod tests {
             build_query(dialect(), "logs", &filters).unwrap(),
             r#"{} | json | duration <= 2m30s | size > 10MiB | __error__="""#
         );
+    }
+
+    #[test]
+    fn reading_accepts_the_portable_subset_and_the_connector_scaffolding() {
+        let read = dialect()
+            .read(r#"{service_name=~".+", app="api", pod=~".*web\\.v2.*"} |= "time out" | json | logfmt | status >= 500 | duration > 1.5s | level=~".*err.*" | trace="" | __error__="""#)
+            .unwrap();
+        assert_eq!(
+            read,
+            [
+                ParsedFilter::new("app", FilterOperator::Eq, text("api")),
+                ParsedFilter::new("pod", FilterOperator::Contains, text("web.v2")),
+                ParsedFilter::new("_msg", FilterOperator::Contains, text("time out")),
+                ParsedFilter::new("status", FilterOperator::Gte, FilterValue::Number(500.into())),
+                ParsedFilter::new("duration", FilterOperator::Gt, text("1.5s")),
+                ParsedFilter::new("level", FilterOperator::Contains, text("err")),
+                ParsedFilter::new("trace", FilterOperator::Eq, text("")),
+            ]
+        );
+        assert_eq!(dialect().read("{}").unwrap(), []);
+        assert_eq!(dialect().read("").unwrap(), []);
+    }
+
+    #[test]
+    fn reading_rejects_anything_it_cannot_translate_exactly() {
+        for query in [
+            r#"app="api""#,
+            r#"{app!="api"}"#,
+            r#"{app=~"api|web"}"#,
+            r#"{app="api"} |~ "time.*out""#,
+            r#"{app="api"} != "debug""#,
+            r#"{app="api"} | json status="code""#,
+            r#"{app="api"} | line_format "{{.msg}}""#,
+            r#"{app="api"} | status != 500"#,
+            r#"{app="api"} | status > 500 or status < 100"#,
+            r#"sum(count_over_time({app="api"}[5m]))"#,
+            r#"{app="api" | json"#,
+            r#"{app="api"} | status > "500""#,
+        ] {
+            assert!(dialect().read(query).is_err(), "{query}");
+        }
     }
 
     #[test]

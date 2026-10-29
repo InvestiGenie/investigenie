@@ -42,6 +42,23 @@ Loki rejects range queries longer than its `max_query_length` (default `30d1h`).
 
 Grafana Mimir reuses the Prometheus connector's PromQL engine (same virtual `metrics` dataset, synthetic `_time` and `_value` fields, server-side counts, and step-bounded pages) against Mimir's Prometheus-compatible API. Use the API URL including its prefix, normally `http://mimir:9009/prometheus`. Mimir adds the shared authentication modes for a gateway in front of it, and an optional tenant sent as `X-Scope-OrgID`; as with Loki, the tenant header selects data and is not an authorization boundary. Errors use Mimir codes and messages (`mimir_*`). AI investigations translate filters to PromQL (`integrations/data_connectors/mimir/investigation.rs`): label `eq`/`contains` become selector matchers, `_value` comparisons (`eq`, `gt`, `gte`, `lt`, `lte`) wrap the selector, such as `({__name__="up"}) == 1`, and a selector whose matchers all accept empty values gets the match-all `__name__!=""` anchor. Labels are the only breakdown fields. Mimir's own query-length limits are disabled by default and are not discovered.
 
+### Cross-language Explore queries
+
+Explore accepts the Data View's own language unchanged. For sources with an investigation dialect (Elasticsearch, ClickHouse, Loki, and Mimir), the query bar also offers the other dialects' languages: Lucene, SQL, LogQL, and PromQL. A query in another language is read by that language's dialect (`InvestigationDialect::read`), typed with the target Data View's field types, validated by the target dialect, and written in the target's language (`translate_query` in `backend/src/investigation_dialect.rs`). The API returns the query it sent as `translated_query`, and Explore shows it under the query bar. The descriptor's `query_languages` lists the choices, native first, each with an example; it is derived from the registered dialects.
+
+Only the portable subset translates: field comparisons (`eq`, `contains`, `>`, `>=`, `<`, `<=`) joined by AND. Each reader accepts exactly what its writer produces:
+
+| Language | Accepted |
+|---|---|
+| Lucene | `field:value`, `field:"phrase"`, `field:*text*`, `field:[low TO high]` with `[`/`{` bounds and `*`, joined by `AND`/`&&` |
+| SQL | optional `SELECT * FROM table` and `WHERE`; `field = value`, `>`, `>=`, `<`, `<=`, `LIKE '%text%'`, joined by `AND` |
+| LogQL | `{label="v", label=~".*text.*"}`, `\|= "text"` (as `_msg`), `\| json`, `\| logfmt`, `\| field op value` label filters |
+| PromQL | `metric{label="v", label=~".*text.*"}`, `_value` comparisons such as `> 5` |
+
+Everything else is rejected with `query_translation_failed` and a reason, never approximated: OR and NOT, implicit OR between Lucene terms, not-equal, other regexes and wildcards, functions, aggregations, joins, LogQL metric queries, and PromQL ranges or offsets. Field names must exist in the target Data View, and each target's field-type rules apply. Elasticsearch has no `contains`, because `field:*text*` needs a leading wildcard and the connector disables leading wildcards; analyzed `text` fields allow only `eq` (a phrase match). Loki's `_msg` is the log line, and Mimir's `_value` is the sample value, so those names exist only in their own sources. An empty query uses the native default query and is not translated.
+
+Writers were checked against Elasticsearch 8.17, ClickHouse 24.8, Loki 3.4.2, and Mimir 2.15. ClickHouse processes backslash escapes inside string literals, so the SQL writer escapes both `\` and `'` (doubling `'` alone let a trailing `\` end the string); `LIKE` patterns escape `\`, `%`, and `_` before string-literal escaping. The Lucene writer escapes whitespace in unquoted terms and quotes non-numeric range bounds, since an unquoted bound cannot hold whitespace.
+
 ### BigQuery
 
 BigQuery connections require the exact `https://bigquery.googleapis.com/` API URL, a billing project ID, one dataset ID, and a service-account JSON key. The key is stored through InvestiGenie's encrypted connection storage and exchanged for a BigQuery-scoped OAuth token; user-managed service-account keys are high-risk, so prefer workload identity or other keyless credentials where available. Grant the service account BigQuery Job User on the billing project and read-only data access only on the intended dataset. The dataset setting scopes table discovery and schema, but custom SQL can reference any resource that the service account is allowed to read; IAM is the access boundary.

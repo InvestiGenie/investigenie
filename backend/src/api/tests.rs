@@ -1066,6 +1066,105 @@ async fn save_status_connection(storage: &Storage, integration_id: &str, url: &s
 }
 
 #[tokio::test]
+async fn explore_search_translates_other_query_languages_before_searching() {
+    let (_directory, storage) = status_storage().await;
+    let server = MockServer::start().await;
+    save_status_connection(&storage, "clickhouse", &server.uri()).await;
+    save_status_connection(&storage, "prometheus", &server.uri()).await;
+    Mock::given(matchers::method("POST"))
+        .and(|request: &wiremock::Request| {
+            String::from_utf8_lossy(&request.body).contains("DESCRIBE TABLE")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta":[{"name":"name","type":"String"},{"name":"type","type":"String"}],
+            "data":[{"name":"service","type":"String"},{"name":"status","type":"UInt16"}],
+            "rows":2
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(|request: &wiremock::Request| {
+            String::from_utf8_lossy(&request.body)
+                .contains("SELECT * FROM `events` WHERE `service` = 'checkout' AND `status` >= 500")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta":[{"name":"service","type":"String"}],
+            "data":[{"service":"checkout"}],
+            "rows":1,
+            "rows_before_limit_at_least":1
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = router("http://localhost".parse().unwrap(), storage);
+    let search = |connection: &str, language: &str, query: &str| {
+        app.clone().oneshot(json_request(
+            &format!("/api/connections/{connection}/search"),
+            json!({"index":"events","query":query,"query_language":language,"size":50,"cursor":""}),
+        ))
+    };
+    let response = search(
+        "clickhouse",
+        "logql",
+        r#"{service="checkout"} | json | status >= 500"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 65_536)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["query_language"], "LogQL");
+    assert_eq!(
+        result["translated_query"],
+        "SELECT * FROM `events` WHERE `service` = 'checkout' AND `status` >= 500"
+    );
+    assert_eq!(result["hits"].as_array().unwrap().len(), 1);
+
+    for (connection, language, query, message) in [
+        (
+            "clickhouse",
+            "Lucene",
+            "message:*timeout*",
+            "Field \"message\" is not in this Data View",
+        ),
+        (
+            "clickhouse",
+            "Lucene",
+            "status:500 OR status:503",
+            "Lucene query: only AND can join terms; OR and NOT cannot be translated",
+        ),
+        (
+            "clickhouse",
+            "KQL",
+            "status: 500",
+            "Queries can be translated from LogQL, Lucene, PromQL, SQL",
+        ),
+        (
+            "prometheus",
+            "SQL",
+            "status = 500",
+            "Prometheus Data Views accept PromQL queries only",
+        ),
+    ] {
+        let response = search(connection, language, query).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        let error: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(error["error"]["code"], "query_translation_failed");
+        assert_eq!(error["error"]["message"], message);
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn search_window_routes_cap_continuations_and_reject_deep_offsets() {
     let (_directory, storage) = status_storage().await;
     let server = MockServer::start().await;

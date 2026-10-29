@@ -1,5 +1,7 @@
 use crate::investigation_dialect::{
-    FilterOperator, FilterPredicate, InvestigationDialect, TranslationError,
+    contains_regex, is_number, literal_value, read_contains_regex, read_string_literal,
+    string_literal, FilterOperator, FilterPredicate, FilterValue, InvestigationDialect,
+    ParsedFilter, TranslationError,
 };
 
 struct PromQlDialect;
@@ -17,7 +19,31 @@ const VALUE_OPERATORS: &[FilterOperator] = &[
     FilterOperator::Lte,
 ];
 
+const UNSUPPORTED: TranslationError = TranslationError(
+    "only metric{label=\"…\"} selectors with optional _value comparisons such as > 5 can be translated",
+);
+
 impl InvestigationDialect for PromQlDialect {
+    fn language(&self) -> &'static str {
+        "PromQL"
+    }
+
+    fn example(&self) -> &'static str {
+        "http_requests_total{service=\"checkout\", code=~\".*5.*\"} > 0"
+    }
+
+    fn read(&self, query: &str) -> Result<Vec<ParsedFilter>, TranslationError> {
+        let mut filters = Vec::new();
+        if query.trim().is_empty() {
+            return Ok(filters);
+        }
+        let rest = read_expression(query, &mut filters)?;
+        if !rest.trim().is_empty() {
+            return Err(UNSUPPORTED);
+        }
+        Ok(filters)
+    }
+
     fn operators(&self) -> &'static [FilterOperator] {
         &FilterOperator::ALL
     }
@@ -61,7 +87,7 @@ impl InvestigationDialect for PromQlDialect {
                 ("label", FilterOperator::Contains) => matchers.push(format!(
                     "{}=~{}",
                     filter.field,
-                    string_literal(&format!(".*{}.*", quote_meta(&value)))
+                    string_literal(&contains_regex(&value))
                 )),
                 ("sample value", operator) => {
                     comparisons.push((comparison(operator)?, number_literal(&value)?));
@@ -95,17 +121,118 @@ fn comparison(operator: FilterOperator) -> Result<&'static str, TranslationError
 
 fn number_literal(text: &str) -> Result<String, TranslationError> {
     let text = text.trim();
-    if !text.is_empty()
-        && text.len() <= 32
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || b".-+eE".contains(&byte))
-        && text.parse::<f64>().is_ok_and(f64::is_finite)
-    {
+    if is_number(text) {
         Ok(text.to_owned())
     } else {
         Err(TranslationError("Sample value filters need a number"))
     }
+}
+
+/// `expression := ( '(' expression ')' | selector ) { comparison number }`, where each
+/// comparison filters samples by `_value`.
+fn read_expression<'a>(
+    input: &'a str,
+    filters: &mut Vec<ParsedFilter>,
+) -> Result<&'a str, TranslationError> {
+    let input = input.trim_start();
+    let mut rest = if let Some(inner) = input.strip_prefix('(') {
+        read_expression(inner, filters)?
+            .trim_start()
+            .strip_prefix(')')
+            .ok_or(UNSUPPORTED)?
+    } else {
+        read_selector(input, filters)?
+    };
+    loop {
+        let trimmed = rest.trim_start();
+        let Some((operator, after)) = ["==", ">=", "<=", "!=", ">", "<"]
+            .iter()
+            .find_map(|operator| trimmed.strip_prefix(operator).map(|after| (*operator, after)))
+        else {
+            return Ok(rest);
+        };
+        let operator = match operator {
+            "==" => FilterOperator::Eq,
+            ">" => FilterOperator::Gt,
+            ">=" => FilterOperator::Gte,
+            "<" => FilterOperator::Lt,
+            "<=" => FilterOperator::Lte,
+            _ => return Err(TranslationError("not-equal comparisons cannot be translated")),
+        };
+        let after = after.trim_start();
+        let end = after
+            .find(|character: char| !(character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+')))
+            .unwrap_or(after.len());
+        let literal = &after[..end];
+        if literal == "bool" || !is_number(literal) {
+            return Err(TranslationError("comparisons are translated only against a number"));
+        }
+        filters.push(ParsedFilter::new("_value", operator, literal_value(literal)));
+        rest = &after[end..];
+    }
+}
+
+fn read_selector<'a>(
+    input: &'a str,
+    filters: &mut Vec<ParsedFilter>,
+) -> Result<&'a str, TranslationError> {
+    let name_end = input
+        .find(|character: char| !(character.is_ascii_alphanumeric() || matches!(character, '_' | ':')))
+        .unwrap_or(input.len());
+    let metric = &input[..name_end];
+    let mut rest = &input[name_end..];
+    if !metric.is_empty() {
+        if rest.trim_start().starts_with('(') || metric.starts_with(|character: char| character.is_ascii_digit()) {
+            return Err(TranslationError("functions and aggregations cannot be translated"));
+        }
+        filters.push(ParsedFilter::new("__name__", FilterOperator::Eq, FilterValue::String(metric.to_owned())));
+    }
+    let Some(mut body) = rest.trim_start().strip_prefix('{') else {
+        return if metric.is_empty() { Err(UNSUPPORTED) } else { Ok(rest) };
+    };
+    let mut first = true;
+    loop {
+        body = body.trim_start();
+        if let Some(after) = body.strip_prefix('}') {
+            rest = after;
+            break;
+        }
+        if !first {
+            body = body.strip_prefix(',').ok_or(UNSUPPORTED)?.trim_start();
+            if let Some(after) = body.strip_prefix('}') {
+                rest = after;
+                break;
+            }
+        }
+        first = false;
+        let end = body
+            .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .unwrap_or(body.len());
+        let label = &body[..end];
+        if !valid_label_name(label) && label != "__name__" {
+            return Err(UNSUPPORTED);
+        }
+        let after = body[end..].trim_start();
+        let (operator, after) = ["=~", "!=", "!~", "="]
+            .iter()
+            .find_map(|operator| after.strip_prefix(operator).map(|rest| (*operator, rest)))
+            .ok_or(UNSUPPORTED)?;
+        let (value, after) = read_string_literal(after.trim_start())
+            .ok_or(TranslationError("label values must be double-quoted strings"))?;
+        body = after;
+        match operator {
+            "=" => filters.push(ParsedFilter::new(label, FilterOperator::Eq, FilterValue::String(value))),
+            "=~" => {
+                let text = read_contains_regex(&value)
+                    .ok_or(TranslationError("only \".*text.*\" regexes (contains) can be translated"))?;
+                filters.push(ParsedFilter::new(label, FilterOperator::Contains, FilterValue::String(text)));
+            }
+            // The match-all anchor this dialect writes; it filters nothing.
+            "!=" if label == "__name__" && value.is_empty() => {}
+            _ => return Err(TranslationError("negative matchers cannot be translated")),
+        }
+    }
+    Ok(rest)
 }
 
 fn valid_label_name(name: &str) -> bool {
@@ -115,23 +242,6 @@ fn valid_label_name(name: &str) -> bool {
             .next()
             .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-}
-
-/// A PromQL double-quoted string; JSON escaping is a subset of the Go escapes PromQL accepts.
-fn string_literal(value: &str) -> String {
-    serde_json::Value::from(value).to_string()
-}
-
-/// Escapes RE2 metacharacters, matching Go's `regexp.QuoteMeta`.
-fn quote_meta(value: &str) -> String {
-    let mut quoted = String::with_capacity(value.len());
-    for character in value.chars() {
-        if r"\.+*?()|[]{}^$".contains(character) {
-            quoted.push('\\');
-        }
-        quoted.push(character);
-    }
-    quoted
 }
 
 #[cfg(test)]
@@ -204,5 +314,52 @@ mod tests {
         }
         assert!(dialect().aggregatable("label"));
         assert!(!dialect().aggregatable("sample value"));
+    }
+
+    #[test]
+    fn reading_accepts_the_portable_subset_and_the_anchor() {
+        let read = dialect()
+            .read(r#"((http_requests_total{job="api", path=~".*v1 \\(x\\).*", __name__!=""}) > 1) <= 2.5e3"#)
+            .unwrap();
+        assert_eq!(
+            read,
+            [
+                ParsedFilter::new("__name__", FilterOperator::Eq, text("http_requests_total")),
+                ParsedFilter::new("job", FilterOperator::Eq, text("api")),
+                ParsedFilter::new("path", FilterOperator::Contains, text("v1 (x)")),
+                ParsedFilter::new("_value", FilterOperator::Gt, FilterValue::Number(1.into())),
+                ParsedFilter::new("_value", FilterOperator::Lte, literal_value("2.5e3")),
+            ]
+        );
+        assert_eq!(
+            dialect().read("up == 1").unwrap(),
+            [
+                ParsedFilter::new("__name__", FilterOperator::Eq, text("up")),
+                ParsedFilter::new("_value", FilterOperator::Eq, FilterValue::Number(1.into())),
+            ]
+        );
+        assert_eq!(dialect().read(r#"{__name__!=""}"#).unwrap(), []);
+    }
+
+    #[test]
+    fn reading_rejects_anything_it_cannot_translate_exactly() {
+        for query in [
+            "rate(http_requests_total[5m])",
+            "sum by (job) (up)",
+            "up[5m]",
+            "up offset 5m",
+            "up > bool 1",
+            "up != 1",
+            "up > 1 and down",
+            r#"up{job!="api"}"#,
+            r#"up{job=~"api|web"}"#,
+            "up{job='api'}",
+            r#"up{job="api""#,
+            "up > NaN",
+            "(up",
+            "1 + up",
+        ] {
+            assert!(dialect().read(query).is_err(), "{query}");
+        }
     }
 }

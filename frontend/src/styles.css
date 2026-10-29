@@ -191,6 +191,9 @@ kbd { min-width: 22px; padding: 3px 5px; color: #788381; text-align: center; bor
 .search-button:hover:not(:disabled) { background: var(--green-dark); }
 .query-footer { min-height: 28px; display: flex; align-items: center; gap: 8px; padding: 0 10px; color: #87928f; background: #fbfcfb; border-top: 1px solid #eef1f0; font-size: 11px; }
 .lucene-badge { padding: 3px 5px; color: #337964; background: var(--green-soft); border-radius: 3px; font: 500 9px var(--mono); }
+.query-language { padding: 2px 4px; color: #337964; background: var(--green-soft); border: 0; border-radius: 3px; font: 500 10px var(--mono); }
+.translated-query { display: flex; align-items: baseline; gap: 8px; padding: 6px 10px; color: #87928f; background: #fbfcfb; border-top: 1px solid #eef1f0; font-size: 11px; }
+.translated-query code { min-width: 0; overflow-wrap: anywhere; color: #293b40; font: 11px var(--mono); }
 .alert { display: flex; align-items: center; gap: 10px; margin-top: 16px; padding: 11px 13px; color: #8b442c; background: #fff5f0; border: 1px solid #f1d5c9; border-radius: 6px; font-size: 12px; }
 .alert-symbol { width: 17px; height: 17px; display: grid; place-items: center; border: 1px solid #d89c83; border-radius: 50%; font-weight: 700; }
 .alert button { margin-left: auto; color: inherit; background: transparent; border: 0; font-size: 19px; }
@@ -638,7 +641,10 @@ th[aria-sort="ascending"] .column-sort-button, th[aria-sort="descending"] .colum
 :root[data-theme="dark"] .query-form input::placeholder,
 :root[data-theme="dark"] .connection-form input::placeholder { color: #8c9c98; }
 :root[data-theme="dark"] .query-footer,
+:root[data-theme="dark"] .translated-query,
 :root[data-theme="dark"] .fields-footnote { color: var(--muted); background: var(--surface-soft); border-color: var(--line); }
+:root[data-theme="dark"] .translated-query code { color: var(--ink); }
+:root[data-theme="dark"] .query-language { color: #a4e2cf; background: #203d36; }
 :root[data-theme="dark"] .field-search,
 :root[data-theme="dark"] .sample-query,
 :root[data-theme="dark"] .histogram-interval,

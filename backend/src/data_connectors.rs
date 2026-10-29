@@ -168,6 +168,9 @@ pub struct IntegrationDescriptor {
     /// Derived by the generated registry: true when the connector folder has an `investigation.rs`
     /// dialect. Connectors leave it to `..Default::default()`.
     pub ai_investigation: bool,
+    /// Derived by the generated registry: the languages Explore translates into this source's
+    /// query language, native first, as `{language, example}`. Empty without a dialect.
+    pub query_languages: Vec<Value>,
 }
 
 pub fn string_setting(

@@ -38,12 +38,27 @@ fn main() {
             path.to_str().unwrap()
         ));
     }
-    // AI support is derived from the dialect file, so the flag cannot drift from the translator.
+    // AI support and translatable query languages are derived from the dialect file, so neither
+    // can drift from the translator.
     generated.push_str("pub fn registered() -> Vec<IntegrationDescriptor> { vec![\n");
     for (name, _, investigation) in &integrations {
+        let languages = if *investigation {
+            format!(
+                "crate::investigation_dialect::input_languages({name}::investigation::dialect())"
+            )
+        } else {
+            "Vec::new()".to_owned()
+        };
         generated.push_str(&format!(
-            "IntegrationDescriptor {{ ai_investigation: {investigation}, ..{name}::descriptor() }},\n"
+            "IntegrationDescriptor {{ ai_investigation: {investigation}, query_languages: {languages}, ..{name}::descriptor() }},\n"
         ));
+    }
+    generated.push_str("] }\n");
+    generated.push_str("pub fn investigation_dialects() -> Vec<&'static dyn crate::investigation_dialect::InvestigationDialect> { vec![\n");
+    for (name, _, investigation) in &integrations {
+        if *investigation {
+            generated.push_str(&format!("{name}::investigation::dialect(),\n"));
+        }
     }
     generated.push_str("] }\n");
     generated.push_str("pub fn investigation_dialect(id: &str) -> Option<&'static dyn crate::investigation_dialect::InvestigationDialect> { match id {\n");
