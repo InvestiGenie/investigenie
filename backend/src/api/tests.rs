@@ -1134,8 +1134,8 @@ async fn explore_search_translates_other_query_languages_before_searching() {
         (
             "clickhouse",
             "Lucene",
-            "status:500 OR status:503",
-            "Lucene query: only AND can join terms; OR and NOT cannot be translated",
+            "status:5~2",
+            "Lucene query: fuzzy, proximity, and boost operators cannot be translated",
         ),
         (
             "clickhouse",
@@ -1144,10 +1144,10 @@ async fn explore_search_translates_other_query_languages_before_searching() {
             "Queries can be translated from LogQL, Lucene, PromQL, SQL",
         ),
         (
-            "prometheus",
-            "SQL",
-            "status = 500",
-            "Prometheus Data Views accept PromQL queries only",
+            "clickhouse",
+            "PromQL",
+            "sum(rate(up[5m]))",
+            "PromQL query: counter and gauge functions have no equivalent in the other languages; use count_over_time or sum_over_time",
         ),
     ] {
         let response = search(connection, language, query).await.unwrap();

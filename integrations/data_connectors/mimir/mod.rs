@@ -194,7 +194,8 @@ mod tests {
                 "metrics",
                 &[
                     predicate("__name__", "label", FilterOperator::Eq, FilterValue::String("up".to_owned())),
-                    predicate("job", "label", FilterOperator::Contains, FilterValue::String("prom".to_owned())),
+                    // Any job: an empty contains requires the label to be present.
+                    predicate("job", "label", FilterOperator::Contains, FilterValue::String(String::new())),
                     predicate("_value", "sample value", value_operator, FilterValue::Number(1.into())),
                 ],
             )

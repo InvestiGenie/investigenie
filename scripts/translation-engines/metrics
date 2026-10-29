@@ -1,0 +1,8 @@
+# HELP ig_matrix Translation matrix fixture; see investigation_dialect/tests.rs.
+# TYPE ig_matrix gauge
+ig_matrix{rid="1",service="check out",env="prod",path="/api/v1/pay"} 503
+ig_matrix{rid="2",service="check out",env="dev",path="/api/v1/cart"} 200
+ig_matrix{rid="3",service="search",path="/find"} 504
+ig_matrix{rid="4",service="CHECKOUT",env="prod",path="/api v1/it's \"x\""} 500
+ig_matrix{rid="5",service="checkout",env="staging"} 301
+ig_matrix{rid="6",service="web",path="/pay"} 404

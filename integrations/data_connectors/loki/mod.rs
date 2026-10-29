@@ -32,6 +32,10 @@ const NANOS_PER_MILLI: i64 = 1_000_000;
 const MAX_ERROR_BYTES: usize = 4096;
 const MAX_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PARSED_FIELDS: usize = 200;
+/// Loki refuses range queries with more points per series than this.
+const MAX_METRIC_POINTS: i64 = 11_000;
+/// The match-all stream selector for `{}`; Loki 3 labels every stream with `service_name`.
+const ALL_STREAMS: &str = "{service_name=~\".+\"}";
 /// Connection setting holding the discovered (or overridden) `max_query_length`; 0 means unlimited.
 pub(super) const MAX_QUERY_LENGTH_SETTING: &str = "max_query_length_ms";
 
@@ -377,6 +381,11 @@ impl LokiClient {
         let (start, end) = time_bounds(time_range)?;
         let started = Instant::now();
         let query = self.resolve_selector(query, &start, &end).await?;
+        if !query.starts_with('{') {
+            return self
+                .search_metric(request, &query, time_range, clamped, options.interval, offset, started)
+                .await;
+        }
         let mut entries = self
             .entries(&query, &start, &end, MAX_RETURNED_ENTRIES, "backward")
             .await?;
@@ -489,15 +498,88 @@ impl LokiClient {
         Ok(result)
     }
 
+    /// Metric queries (`sum by (service) (count_over_time({…} [5m]))`) return one row per series
+    /// and evaluation step. Steps fall on multiples of the step since the epoch, so each value
+    /// covers the bucket `(t - step, t]` that other sources' computations use for the same range.
+    #[allow(clippy::too_many_arguments)]
+    async fn search_metric(
+        &self,
+        request: &crate::search::SearchRequest,
+        query: &str,
+        time_range: Option<TimeRange>,
+        clamped: bool,
+        interval: Option<HistogramInterval>,
+        offset: u64,
+        started: Instant,
+    ) -> Result<Value, LokiError> {
+        let range = time_range.unwrap_or_else(|| {
+            let end = Utc::now().timestamp_millis();
+            TimeRange { start: end - 3_600_000, end }
+        });
+        let interval = interval
+            .or_else(|| HistogramInterval::automatic(range.end.saturating_sub(range.start).max(1) as f64))
+            .ok_or(LokiError::InvalidQuery)?;
+        let step = interval.approximate_millis();
+        if step <= 0 {
+            return Err(LokiError::InvalidQuery);
+        }
+        let mut samples = Vec::new();
+        if let Some(TimeRange { start: first, end: last }) = crate::investigation_dialect::bucket_ends(range, step) {
+            if (last - first) / step + 1 > MAX_METRIC_POINTS {
+                return Err(LokiError::InvalidQuery);
+            }
+            let start = first.checked_mul(NANOS_PER_MILLI).ok_or(LokiError::InvalidQuery)?.to_string();
+            let end = last.checked_mul(NANOS_PER_MILLI).ok_or(LokiError::InvalidQuery)?.to_string();
+            let step = format!("{step}ms");
+            let params = [
+                ("query", query),
+                ("start", start.as_str()),
+                ("end", end.as_str()),
+                ("step", step.as_str()),
+                ("timeout", QUERY_TIMEOUT),
+            ];
+            let data = self.query_data("loki/api/v1/query_range", "matrix", &params).await?;
+            samples = parse_matrix(
+                data.get("result").and_then(Value::as_array).ok_or(LokiError::InvalidResponse)?,
+                MAX_RETURNED_ENTRIES,
+            )?;
+        }
+        samples.sort_by(|left, right| compare_entries(left, right, request));
+        let total = samples.len() as u64;
+        let end_offset = offset.checked_add(request.size as u64).ok_or(LokiError::InvalidQuery)?;
+        let hits = samples
+            .into_iter()
+            .skip(offset as usize)
+            .take(request.size)
+            .map(|entry| json!({"index": request.index, "id": entry.id, "score": null, "source": entry.source}))
+            .collect::<Vec<_>>();
+        let wants_histogram = request.cursor.as_deref().is_none_or(str::is_empty)
+            && request.histogram_field.is_some()
+            && request.include_histogram.unwrap_or(true);
+        let mut result = json!({
+            "took": started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            "timed_out": false,
+            "total": total,
+            "total_relation": if clamped { "gte" } else { "eq" },
+            "hits": hits,
+            "histogram": [],
+            "histogram_unavailable_reason": wants_histogram
+                .then_some("Metric queries return their values as rows, one per series and step."),
+        });
+        if end_offset < total {
+            result["next_cursor"] = json!(end_offset.to_string());
+        }
+        Ok(result)
+    }
+
     /// Loki rejects `{}`. Loki 3 labels every stream with `service_name`, so a non-empty
     /// `service_name` matcher selects all streams; older servers need an explicit selector.
+    /// Metric queries can hold several selectors, so each `{}` outside a string is replaced.
     async fn resolve_selector(&self, query: &str, start: &str, end: &str) -> Result<String, LokiError> {
-        let Some(pipeline) = query
-            .strip_prefix('{')
-            .and_then(|rest| rest.trim_start().strip_prefix('}'))
-        else {
+        let empty = empty_selectors(query);
+        if empty.is_empty() {
             return Ok(query.to_owned());
-        };
+        }
         let response = self
             .request("loki/api/v1/labels")
             .await?
@@ -516,7 +598,15 @@ impl LokiClient {
         if !labels.is_empty() && !labels.iter().any(|label| label == "service_name") {
             return Err(LokiError::SelectorRequired);
         }
-        Ok(format!("{{service_name=~\".+\"}}{pipeline}"))
+        let mut resolved = String::with_capacity(query.len() + empty.len() * ALL_STREAMS.len());
+        let mut copied = 0;
+        for (start, end) in empty {
+            resolved.push_str(&query[copied..start]);
+            resolved.push_str(ALL_STREAMS);
+            copied = end;
+        }
+        resolved.push_str(&query[copied..]);
+        Ok(resolved)
     }
 
     async fn entries(
@@ -739,6 +829,74 @@ fn time_bounds(range: Option<TimeRange>) -> Result<(String, String), LokiError> 
         .checked_mul(NANOS_PER_MILLI)
         .ok_or(LokiError::InvalidQuery)?;
     Ok((start.to_string(), end.to_string()))
+}
+
+/// Byte ranges of the `{}` stream selectors outside string literals.
+fn empty_selectors(query: &str) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in query.char_indices() {
+        match quote {
+            Some(_) if escaped => escaped = false,
+            Some(open) if character == '\\' && open != '`' => escaped = true,
+            Some(open) if character == open => quote = None,
+            Some(_) => {}
+            None if matches!(character, '"' | '`') => quote = Some(character),
+            None if character == '{' => {
+                let rest = &query[index + 1..];
+                let inner = rest.len() - rest.trim_start().len();
+                if rest[inner..].starts_with('}') {
+                    found.push((index, index + 1 + inner + 1));
+                }
+            }
+            None => {}
+        }
+    }
+    found
+}
+
+/// Metric query series as rows: the series labels, `_time`, and `_value`.
+fn parse_matrix(series: &[Value], limit: usize) -> Result<Vec<LogEntry>, LokiError> {
+    let mut entries = Vec::new();
+    for item in series {
+        let labels = item.get("metric").and_then(Value::as_object).ok_or(LokiError::InvalidResponse)?;
+        let values = item.get("values").and_then(Value::as_array).ok_or(LokiError::InvalidResponse)?;
+        for point in values {
+            let (Some(seconds), Some(value)) = (
+                point.get(0).and_then(Value::as_f64),
+                point.get(1).and_then(Value::as_str),
+            ) else {
+                return Err(LokiError::InvalidResponse);
+            };
+            let millis = (seconds * 1_000.0).round() as i64;
+            let time = DateTime::<Utc>::from_timestamp_millis(millis)
+                .ok_or(LokiError::InvalidResponse)?
+                .to_rfc3339_opts(SecondsFormat::Millis, true);
+            let mut source = labels.clone();
+            source.insert("_time".to_owned(), json!(time));
+            source.insert(
+                "_value".to_owned(),
+                value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|number| number.is_finite())
+                    .map_or_else(|| json!(value), |number| json!(number)),
+            );
+            let source = Value::Object(source);
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            source.to_string().hash(&mut hasher);
+            entries.push(LogEntry {
+                id: format!("sample-{:016x}-{}", hasher.finish(), entries.len()),
+                timestamp: millis,
+                source,
+            });
+            if entries.len() > limit {
+                return Err(LokiError::TooManyEntries);
+            }
+        }
+    }
+    Ok(entries)
 }
 
 fn parse_streams(streams: &[Value], limit: usize) -> Result<Vec<LogEntry>, LokiError> {

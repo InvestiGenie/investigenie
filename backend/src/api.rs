@@ -25,7 +25,9 @@ use crate::data_connectors::{
     connect, editable_configuration, investigation_dialect, public_configuration, registered,
     validate_registry, ConnectionConfig, Connector, ConnectorError, IntegrationDescriptor,
 };
-use crate::investigation_dialect::{dialect_for_language, translate_query};
+use crate::investigation_dialect::{
+    bucket_ends, dialect_for_language, format_duration, translate_query, Schema, WriteContext,
+};
 use crate::search::{SearchRequest, SearchWindow};
 use crate::storage::{
     AiConversationSummary, AiModelSummary, DataView, ResolvedConnection, Storage, StorageError,
@@ -1073,23 +1075,35 @@ async fn translate_search_query(
             connection.integration.display_name, connection.integration.query_language
         ))
     })?;
-    let field_types = connection
+    let schema: Schema = connection
         .connector
         .fields(&request.index)
         .await?
         .into_iter()
         .map(|field| (field.name, field.field_type))
         .collect();
-    let query = translate_query(
-        source.language(),
-        &request.query,
-        target,
-        &request.index,
-        &field_types,
-    )
-    .map_err(|error| ApiError::QueryTranslation(error.to_string()))?;
-    request.query.clone_from(&query);
-    Ok((source.language(), query))
+    let context = WriteContext {
+        index: &request.index,
+        time_field: request.histogram_field.as_deref(),
+        time_range: request.time_range,
+        schema: &schema,
+    };
+    let translation = translate_query(source.language(), &request.query, target, &context)
+        .map_err(|error| ApiError::QueryTranslation(error.to_string()))?;
+    // A computation's buckets are its range, so the search steps by exactly that range, at
+    // multiples of it since the epoch as SQL buckets are.
+    if let Some(range_ms) = translation.range_ms {
+        request.histogram_interval = Some(format_duration(range_ms));
+        if let Some(range) = request.time_range.as_mut() {
+            *range = bucket_ends(*range, range_ms).ok_or_else(|| {
+                ApiError::QueryTranslation(
+                    "The time range must contain the end of at least one bucket of the computation's range".to_owned(),
+                )
+            })?;
+        }
+    }
+    request.query.clone_from(&translation.query);
+    Ok((source.language(), translation.query))
 }
 
 fn translatable_languages() -> String {

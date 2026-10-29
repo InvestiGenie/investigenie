@@ -30,5 +30,6 @@ url = "2"
 yup-oauth2 = { version = "12", default-features = false, features = ["hyper-rustls", "ring", "service-account"] }
 
 [dev-dependencies]
+regex = "1"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"

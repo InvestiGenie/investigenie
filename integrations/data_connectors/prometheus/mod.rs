@@ -18,6 +18,8 @@ use thiserror::Error;
 mod connector;
 pub use connector::{connect, connector_error};
 
+pub mod investigation;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const QUERY_TIMEOUT: &str = "10s";
 const MAX_QUERY_BYTES: usize = 8192;
