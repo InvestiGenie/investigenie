@@ -27,7 +27,7 @@ The descriptor must contain all these properties with the correct types:
 
 | Property | Contents |
 | --- | --- |
-| Identity | `id`, `display_name`, `query_language`, `description`, `icon`: strings. `icon` identifies a bundled connector brand asset: `elasticsearch`, `clickhouse`, `bigquery`, `loki`, `prometheus`, `victorialogs`, or `victoriametrics`. Missing or unknown keys use the generic database icon. |
+| Identity | `id`, `display_name`, `query_language`, `description`, `icon`: strings. `icon` identifies a bundled connector brand asset: `elasticsearch`, `clickhouse`, `bigquery`, `loki`, `mimir`, `prometheus`, `victorialogs`, or `victoriametrics`. Missing or unknown keys use the generic database icon. |
 | `connection_fields` | Each field: `name`, `label`, `input_type`, `placeholder` strings; `required`, `secret`, `editable` booleans. Inputs: `text`, `url`, `password`, `checkbox`, `select`. Include a required, editable, non-secret `url`. |
 | Optional field controls | Select `options`: `[{"value":"basic","label":"Basic"}]` (first is default). Conditional visibility: `visible_when: {"field":"auth_type","value":"basic"}`. Optional `group` string: `"authentication"` pairs options in a separate grid before `"credentials"`, which pairs credential inputs. Noneditable, non-secret authentication options remain visible but disabled during edits. |
 | `query` strings | `placeholder`, `default_query`, `field_query`, `identifier_quote`, `help`, `schema_label`. Templates accept `{index}`, `{field}`, `{query}`; inserted identifiers use `identifier_quote` (empty means unquoted). An empty query removes a leading `{query} AND `. |

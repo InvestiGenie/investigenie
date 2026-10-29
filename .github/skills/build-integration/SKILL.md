@@ -35,7 +35,7 @@ Choose the native query language, read-only credentials, stable record identity,
 
 ## Descriptor and Configuration Rules
 
-- Supply `id`, `display_name`, `icon`, `query_language`, `description`, `connection_fields`, and `query` with the exact types expected by the shared contract, then `..Default::default()`; the registry derives `ai_investigation`. `icon` selects a bundled connector brand asset (`elasticsearch`, `clickhouse`, `bigquery`, `loki`, `prometheus`, `victorialogs`, or `victoriametrics`); missing or unsupported values, such as `mimir`, fall back to the generic database icon.
+- Supply `id`, `display_name`, `icon`, `query_language`, `description`, `connection_fields`, and `query` with the exact types expected by the shared contract, then `..Default::default()`; the registry derives `ai_investigation`. `icon` selects a bundled connector brand asset (`elasticsearch`, `clickhouse`, `bigquery`, `loki`, `mimir`, `prometheus`, `victorialogs`, or `victoriametrics`); missing or unsupported values fall back to the generic database icon. Add a new mark to `frontend/src/assets/connectors/` with its source and license in that folder's README.
 - Include a required, editable, non-secret `url` field under the current UI contract. Validate the native endpoint and configuration in `connect`; do not bypass validation by leaving placeholders.
 - Field metadata includes `name`, `label`, `input_type`, `placeholder`, `required`, `secret`, and `editable`. Supported inputs are text, url, password, checkbox, and select. Use existing select options, groups, and `visible_when` patterns.
 - Mark API keys, passwords, bearer tokens, and sensitive usernames as secrets. Only advertise replacement with `editable: true` when supported.

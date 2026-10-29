@@ -6,7 +6,7 @@ export type IndexSummary = {
 
 export type ConnectionType = string;
 
-export type IntegrationIconKey = 'elasticsearch' | 'clickhouse' | 'bigquery' | 'loki' | 'prometheus' | 'victorialogs' | 'victoriametrics';
+export type IntegrationIconKey = 'elasticsearch' | 'clickhouse' | 'bigquery' | 'loki' | 'mimir' | 'prometheus' | 'victorialogs' | 'victoriametrics';
 
 export type ConnectionStatus = 'connected' | 'not_connected';
 
