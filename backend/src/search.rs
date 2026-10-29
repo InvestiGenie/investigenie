@@ -298,7 +298,7 @@ impl SearchRequest {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 pub struct TimeRange {
     pub start: i64,
     pub end: i64,

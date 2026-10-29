@@ -12,6 +12,11 @@ pub trait Connector: Send + Sync {
     fn public_configuration(&self) -> ConnectionConfig {
         ConnectionConfig::new()
     }
+    /// Settings learned from the source by `test_connection`, such as server limits, which are
+    /// saved with the connection so later requests can respect them.
+    fn learned_configuration(&self) -> ConnectionConfig {
+        ConnectionConfig::new()
+    }
     fn test_connection(&self) -> ConnectorFuture<'_, ()>;
     fn indices(&self) -> ConnectorFuture<'_, Vec<IndexSummary>>;
     fn fields<'a>(&'a self, index: &'a str) -> ConnectorFuture<'a, Vec<FieldSummary>>;
@@ -92,6 +97,10 @@ impl Connector for LoggedConnector {
         self.inner.public_configuration()
     }
 
+    fn learned_configuration(&self) -> ConnectionConfig {
+        self.inner.learned_configuration()
+    }
+
     fn test_connection(&self) -> ConnectorFuture<'_, ()> {
         self.observe("test_connection", self.inner.test_connection(), |_| None)
     }
@@ -147,7 +156,7 @@ impl Connector for LoggedConnector {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct IntegrationDescriptor {
     pub id: &'static str,
     pub display_name: &'static str,
@@ -156,6 +165,9 @@ pub struct IntegrationDescriptor {
     pub description: &'static str,
     pub connection_fields: Vec<Value>,
     pub query: Value,
+    /// Derived by the generated registry: true when the connector folder has an `investigation.rs`
+    /// dialect. Connectors leave it to `..Default::default()`.
+    pub ai_investigation: bool,
 }
 
 pub fn string_setting(
@@ -371,6 +383,7 @@ mod tests {
             ("victoriametrics", "http://localhost:8428"),
             ("victorialogs", "http://localhost:9428"),
             ("loki", "http://localhost:3100"),
+            ("mimir", "http://localhost:9009/prometheus"),
             ("clickhouse", "http://localhost:8123"),
             ("elasticsearch", "http://localhost:9200"),
         ] {
@@ -473,6 +486,7 @@ mod tests {
             for key in ["id", "display_name", "query_language", "description"] {
                 assert!(serialized[key].is_string());
             }
+            assert!(serialized["ai_investigation"].is_boolean());
             for field in &descriptor.connection_fields {
                 for key in ["name", "label", "placeholder"] {
                     assert!(field[key].is_string(), "{field}");

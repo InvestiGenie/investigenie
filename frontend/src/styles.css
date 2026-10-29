@@ -430,6 +430,7 @@ th[aria-sort="ascending"] .column-sort-button, th[aria-sort="descending"] .colum
 .ai-source-list { max-height: 158px; overflow-y: auto; display: flex; flex-wrap: wrap; align-content: flex-start; gap: 6px; padding: 1px 2px 3px 1px; }
 .ai-source { min-width: 170px; max-width: min(100%, 270px); display: flex !important; align-items: center; gap: 9px !important; padding: 8px 10px; color: var(--text-soft) !important; background: var(--paper); border: 1px solid var(--line); border-radius: 5px; cursor: pointer; }
 .ai-source.selected { background: var(--green-soft); border-color: #a8cfc1; }
+.ai-source.unsupported { cursor: not-allowed; opacity: .55; }
 .ai-source input { position: absolute; width: 1px; height: 1px; opacity: 0; }
 .ai-source input:focus-visible + .ai-source-check { outline: 3px solid #91d4c2; outline-offset: 2px; }
 .ai-source-check { width: 16px; height: 16px; flex: 0 0 16px; display: grid; place-items: center; color: white; border: 1px solid #aab9b4; border-radius: 3px; }

@@ -5,17 +5,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::connector_auth::HttpAuth;
 use crate::data_connectors::IntegrationDescriptor;
 use crate::search::{
     BreakdownCount, HistogramInterval, TimeRange, BREAKDOWN_OTHER_KEY, MAX_BREAKDOWN_VALUES,
 };
 use chrono::Utc;
-use reqwest::{redirect::Policy, Client, Response, Url};
+use reqwest::{header::HeaderValue, redirect::Policy, Client, Response, Url};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
 mod connector;
-pub use connector::connect;
+pub use connector::{connect, connector_error};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const QUERY_TIMEOUT: &str = "10s";
@@ -38,22 +39,61 @@ pub fn descriptor() -> IntegrationDescriptor {
             json!({"name":"password","label":"Password","input_type":"password","required":false,"secret":true,"editable":true,"group":"credentials","placeholder":""}),
         ],
         query: json!({"placeholder":"Enter a PromQL expression, e.g. rate(http_requests_total[5m])","default_query":"{__name__!=\"\"}","field_query":"{query}","identifier_quote":"","help":"PromQL range queries return evaluated samples at a bounded step; missing samples may be filled by Prometheus lookback semantics","document_mode":"inline","sort_requires_projection":false,"histogram_total_from_buckets":true,"schema_label":"Prometheus labels"}),
+        ..Default::default()
     }
 }
 
-#[derive(Clone)]
-pub struct PrometheusSettings {
-    pub url: Url,
-    pub username: Option<String>,
-    pub password: Option<String>,
+/// Names and error codes for a server that speaks the Prometheus HTTP API, so compatible
+/// backends such as Mimir reuse this client without reporting themselves as Prometheus.
+pub struct ApiFlavor {
+    pub name: &'static str,
+    /// Whether the descriptor offers authentication modes and a tenant, which are then public.
+    pub configurable_auth: bool,
+    pub codes: ErrorCodes,
 }
 
-#[derive(Clone)]
+pub struct ErrorCodes {
+    pub invalid_connection: &'static str,
+    pub invalid_request: &'static str,
+    pub result_limit_exceeded: &'static str,
+    pub partial_response: &'static str,
+    pub client_error: &'static str,
+    pub unreachable: &'static str,
+    pub authentication_failed: &'static str,
+    pub rejected_request: &'static str,
+    pub response_error: &'static str,
+}
+
+pub const PROMETHEUS: ApiFlavor = ApiFlavor {
+    name: "Prometheus",
+    configurable_auth: false,
+    codes: ErrorCodes {
+        invalid_connection: "invalid_prometheus_connection",
+        invalid_request: "invalid_prometheus_request",
+        result_limit_exceeded: "prometheus_result_limit_exceeded",
+        partial_response: "prometheus_partial_response",
+        client_error: "prometheus_client_error",
+        unreachable: "prometheus_unreachable",
+        authentication_failed: "prometheus_authentication_failed",
+        rejected_request: "prometheus_rejected_request",
+        response_error: "prometheus_response_error",
+    },
+};
+
+pub struct PrometheusSettings {
+    pub url: Url,
+    pub auth: HttpAuth,
+    /// Sent as `X-Scope-OrgID` by multi-tenant backends.
+    pub tenant_id: Option<String>,
+    pub flavor: &'static ApiFlavor,
+}
+
 pub struct PrometheusClient {
     base_url: Url,
     client: Client,
-    username: Option<String>,
-    password: Option<String>,
+    auth: HttpAuth,
+    tenant_id: Option<String>,
+    flavor: &'static ApiFlavor,
 }
 
 #[derive(Debug, Error)]
@@ -76,6 +116,8 @@ pub enum PrometheusError {
     ClientConfiguration,
     #[error("Prometheus request could not be completed")]
     Request,
+    #[error("Could not obtain an OAuth 2.0 access token")]
+    Authentication,
     #[error("Prometheus rejected the request with HTTP {status}")]
     Rejected { status: u16, error_type: String },
     #[error("Prometheus returned an invalid response")]
@@ -122,11 +164,11 @@ impl PrometheusClient {
         {
             return Err(PrometheusError::InvalidUrl);
         }
-        if settings
-            .username
-            .as_deref()
-            .is_some_and(|value| value.trim().is_empty())
-            || settings.username.is_some() != settings.password.is_some()
+        let tenant_id = settings.tenant_id.filter(|value| !value.trim().is_empty());
+        if matches!(&settings.auth, HttpAuth::Basic { username, .. } if username.trim().is_empty())
+            || tenant_id
+                .as_deref()
+                .is_some_and(|value| value.len() > 256 || HeaderValue::from_str(value).is_err())
         {
             return Err(PrometheusError::InvalidConfiguration);
         }
@@ -138,14 +180,28 @@ impl PrometheusClient {
         Ok(Self {
             base_url: settings.url,
             client,
-            username: settings.username,
-            password: settings.password,
+            auth: settings.auth,
+            tenant_id,
+            flavor: settings.flavor,
         })
+    }
+
+    pub fn auth(&self) -> &HttpAuth {
+        &self.auth
+    }
+
+    pub fn tenant_id(&self) -> Option<&str> {
+        self.tenant_id.as_deref()
+    }
+
+    pub fn flavor(&self) -> &'static ApiFlavor {
+        self.flavor
     }
 
     pub async fn test_connection(&self) -> Result<(), PrometheusError> {
         let response = self
-            .request("api/v1/query")?
+            .request("api/v1/query")
+            .await?
             .form(&[("query", "vector(1)"), ("timeout", QUERY_TIMEOUT)])
             .send()
             .await
@@ -163,7 +219,8 @@ impl PrometheusClient {
     ) -> Result<Vec<crate::data_connectors::FieldSummary>, PrometheusError> {
         validate_index(index)?;
         let response = self
-            .request("api/v1/labels")?
+            .request("api/v1/labels")
+            .await?
             .query(&[("timeout", QUERY_TIMEOUT)])
             .send()
             .await
@@ -425,7 +482,8 @@ impl PrometheusClient {
         step_millis: i64,
     ) -> Result<Vec<Value>, PrometheusError> {
         let response = self
-            .request("api/v1/query_range")?
+            .request("api/v1/query_range")
+            .await?
             .form(&[
                 ("query", query.to_owned()),
                 ("start", seconds(range.start)),
@@ -452,7 +510,7 @@ impl PrometheusClient {
         }
     }
 
-    fn request(&self, path: &str) -> Result<reqwest::RequestBuilder, PrometheusError> {
+    async fn request(&self, path: &str) -> Result<reqwest::RequestBuilder, PrometheusError> {
         let mut endpoint = self.base_url.clone();
         let mut segments = endpoint
             .path_segments_mut()
@@ -462,11 +520,17 @@ impl PrometheusClient {
             segments.push(segment);
         }
         drop(segments);
-        let request = self.client.post(endpoint);
-        Ok(match (self.username.as_deref(), self.password.as_deref()) {
-            (Some(username), Some(password)) => request.basic_auth(username, Some(password)),
-            _ => request,
-        })
+        let mut request = self
+            .auth
+            .authorize(self.client.post(endpoint))
+            .await
+            .map_err(|_| PrometheusError::Authentication)?;
+        if let Some(tenant_id) = self.tenant_id.as_deref() {
+            let value =
+                HeaderValue::from_str(tenant_id).map_err(|_| PrometheusError::InvalidConfiguration)?;
+            request = request.header("X-Scope-OrgID", value);
+        }
+        Ok(request)
     }
 }
 
@@ -810,8 +874,9 @@ mod tests {
     fn client(url: &str) -> PrometheusClient {
         PrometheusClient::new(PrometheusSettings {
             url: Url::parse(url).unwrap(),
-            username: None,
-            password: None,
+            auth: HttpAuth::None,
+            tenant_id: None,
+            flavor: &PROMETHEUS,
         })
         .unwrap()
     }
@@ -826,15 +891,20 @@ mod tests {
         ] {
             assert!(PrometheusClient::new(PrometheusSettings {
                 url: Url::parse(raw_url).unwrap(),
-                username: None,
-                password: None,
+                auth: HttpAuth::None,
+                tenant_id: None,
+                flavor: &PROMETHEUS,
             })
             .is_err());
         }
         assert!(PrometheusClient::new(PrometheusSettings {
             url: Url::parse("http://localhost:9090").unwrap(),
-            username: Some("user".to_owned()),
-            password: None,
+            auth: HttpAuth::Basic {
+                username: " ".to_owned(),
+                password: None,
+            },
+            tenant_id: None,
+            flavor: &PROMETHEUS,
         })
         .is_err());
     }

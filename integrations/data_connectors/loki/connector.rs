@@ -1,7 +1,8 @@
-use super::{LokiClient, LokiError, LokiSettings};
+use super::{LokiClient, LokiError, LokiSettings, MAX_QUERY_LENGTH_SETTING};
+use crate::connector_auth::HttpAuth;
 use crate::data_connectors::{
-    credential_setting, string_setting, ConnectionConfig, Connector, ConnectorError,
-    ConnectorFuture, FieldSummary, IndexSummary,
+    string_setting, ConnectionConfig, Connector, ConnectorError, ConnectorFuture, FieldSummary,
+    IndexSummary,
 };
 use crate::search::SearchRequest;
 use axum::http::StatusCode;
@@ -11,47 +12,58 @@ use std::sync::Arc;
 pub fn connect(config: &ConnectionConfig) -> Result<Arc<dyn Connector>, ConnectorError> {
     let raw_url = string_setting(config, "url")?.ok_or_else(ConnectorError::invalid_connection)?;
     let url = url::Url::parse(&raw_url).map_err(|_| ConnectorError::invalid_connection())?;
-    let username = credential_setting(config, "username")?;
-    let password = string_setting(config, "password")?.filter(|value| !value.is_empty());
-    let bearer_token = credential_setting(config, "bearer_token")?;
-    let auth_type = string_setting(config, "auth_type")?.unwrap_or_else(|| {
-        if bearer_token.is_some() {
-            "bearer".to_owned()
-        } else if username.is_some() || password.is_some() {
-            "basic".to_owned()
-        } else {
-            "none".to_owned()
-        }
-    });
-    // Hidden credential inputs for other modes may be submitted empty; only the selected mode's values matter.
-    let (username, password, bearer_token) = match auth_type.as_str() {
-        "none" => (None, None, None),
-        "basic" => (username, password, None),
-        "bearer" => (None, None, bearer_token),
-        _ => (username, password, bearer_token),
+    let max_query_length = match config.get(MAX_QUERY_LENGTH_SETTING) {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_i64()
+                .filter(|limit| *limit >= 0)
+                .ok_or_else(ConnectorError::invalid_connection)?,
+        ),
     };
     Ok(Arc::new(LokiClient::new(LokiSettings {
         url,
-        auth_type,
-        username,
-        password,
-        bearer_token,
+        auth: HttpAuth::from_config(config)?,
         tenant_id: string_setting(config, "tenant_id")?,
+        max_query_length,
     })?))
+}
+
+impl LokiClient {
+    fn connector_error(&self, error: LokiError) -> ConnectorError {
+        if matches!(error, LokiError::Rejected { status: 401 }) {
+            self.auth().invalidate();
+        }
+        error.into()
+    }
 }
 
 impl Connector for LokiClient {
     fn public_configuration(&self) -> ConnectionConfig {
-        let mut configuration = ConnectionConfig::new();
-        configuration.insert("auth_type".to_owned(), json!(self.auth_type));
-        if let Some(tenant_id) = self.tenant_id.as_deref() {
+        let mut configuration = self.auth().public_configuration();
+        if let Some(tenant_id) = self.tenant_id() {
             configuration.insert("tenant_id".to_owned(), json!(tenant_id));
+        }
+        if let Some(limit) = self.max_query_length() {
+            configuration.insert(MAX_QUERY_LENGTH_SETTING.to_owned(), json!(limit));
+        }
+        configuration
+    }
+
+    fn learned_configuration(&self) -> ConnectionConfig {
+        let mut configuration = ConnectionConfig::new();
+        if let Some(limit) = self.learned_max_query_length() {
+            configuration.insert(MAX_QUERY_LENGTH_SETTING.to_owned(), json!(limit));
         }
         configuration
     }
 
     fn test_connection(&self) -> ConnectorFuture<'_, ()> {
-        Box::pin(async move { Ok(LokiClient::test_connection(self).await?) })
+        Box::pin(async move {
+            LokiClient::test_connection(self)
+                .await
+                .map_err(|error| self.connector_error(error))
+        })
     }
 
     fn indices(&self) -> ConnectorFuture<'_, Vec<IndexSummary>> {
@@ -65,11 +77,19 @@ impl Connector for LokiClient {
     }
 
     fn fields<'a>(&'a self, index: &'a str) -> ConnectorFuture<'a, Vec<FieldSummary>> {
-        Box::pin(async move { Ok(LokiClient::fields(self, index).await?) })
+        Box::pin(async move {
+            LokiClient::fields(self, index)
+                .await
+                .map_err(|error| self.connector_error(error))
+        })
     }
 
     fn search(&self, request: SearchRequest) -> ConnectorFuture<'_, Value> {
-        Box::pin(async move { Ok(LokiClient::search(self, request).await?) })
+        Box::pin(async move {
+            LokiClient::search(self, request)
+                .await
+                .map_err(|error| self.connector_error(error))
+        })
     }
 
     fn document<'a>(&'a self, _index: &'a str, _id: &'a str) -> ConnectorFuture<'a, Value> {
@@ -89,6 +109,11 @@ impl From<LokiError> for ConnectorError {
                 StatusCode::BAD_REQUEST,
                 "invalid_loki_request",
                 "LogQL query or search parameters are invalid or exceed configured limits",
+            ),
+            LokiError::SelectorRequired => (
+                StatusCode::BAD_REQUEST,
+                "loki_selector_required",
+                "Loki needs a stream selector with at least one non-empty label matcher, such as {app=\"api\"}",
             ),
             LokiError::TooManyEntries | LokiError::ResponseTooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -115,6 +140,16 @@ impl From<LokiError> for ConnectorError {
                 },
                 "loki_rejected_request",
                 "Loki rejected the request",
+            ),
+            LokiError::Authentication => (
+                StatusCode::BAD_GATEWAY,
+                "loki_authentication_failed",
+                "Could not obtain an OAuth 2.0 access token; check the token URL, client ID, and client secret",
+            ),
+            LokiError::QueryTooLong { .. } => (
+                StatusCode::BAD_REQUEST,
+                "loki_query_too_long",
+                "The time range is longer than Loki's max_query_length; choose a shorter time range",
             ),
             LokiError::InvalidResponse => (
                 StatusCode::BAD_GATEWAY,

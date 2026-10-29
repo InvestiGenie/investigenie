@@ -12,8 +12,11 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     ai_connectors::{default_connector, AiConnectorError, AiSettings, ModelUsage},
-    data_connectors::Connector,
-    search::{HistogramInterval, SearchRequest, TimeRange, MAX_BREAKDOWN_VALUES},
+    data_connectors::{investigation_dialect, Connector},
+    investigation_dialect::{
+        build_query, validate, FilterOperator, FilterPredicate, FilterValue, InvestigationDialect,
+    },
+    search::{safe_field_name, HistogramInterval, SearchRequest, TimeRange, MAX_BREAKDOWN_VALUES},
     storage::{DataView, Storage, StorageError, StoredAiConversationMessage},
 };
 
@@ -305,6 +308,16 @@ impl InvestigationError {
             message: message.to_owned(),
         }
     }
+    fn unsupported_integration(view: &DataView, integration: &str) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "unsupported_integration",
+            message: format!(
+                "Data View \"{}\" uses {integration}, which does not support AI investigations",
+                view.name
+            ),
+        }
+    }
     fn upstream(code: &'static str, message: &'static str) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
@@ -371,47 +384,16 @@ struct RawPlannedFilter {
     value: Value,
 }
 
-#[derive(Debug)]
-struct PlannedFilter {
-    field: String,
-    operator: Operator,
-    value: Value,
-}
-
 struct ViewFieldMetadata {
-    integration: String,
+    dialect: &'static dyn InvestigationDialect,
     field_types: BTreeMap<String, String>,
 }
 
 struct PlannedView {
     view: DataView,
-    filters: Vec<PlannedFilter>,
+    filters: Vec<FilterPredicate>,
     aggregation_field: Option<String>,
     sample_fields: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Operator {
-    Eq,
-    Contains,
-    Gt,
-    Gte,
-    Lt,
-    Lte,
-}
-
-impl Operator {
-    fn from_label(label: &str) -> Option<Self> {
-        Some(match label.trim().to_ascii_lowercase().as_str() {
-            "eq" | "=" | "==" | "equals" | "equal" | "is" | "term" | "match" => Self::Eq,
-            "contains" | "like" | "includes" | "substring" => Self::Contains,
-            "gt" | ">" | "greater_than" | "after" => Self::Gt,
-            "gte" | ">=" | "greater_than_or_equal" | "at_least" => Self::Gte,
-            "lt" | "<" | "less_than" | "before" => Self::Lt,
-            "lte" | "<=" | "less_than_or_equal" | "at_most" => Self::Lte,
-            _ => return None,
-        })
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -427,7 +409,7 @@ struct ModelFindings {
 struct SourceResult {
     view: DataView,
     records_examined: u64,
-    filters: Vec<PlannedFilter>,
+    filters: Vec<FilterPredicate>,
     aggregation_field: Option<String>,
     aggregations: Vec<Value>,
     aggregate_total: Option<u64>,
@@ -464,26 +446,33 @@ pub async fn investigate(
 
     let all_views = storage.views().await.map_err(InvestigationError::storage)?;
     let mut selected = Vec::with_capacity(request.data_view_ids.len());
+    let mut connections = Vec::with_capacity(request.data_view_ids.len());
+    let mut dialects = Vec::with_capacity(request.data_view_ids.len());
     for id in &request.data_view_ids {
-        selected.push(
-            all_views
-                .iter()
-                .find(|view| view.id == *id)
-                .cloned()
-                .ok_or_else(|| {
-                    InvestigationError::invalid("A selected data view is unavailable")
-                })?,
-        );
-    }
-
-    let mut field_catalog = Vec::with_capacity(selected.len());
-    let mut view_fields = HashMap::<String, ViewFieldMetadata>::new();
-    for view in &selected {
-        let _permit = acquire_upstream(upstream_slots)?;
+        let view = all_views
+            .iter()
+            .find(|view| view.id == *id)
+            .cloned()
+            .ok_or_else(|| InvestigationError::invalid("A selected data view is unavailable"))?;
         let connection = storage
             .connection(&view.connection_id)
             .await
             .map_err(InvestigationError::storage)?;
+        let Some(dialect) = investigation_dialect(connection.integration.id) else {
+            return Err(InvestigationError::unsupported_integration(
+                &view,
+                connection.integration.display_name,
+            ));
+        };
+        selected.push(view);
+        connections.push(connection);
+        dialects.push(dialect);
+    }
+
+    let mut field_catalog = Vec::with_capacity(selected.len());
+    let mut view_fields = HashMap::<String, ViewFieldMetadata>::new();
+    for ((view, connection), dialect) in selected.iter().zip(&connections).zip(dialects) {
+        let _permit = acquire_upstream(upstream_slots)?;
         let fields = connection
             .connector
             .fields(&view.index)
@@ -501,7 +490,7 @@ pub async fn investigate(
         view_fields.insert(
             view.id.clone(),
             ViewFieldMetadata {
-                integration: connection.integration.id.to_string(),
+                dialect,
                 field_types,
             },
         );
@@ -510,8 +499,19 @@ pub async fn investigate(
             "name": view.name,
             "index": view.index,
             "integration": connection.integration.id,
-            "allowed_filter_operators": if connection.integration.id == "clickhouse" { vec!["eq", "contains", "gt", "gte", "lt", "lte"] } else { vec!["eq", "gt", "gte", "lt", "lte"] },
-            "fields": fields.iter().take(MAX_PLANNER_FIELDS).map(|field| json!({"name":field.name,"type":field.field_type})).collect::<Vec<_>>(),
+            "allowed_filter_operators": dialect.operators().iter().map(|operator| operator.label()).collect::<Vec<_>>(),
+            "fields": fields.iter().take(MAX_PLANNER_FIELDS).map(|field| {
+                let mut entry = json!({"name":field.name,"type":field.field_type});
+                // Listed only where a field narrows the view's operators, so uniform sources keep a compact catalog.
+                let operators = dialect.field_operators(&field.field_type);
+                if operators != dialect.operators() {
+                    entry["operators"] = json!(operators.iter().map(|operator| operator.label()).collect::<Vec<_>>());
+                }
+                if dialect.aggregatable(&field.field_type) {
+                    entry["aggregatable"] = json!(true);
+                }
+                entry
+            }).collect::<Vec<_>>(),
         }));
     }
 
@@ -520,7 +520,7 @@ pub async fn investigate(
     control.report(|progress| progress.stage = "Planning source queries".to_owned());
     let plan_completion: ModelCompletion<RawPlan> = match control
         .call(
-            || call_model(settings, "Plan bounded evidence using only the supplied Data View metadata. Return only a JSON object, with no markdown or commentary, shaped as {\"views\":[{\"data_view_id\":string,\"filters\":[{\"field\":string,\"operator\":\"eq|contains|gt|gte|lt|lte\",\"value\":string|number|boolean}],\"sample_fields\":[string],\"aggregation_field\":string|null}]}. Choose only supplied view IDs and fields, and only operators listed for that view. Use at most 10 filters and 4 sample fields per view. Choose fields that best test the question; choose one aggregatable field for a top-values breakdown when useful. Do not request records or invent field names.", &plan_input),
+            || call_model(settings, "Plan bounded evidence using only the supplied Data View metadata. Return only a JSON object, with no markdown or commentary, shaped as {\"views\":[{\"data_view_id\":string,\"filters\":[{\"field\":string,\"operator\":\"eq|contains|gt|gte|lt|lte\",\"value\":string|number|boolean}],\"sample_fields\":[string],\"aggregation_field\":string|null}]}. Choose only supplied view IDs and fields, and only operators listed for that view; when a field lists its own operators, use only those for that field. Use at most 10 filters and 4 sample fields per view. Choose fields that best test the question; when useful, choose one field marked aggregatable for a top-values breakdown. Do not request records or invent field names.", &plan_input),
             || None,
         )
         .await?
@@ -580,6 +580,9 @@ pub async fn investigate(
             .connection(&view.connection_id)
             .await
             .map_err(InvestigationError::storage)?;
+        let dialect = investigation_dialect(connection.integration.id).ok_or_else(|| {
+            InvestigationError::unsupported_integration(&view, connection.integration.display_name)
+        })?;
         let view_name = view.name.clone();
         let mut sampled_hits = Vec::new();
         let mut sampled_keys = BTreeSet::new();
@@ -614,7 +617,7 @@ pub async fn investigate(
             let result = query_evidence(
                 &sources[source_index],
                 connection.connector.as_ref(),
-                connection.integration.id,
+                dialect,
                 time_range,
                 order,
                 include_histogram,
@@ -756,13 +759,14 @@ pub async fn investigate(
 async fn query_evidence(
     source: &SourceResult,
     connector: &dyn Connector,
-    integration: &str,
+    dialect: &dyn InvestigationDialect,
     time_range: Option<TimeRange>,
     order: &str,
     include_histogram: bool,
     upstream_slots: &Arc<Semaphore>,
 ) -> Result<Value, InvestigationError> {
-    let query = build_query(integration, &source.view, &source.filters)?;
+    let query = build_query(dialect, &source.view.index, &source.filters)
+        .map_err(|error| InvestigationError::invalid(error.0))?;
     let histogram_interval = time_range.and_then(|range| {
         HistogramInterval::automatic(range.end.saturating_sub(range.start).max(1) as f64)
             .map(|interval| format!("{}{}", interval.count, interval.suffix()))
@@ -970,25 +974,25 @@ fn sanitize_plan(
             continue;
         }
         let metadata = view_fields.get(&view.id);
-        let integration = metadata.map_or("", |metadata| metadata.integration.as_str());
         let field_types = metadata.map(|metadata| &metadata.field_types);
         let mut filters = Vec::new();
         for filter in raw.filters {
             let field = filter.field.trim().to_owned();
-            let usable = Operator::from_label(&filter.operator).filter(|operator| {
-                (*operator != Operator::Contains || integration == "clickhouse")
-                    && safe_field_name(&field)
-                    && field.len() <= 255
-                    && field_types.is_some_and(|fields| fields.contains_key(&field))
-                    && scalar(&filter.value)
-                    && filter.value.to_string().len() <= 256
-            });
-            match usable {
-                Some(operator) if filters.len() < 10 => filters.push(PlannedFilter {
-                    field,
-                    operator,
-                    value: filter.value,
-                }),
+            let predicate = metadata
+                .zip(field_types.and_then(|fields| fields.get(&field)))
+                .filter(|_| field.len() <= 255 && filter.value.to_string().len() <= 256)
+                .and_then(|(metadata, field_type)| {
+                    let predicate = FilterPredicate {
+                        operator: FilterOperator::from_label(&filter.operator)?,
+                        value: FilterValue::from_json(&filter.value)?,
+                        field_type: field_type.clone(),
+                        field: field.clone(),
+                    };
+                    validate(metadata.dialect, &predicate).ok()?;
+                    Some(predicate)
+                });
+            match predicate {
+                Some(predicate) if filters.len() < 10 => filters.push(predicate),
                 _ => dropped_filters += 1,
             }
         }
@@ -1010,9 +1014,10 @@ fn sanitize_plan(
                 dropped_samples += 1;
             }
         }
-        let Some(field_types) = field_types else {
+        let Some(metadata) = metadata else {
             continue;
         };
+        let field_types = &metadata.field_types;
         if sample_fields.is_empty() {
             sample_fields = default_sample_fields(view, field_types);
         }
@@ -1022,7 +1027,7 @@ fn sanitize_plan(
         } else if safe_field_name(aggregation_field)
             && field_types
                 .get(aggregation_field)
-                .is_some_and(|field_type| supports_aggregation_field(integration, field_type))
+                .is_some_and(|field_type| metadata.dialect.aggregatable(field_type))
         {
             Some(aggregation_field.to_owned())
         } else {
@@ -1084,41 +1089,6 @@ fn default_sample_fields(view: &DataView, field_types: &BTreeMap<String, String>
         }
     }
     fields
-}
-
-fn supports_aggregation_field(integration: &str, field_type: &str) -> bool {
-    let normalized = field_type.trim().to_ascii_lowercase();
-    if integration == "elasticsearch" {
-        return matches!(
-            normalized.as_str(),
-            "keyword"
-                | "constant_keyword"
-                | "boolean"
-                | "ip"
-                | "long"
-                | "integer"
-                | "short"
-                | "byte"
-                | "double"
-                | "float"
-                | "half_float"
-                | "scaled_float"
-                | "unsigned_long"
-                | "version"
-        );
-    }
-    if integration != "clickhouse" {
-        return false;
-    }
-    let normalized = normalized
-        .strip_prefix("nullable(")
-        .and_then(|value| value.strip_suffix(')'))
-        .unwrap_or(&normalized);
-    ![
-        "object", "nested", "array", "map", "tuple", "json", "text", "date", "datetime",
-    ]
-    .iter()
-    .any(|prefix| normalized.starts_with(prefix))
 }
 
 fn truncate_chars(text: &str, limit: usize) -> String {
@@ -1240,122 +1210,6 @@ fn acquire_upstream(slots: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, Inve
             code: "upstream_capacity_unavailable",
             message: "Search service is temporarily at capacity".to_owned(),
         })
-}
-
-fn scalar(value: &Value) -> bool {
-    value.is_string() || value.is_number() || value.is_boolean()
-}
-
-fn safe_field_name(field: &str) -> bool {
-    !field.is_empty()
-        && field
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_.@-".contains(&byte))
-}
-
-fn build_query(
-    integration_id: &str,
-    view: &DataView,
-    filters: &[PlannedFilter],
-) -> Result<String, InvestigationError> {
-    match integration_id {
-        "elasticsearch" => {
-            let clauses = filters
-                .iter()
-                .map(lucene_filter)
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(clauses.join(" AND "))
-        }
-        "clickhouse" => {
-            if !view
-                .index
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"_.".contains(&byte))
-            {
-                return Err(InvestigationError::invalid(
-                    "The selected data view has an unsupported table name",
-                ));
-            }
-            let mut clauses = Vec::with_capacity(filters.len());
-            for filter in filters {
-                clauses.push(sql_filter(filter)?);
-            }
-            let table = view
-                .index
-                .split('.')
-                .map(|part| format!("`{part}`"))
-                .collect::<Vec<_>>()
-                .join(".");
-            let suffix = if clauses.is_empty() {
-                String::new()
-            } else {
-                format!(" WHERE {}", clauses.join(" AND "))
-            };
-            Ok(format!("SELECT * FROM {table}{suffix}"))
-        }
-        _ => Err(InvestigationError::invalid(
-            "This integration is not supported for AI investigations",
-        )),
-    }
-}
-
-fn lucene_filter(filter: &PlannedFilter) -> Result<String, InvestigationError> {
-    let value = filter
-        .value
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| filter.value.to_string());
-    let escaped = value
-        .chars()
-        .flat_map(|character| {
-            if "\\+-=&|><!(){}[]^\"~*?:/".contains(character) {
-                vec!['\\', character]
-            } else {
-                vec![character]
-            }
-        })
-        .collect::<String>();
-    let expression = match filter.operator {
-        Operator::Eq => format!("{}:\"{}\"", filter.field, escaped),
-        Operator::Contains => format!("{}:*{}*", filter.field, escaped),
-        Operator::Gt => format!("{}:{{{} TO *]", filter.field, escaped),
-        Operator::Gte => format!("{}:[{} TO *]", filter.field, escaped),
-        Operator::Lt => format!("{}:[* TO {}}}", filter.field, escaped),
-        Operator::Lte => format!("{}:[* TO {}]", filter.field, escaped),
-    };
-    Ok(expression)
-}
-
-fn sql_filter(filter: &PlannedFilter) -> Result<String, InvestigationError> {
-    let field = format!("`{}`", filter.field);
-    let value = match &filter.value {
-        Value::String(value) => format!("'{}'", value.replace('\'', "''")),
-        Value::Bool(value) => value.to_string(),
-        Value::Number(value) => value.to_string(),
-        _ => return Err(InvestigationError::invalid("Unsupported filter value")),
-    };
-    let expression = match filter.operator {
-        Operator::Eq => format!("{field} = {value}"),
-        Operator::Contains => {
-            let Some(text) = filter.value.as_str() else {
-                return Err(InvestigationError::invalid(
-                    "Contains filters require string values",
-                ));
-            };
-            format!(
-                "{field} LIKE '%{}%'",
-                text.replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_")
-                    .replace('\'', "''")
-            )
-        }
-        Operator::Gt => format!("{field} > {value}"),
-        Operator::Gte => format!("{field} >= {value}"),
-        Operator::Lt => format!("{field} < {value}"),
-        Operator::Lte => format!("{field} <= {value}"),
-    };
-    Ok(expression)
 }
 
 fn extract_hits(result: &Value) -> Vec<Value> {
@@ -1602,7 +1456,7 @@ fn compact_value(value: &Value, depth: usize) -> Value {
 }
 
 fn query_summary(
-    filters: &[PlannedFilter],
+    filters: &[FilterPredicate],
     scope: &str,
     aggregation_field: Option<&str>,
 ) -> String {
@@ -2085,7 +1939,7 @@ mod tests {
             (
                 "logs".to_owned(),
                 ViewFieldMetadata {
-                    integration: "elasticsearch".to_owned(),
+                    dialect: investigation_dialect("elasticsearch").unwrap(),
                     field_types: BTreeMap::from([
                         ("message".to_owned(), "text".to_owned()),
                         ("service".to_owned(), "keyword".to_owned()),
@@ -2096,7 +1950,7 @@ mod tests {
             (
                 "metrics".to_owned(),
                 ViewFieldMetadata {
-                    integration: "clickhouse".to_owned(),
+                    dialect: investigation_dialect("clickhouse").unwrap(),
                     field_types: BTreeMap::from([("host".to_owned(), "String".to_owned())]),
                 },
             ),
@@ -2119,11 +1973,11 @@ mod tests {
         let (planned, notes) = sanitize_plan(plan, &selected, &fields);
         assert_eq!(planned.len(), 2);
         assert_eq!(planned[0].filters.len(), 1);
-        assert_eq!(planned[0].filters[0].operator, Operator::Eq);
+        assert_eq!(planned[0].filters[0].operator, FilterOperator::Eq);
         assert_eq!(planned[0].sample_fields, ["status", "message"]);
         assert!(planned[0].aggregation_field.is_none());
         assert_eq!(planned[1].view.id, "metrics");
-        assert_eq!(planned[1].filters[0].operator, Operator::Contains);
+        assert_eq!(planned[1].filters[0].operator, FilterOperator::Contains);
         assert_eq!(planned[1].aggregation_field.as_deref(), Some("host"));
         assert!(notes
             .iter()
@@ -2136,6 +1990,49 @@ mod tests {
         assert_eq!(fallback.len(), 2);
         assert!(fallback.iter().all(|planned| planned.filters.is_empty()));
         assert!(notes[0].contains("each selected Data View"));
+    }
+
+    #[test]
+    fn plan_sanitization_applies_per_field_operators() {
+        let selected = vec![view("logs", "Logs")];
+        let fields = HashMap::from([(
+            "logs".to_owned(),
+            ViewFieldMetadata {
+                dialect: investigation_dialect("loki").unwrap(),
+                field_types: BTreeMap::from([
+                    ("_msg".to_owned(), "text".to_owned()),
+                    ("_time".to_owned(), "timestamp".to_owned()),
+                    ("app".to_owned(), "label".to_owned()),
+                ]),
+            },
+        )]);
+        let plan: RawPlan = parse_model_json(
+            r#"{"views":[{"data_view_id":"logs","filters":[
+                {"field":"_msg","operator":"contains","value":"timeout"},
+                {"field":"_msg","operator":"eq","value":"timeout"},
+                {"field":"_time","operator":"gt","value":1},
+                {"field":"app","operator":"eq","value":"api"},
+                {"field":"app","operator":"gte","value":"api"}
+            ],"aggregation_field":"_msg"}]}"#,
+        )
+        .unwrap();
+        let (planned, notes) = sanitize_plan(plan, &selected, &fields);
+        let kept = planned[0]
+            .filters
+            .iter()
+            .map(|filter| (filter.field.as_str(), filter.operator))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            [
+                ("_msg", FilterOperator::Contains),
+                ("app", FilterOperator::Eq)
+            ]
+        );
+        assert!(planned[0].aggregation_field.is_none());
+        assert!(notes
+            .iter()
+            .any(|note| note.contains("Ignored 3 AI-proposed filter")));
     }
 
     async fn provider_settings(server: &wiremock::MockServer) -> AiSettings {
@@ -2526,35 +2423,6 @@ mod tests {
             end: 0
         }))
         .is_err());
-    }
-
-    #[test]
-    fn filters_translate_to_safe_source_queries() {
-        let view = DataView {
-            id: "logs".to_owned(),
-            name: "Logs".to_owned(),
-            connection_id: "ch".to_owned(),
-            index: "database.events".to_owned(),
-            time_field: "timestamp".to_owned(),
-            revision: "r1".to_owned(),
-        };
-        let filters = vec![PlannedFilter {
-            field: "message".to_owned(),
-            operator: Operator::Contains,
-            value: json!("error%' OR 1=1 --"),
-        }];
-        let query = build_query("clickhouse", &view, &filters).unwrap();
-        assert_eq!(
-            query,
-            "SELECT * FROM `database`.`events` WHERE `message` LIKE '%error\\%'' OR 1=1 --%'"
-        );
-
-        let es_filter = PlannedFilter {
-            field: "status".to_owned(),
-            operator: Operator::Eq,
-            value: json!("500 OR *"),
-        };
-        assert_eq!(lucene_filter(&es_filter).unwrap(), "status:\"500 OR \\*\"");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 # Profiles:
 #   (default)      investigenie, elasticsearch, seeder, setup
 #   ollama         local LLM server in Docker (CPU, or NVIDIA GPU with compose.gpu.yaml)
-#   observability  loki, prometheus, mimir (InvestiGenie has no connector for these yet)
+#   observability  loki, prometheus, mimir (connect them as Loki, Prometheus, and Mimir connections)
 #   tools          eval: scores AI investigations against the seeded incidents
 #
 # Every knob is an environment variable; see .env.example. Ports are published on 127.0.0.1 only:

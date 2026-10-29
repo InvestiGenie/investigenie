@@ -895,6 +895,7 @@ async fn add_connection(
     let connector = connect(integration.id, &config)?;
     let _permit = acquire(&state).await?;
     connector.test_connection().await?;
+    config.extend(connector.learned_configuration());
     let connection = StoredConnection {
         id: id.clone(),
         name: request.name,
@@ -922,10 +923,12 @@ async fn update_connection(
     }
     let mut settings = request.settings;
     settings.insert("url".to_owned(), Value::String(request.url));
-    let config = editable_configuration(&existing.integration, &existing.record.config, &settings)?;
+    let mut config =
+        editable_configuration(&existing.integration, &existing.record.config, &settings)?;
     let connector = connect(existing.integration.id, &config)?;
     let _permit = acquire(&state).await?;
     connector.test_connection().await?;
+    config.extend(connector.learned_configuration());
     let updated = StoredConnection {
         id: new_id.clone(),
         name: request.name,
