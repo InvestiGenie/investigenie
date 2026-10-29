@@ -445,9 +445,10 @@ pub async fn investigate(
     }
 
     let all_views = storage.views().await.map_err(InvestigationError::storage)?;
-    let mut selected = Vec::with_capacity(request.data_view_ids.len());
-    let mut connections = Vec::with_capacity(request.data_view_ids.len());
-    let mut dialects = Vec::with_capacity(request.data_view_ids.len());
+    // Bounded by the validation above; a constant keeps request input out of allocation sizes.
+    let mut selected = Vec::with_capacity(MAX_DATA_VIEWS);
+    let mut connections = Vec::with_capacity(MAX_DATA_VIEWS);
+    let mut dialects = Vec::with_capacity(MAX_DATA_VIEWS);
     for id in &request.data_view_ids {
         let view = all_views
             .iter()

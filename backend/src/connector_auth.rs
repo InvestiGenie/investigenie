@@ -50,7 +50,8 @@ enum ClientAuthentication {
 }
 
 pub struct OAuth2ClientCredentials {
-    token_url: Url,
+    /// HTTPS, or HTTP on a loopback host only; see `token_endpoint`.
+    endpoint: Url,
     client_id: String,
     client_secret: String,
     scopes: Option<String>,
@@ -107,7 +108,7 @@ impl HttpAuth {
             )),
             "oauth2" => {
                 let raw_url = string_setting(config, "oauth_token_url")?.ok_or_else(invalid)?;
-                let token_url = Url::parse(raw_url.trim()).map_err(|_| invalid())?;
+                let endpoint = token_endpoint(raw_url.trim()).ok_or_else(invalid)?;
                 let optional = |name| -> Result<Option<String>, ConnectorError> {
                     let value =
                         credential_setting(config, name)?.map(|value| value.trim().to_owned());
@@ -124,21 +125,13 @@ impl HttpAuth {
                         Some("body") => ClientAuthentication::Body,
                         Some(_) => return Err(invalid()),
                     };
-                if !matches!(token_url.scheme(), "http" | "https")
-                    || token_url.host_str().is_none()
-                    || !token_url.username().is_empty()
-                    || token_url.password().is_some()
-                    || token_url.fragment().is_some()
-                {
-                    return Err(invalid());
-                }
                 let client = Client::builder()
                     .timeout(TOKEN_TIMEOUT)
                     .redirect(Policy::none())
                     .build()
                     .map_err(|_| invalid())?;
                 Ok(Self::OAuth2(OAuth2ClientCredentials {
-                    token_url,
+                    endpoint,
                     client_id: credential_setting(config, "oauth_client_id")?
                         .ok_or_else(invalid)?,
                     client_secret: credential_setting(config, "oauth_client_secret")?
@@ -166,21 +159,18 @@ impl HttpAuth {
     pub fn public_configuration(&self) -> ConnectionConfig {
         let mut configuration = ConnectionConfig::new();
         configuration.insert("auth_type".to_owned(), json!(self.mode()));
-        if let Self::OAuth2(oauth) = self {
-            configuration.insert(
-                "oauth_token_url".to_owned(),
-                json!(oauth.token_url.as_str()),
-            );
+        if let Self::OAuth2(flow) = self {
+            configuration.insert("oauth_token_url".to_owned(), json!(flow.endpoint.as_str()));
             configuration.insert(
                 "oauth_client_auth".to_owned(),
-                json!(match oauth.client_authentication {
+                json!(match flow.client_authentication {
                     ClientAuthentication::Basic => "basic",
                     ClientAuthentication::Body => "body",
                 }),
             );
             for (name, value) in [
-                ("oauth_scopes", &oauth.scopes),
-                ("oauth_audience", &oauth.audience),
+                ("oauth_scopes", &flow.scopes),
+                ("oauth_audience", &flow.audience),
             ] {
                 if let Some(value) = value {
                     configuration.insert(name.to_owned(), json!(value));
@@ -196,21 +186,35 @@ impl HttpAuth {
             Self::None => request,
             Self::Basic { username, password } => request.basic_auth(username, password.as_deref()),
             Self::Bearer(token) => request.header(header::AUTHORIZATION, bearer_header(token)?),
-            Self::OAuth2(oauth) => request.header(
+            Self::OAuth2(flow) => request.header(
                 header::AUTHORIZATION,
-                bearer_header(&oauth.access_token().await?)?,
+                bearer_header(&flow.access_token().await?)?,
             ),
         })
     }
 
     /// Drops a cached OAuth token after the source rejects it, so the next request fetches a new one.
     pub fn invalidate(&self) {
-        if let Self::OAuth2(oauth) = self {
+        if let Self::OAuth2(flow) = self {
             if let Ok(mut tokens) = token_cache().lock() {
-                tokens.remove(&oauth.cache_key());
+                tokens.remove(&flow.cache_key());
             }
         }
     }
+}
+
+/// RFC 6749 §3.2 requires TLS for the token endpoint, since requests carry the client secret.
+/// Plain HTTP is accepted only for loopback hosts, such as a local identity provider.
+fn token_endpoint(raw: &str) -> Option<Url> {
+    let url = Url::parse(raw).ok()?;
+    let loopback = match url.host()? {
+        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(address) => address.is_loopback(),
+        url::Host::Ipv6(address) => address.is_loopback(),
+    };
+    let secure = url.scheme() == "https" || (url.scheme() == "http" && loopback);
+    (secure && url.username().is_empty() && url.password().is_none() && url.fragment().is_none())
+        .then_some(url)
 }
 
 fn bearer_header(token: &str) -> Result<header::HeaderValue, TokenError> {
@@ -230,7 +234,7 @@ impl OAuth2ClientCredentials {
     fn cache_key(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         (
-            self.token_url.as_str(),
+            self.endpoint.as_str(),
             &self.client_id,
             &self.client_secret,
             &self.scopes,
@@ -280,7 +284,7 @@ impl OAuth2ClientCredentials {
         }
         let mut request = self
             .client
-            .post(self.token_url.clone())
+            .post(self.endpoint.clone())
             .header(header::ACCEPT, "application/json");
         request = match self.client_authentication {
             // RFC 6749 §2.3.1 form-encodes the identifier and secret before Basic encoding.
@@ -399,6 +403,7 @@ mod tests {
             json!({"auth_type":"oauth2","oauth_token_url":"https://idp/token","oauth_client_id":"id"}),
             json!({"auth_type":"oauth2","oauth_token_url":"https://user:pw@idp/token","oauth_client_id":"id","oauth_client_secret":"s"}),
             json!({"auth_type":"oauth2","oauth_token_url":"ftp://idp/token","oauth_client_id":"id","oauth_client_secret":"s"}),
+            json!({"auth_type":"oauth2","oauth_token_url":"http://idp.example.com/token","oauth_client_id":"id","oauth_client_secret":"s"}),
             json!({"auth_type":"oauth2","oauth_token_url":"https://idp/token","oauth_client_id":"id","oauth_client_secret":"s","oauth_client_auth":"jwt"}),
             json!({"auth_type":"kerberos"}),
         ] {
@@ -406,6 +411,29 @@ mod tests {
                 HttpAuth::from_config(&config(rejected.clone())).is_err(),
                 "{rejected}"
             );
+        }
+    }
+
+    #[test]
+    fn token_endpoints_require_tls_except_on_loopback() {
+        for accepted in [
+            "https://idp.example.com/oauth2/token?tenant=a",
+            "http://localhost:8080/token",
+            "http://127.0.0.1:9000/token",
+            "http://[::1]/token",
+        ] {
+            assert!(token_endpoint(accepted).is_some(), "{accepted}");
+        }
+        for rejected in [
+            "http://idp.example.com/token",
+            "http://10.0.0.5/token",
+            "http://localhost.example.com/token",
+            "https://user:pw@idp/token",
+            "https://idp/token#fragment",
+            "ftp://idp/token",
+            "not a url",
+        ] {
+            assert!(token_endpoint(rejected).is_none(), "{rejected}");
         }
     }
 
