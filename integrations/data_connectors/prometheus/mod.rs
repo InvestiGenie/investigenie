@@ -1,7 +1,6 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
-    hash::{Hash, Hasher},
     time::{Duration, Instant},
 };
 
@@ -11,7 +10,7 @@ use crate::search::{
     BreakdownCount, HistogramInterval, TimeRange, BREAKDOWN_OTHER_KEY, MAX_BREAKDOWN_VALUES,
 };
 use chrono::Utc;
-use reqwest::{header::HeaderValue, redirect::Policy, Client, Response, Url};
+use reqwest::{header::HeaderValue, Client, Response, Url};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
@@ -174,10 +173,7 @@ impl PrometheusClient {
         {
             return Err(PrometheusError::InvalidConfiguration);
         }
-        let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(Policy::none())
-            .build()
+        let client = crate::data_connectors::shared_http_client(REQUEST_TIMEOUT)
             .map_err(|_| PrometheusError::ClientConfiguration)?;
         Ok(Self {
             base_url: settings.url,
@@ -662,10 +658,8 @@ fn make_sample(labels: &Map<String, Value>, timestamp: i64, value: Value) -> Eva
     source.insert("_time".to_owned(), json!(timestamp));
     source.insert("_value".to_owned(), value);
     let source = Value::Object(source);
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    source.to_string().hash(&mut hasher);
     EvaluatedSample {
-        id: format!("sample-{:016x}", hasher.finish()),
+        id: format!("sample-{:016x}", crate::data_connectors::json_hash(&source)),
         timestamp,
         source,
     }

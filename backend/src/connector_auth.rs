@@ -12,11 +12,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use reqwest::{header, redirect::Policy, Client, RequestBuilder, Response, Url};
+use reqwest::{header, Client, RequestBuilder, Response, Url};
 use serde_json::{json, Value};
 
 use crate::data_connectors::{
-    credential_setting, string_setting, ConnectionConfig, ConnectorError,
+    credential_setting, shared_http_client, string_setting, ConnectionConfig, ConnectorError,
 };
 
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -125,11 +125,7 @@ impl HttpAuth {
                         Some("body") => ClientAuthentication::Body,
                         Some(_) => return Err(invalid()),
                     };
-                let client = Client::builder()
-                    .timeout(TOKEN_TIMEOUT)
-                    .redirect(Policy::none())
-                    .build()
-                    .map_err(|_| invalid())?;
+                let client = shared_http_client(TOKEN_TIMEOUT).map_err(|_| invalid())?;
                 Ok(Self::OAuth2(OAuth2ClientCredentials {
                     endpoint,
                     client_id: credential_setting(config, "oauth_client_id")?

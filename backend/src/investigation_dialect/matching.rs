@@ -47,11 +47,21 @@ pub fn search_pattern(op: &Op, case_insensitive: bool) -> Result<String, Transla
 
 /// The condition a whole-value pattern expresses, and whether it is case-insensitive.
 pub fn classify_value_pattern(pattern: &str) -> Result<(Op, bool), TranslationError> {
+    classify_value_pattern_and_empty(pattern)
+        .map(|(op, case_insensitive, _)| (op, case_insensitive))
+}
+
+/// `classify_value_pattern`, plus whether the pattern matches the empty value, from one parse.
+/// Word patterns never match it.
+pub fn classify_value_pattern_and_empty(
+    pattern: &str,
+) -> Result<(Op, bool, bool), TranslationError> {
     if let Some(words) = read_words_regex(pattern) {
-        return Ok((Op::Words(words), true));
+        return Ok((Op::Words(words), true, false));
     }
     let regex = PortableRegex::from_re2(pattern)?;
     let case_insensitive = regex.case_insensitive;
+    let matches_empty = regex.matches_empty();
     let op = match regex.shape() {
         Shape::Literal(text) => Op::Eq(FilterValue::String(text)),
         Shape::Contains(text) => Op::Contains(text),
@@ -60,9 +70,9 @@ pub fn classify_value_pattern(pattern: &str) -> Result<(Op, bool), TranslationEr
         Shape::Alternatives(values) => {
             Op::In(values.into_iter().map(FilterValue::String).collect())
         }
-        Shape::Other => return Ok((Op::Regex(regex), false)),
+        Shape::Other => return Ok((Op::Regex(regex), false, matches_empty)),
     };
-    Ok((op, case_insensitive))
+    Ok((op, case_insensitive, matches_empty))
 }
 
 /// The condition a search pattern expresses: unanchored text is `contains`, `^…$` is the

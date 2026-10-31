@@ -11,9 +11,11 @@
 //! Computations reduce raw samples per bucket with the `*_over_time` functions; the filter must be
 //! a single selector, since range functions take one.
 
+use std::collections::HashSet;
+
 use crate::investigation_dialect::{
     attribute_key, format_duration, is_number, label_name, literal_value,
-    matching::{classify_value_pattern, value_pattern},
+    matching::{classify_value_pattern_and_empty, value_pattern},
     parse_duration, read_string_literal, string_literal, valid_field_name, word_tokens, Cmp, Expr,
     Field, FilterOperator, FilterValue, InvestigationDialect, Leaf, MetricQuery, Op, PortableRegex,
     Query, RangeFunction, Schema, TranslationError, WriteContext,
@@ -686,41 +688,48 @@ fn read_single_quoted(input: &str) -> Option<(String, &str)> {
 /// One selector's matchers as a condition. A missing label reads as the empty string, so a
 /// matcher that accepts the empty value also accepts series without the label.
 fn read_matchers(raw: Vec<(String, &str, String)>) -> Result<Expr, TranslationError> {
-    let empty = |operator: &str, value: &str| -> Result<bool, TranslationError> {
-        Ok(match operator {
-            "=" => value.is_empty(),
-            "!=" => !value.is_empty(),
-            _ => {
-                let accepts = read_words(value).is_none() && PortableRegex::from_re2(value)?.matches_empty();
-                if operator == "=~" { accepts } else { !accepts }
-            }
+    // Each pattern is parsed once, for its condition and whether it accepts the empty value.
+    let patterns = raw
+        .iter()
+        .map(|(_, operator, value)| match *operator {
+            "=" | "!=" => Ok(None),
+            _ => classify_value_pattern_and_empty(value).map(Some),
         })
-    };
-    // Labels another matcher already requires to be present.
-    let mut present = Vec::new();
-    for (name, operator, value) in &raw {
-        if !(*operator == "!=" && value.is_empty()) && !empty(operator, value)? {
-            present.push(name.as_str());
+        .collect::<Result<Vec<_>, _>>()?;
+    // Labels another matcher already requires to be present, labels with a `!=""` matcher, and
+    // labels with a `=~` matcher, gathered in one pass so each matcher below is a set lookup.
+    let (mut present, mut with_exists, mut with_pattern) = (HashSet::new(), HashSet::new(), HashSet::new());
+    for ((name, operator, value), pattern) in raw.iter().zip(&patterns) {
+        let matches_empty = match (*operator, pattern) {
+            ("=", _) => value.is_empty(),
+            ("!=", _) => !value.is_empty(),
+            ("=~", Some((_, _, accepts))) => *accepts,
+            (_, pattern) => !pattern.as_ref().is_some_and(|(_, _, accepts)| *accepts),
+        };
+        if *operator == "!=" && value.is_empty() {
+            with_exists.insert(name.as_str());
+        } else if !matches_empty {
+            present.insert(name.as_str());
+        }
+        if *operator == "=~" {
+            with_pattern.insert(name.as_str());
         }
     }
-    let has_exists = |name: &str| raw.iter().any(|(other, operator, value)| other == name && *operator == "!=" && value.is_empty());
-    // A pattern matcher that accepts the empty value consumes the `!=""` beside it.
-    let has_pattern = |name: &str| raw.iter().any(|(other, operator, _)| other == name && *operator == "=~");
     let mut items = Vec::new();
-    for (name, operator, value) in &raw {
+    for ((name, operator, value), pattern) in raw.iter().zip(patterns) {
         let exists = || Expr::Leaf(Leaf::new(name.clone(), Op::Exists));
         match (*operator, value.is_empty()) {
-            ("!=", true) if name == "__name__" || present.contains(&name.as_str()) || has_pattern(name) => {}
+            // A pattern matcher that accepts the empty value consumes the `!=""` beside it.
+            ("!=", true) if name == "__name__" || present.contains(name.as_str()) || with_pattern.contains(name.as_str()) => {}
             ("!=", true) => items.push(exists()),
             ("=", true) => items.push(exists().negate()),
             ("=", false) => items.push(Expr::Leaf(Leaf::new(name.clone(), Op::Eq(FilterValue::String(value.clone()))))),
             ("!=", false) => items.push(Expr::Leaf(Leaf::new(name.clone(), Op::Eq(FilterValue::String(value.clone())))).negate()),
             (pattern_operator, _) => {
-                let (op, insensitive) = classify_value_pattern(value)?;
+                let (op, insensitive, accepts_empty) = pattern.ok_or(UNSUPPORTED)?;
                 let leaf = Expr::Leaf(Leaf { field: Some(Field::named(name.clone())), op, case_insensitive: insensitive });
-                let accepts_empty = empty("=~", value)?;
                 items.push(match (pattern_operator, accepts_empty) {
-                    ("=~", true) if has_exists(name) => leaf,
+                    ("=~", true) if with_exists.contains(name.as_str()) => leaf,
                     ("=~", true) => Expr::Or(vec![exists().negate(), leaf]),
                     ("=~", false) => leaf,
                     (_, true) => Expr::And(vec![exists(), leaf.negate()]),
@@ -730,10 +739,6 @@ fn read_matchers(raw: Vec<(String, &str, String)>) -> Result<Expr, TranslationEr
         }
     }
     Ok(Expr::And(items).simplify())
-}
-
-fn read_words(pattern: &str) -> Option<String> {
-    crate::investigation_dialect::read_words_regex(pattern)
 }
 
 enum Divisor {

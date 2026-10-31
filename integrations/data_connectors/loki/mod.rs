@@ -1,7 +1,6 @@
 use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, HashMap},
-    hash::{Hash, Hasher},
+    borrow::Cow,
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -13,7 +12,7 @@ use crate::search::{
     MAX_BREAKDOWN_VALUES,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
-use reqwest::{header, redirect::Policy, Client, Response, Url};
+use reqwest::{header, Client, Response, Url};
 use serde_json::{json, Value};
 use thiserror::Error;
 
@@ -121,7 +120,13 @@ impl BucketCounts {
     fn add(&mut self, key: Option<&str>, count: u64) {
         self.count += count;
         if let Some(key) = key {
-            *self.breakdown.entry(key.to_owned()).or_default() += count;
+            // Copies the key only the first time it is seen.
+            match self.breakdown.get_mut(key) {
+                Some(total) => *total += count,
+                None => {
+                    self.breakdown.insert(key.to_owned(), count);
+                }
+            }
         }
     }
 }
@@ -153,10 +158,7 @@ impl LokiClient {
         {
             return Err(LokiError::InvalidConfiguration);
         }
-        let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(Policy::none())
-            .build()
+        let client = crate::data_connectors::shared_http_client(REQUEST_TIMEOUT)
             .map_err(|_| LokiError::ClientConfiguration)?;
         if settings.max_query_length.is_some_and(|limit| limit < 0) {
             return Err(LokiError::InvalidConfiguration);
@@ -251,6 +253,7 @@ impl LokiClient {
         let Ok(response) = serde_json::from_slice::<Value>(&body) else {
             return Vec::new();
         };
+        let labels = labels.iter().copied().collect::<HashSet<_>>();
         response
             .get("fields")
             .and_then(Value::as_array)
@@ -386,24 +389,23 @@ impl LokiClient {
                 .search_metric(request, &query, time_range, clamped, options.interval, offset, started)
                 .await;
         }
+        // Above the entry cap Loki returns only one end of the range, so fetch the end the page
+        // starts from: the oldest entries for an ascending sort, otherwise the newest. Below the
+        // cap both directions return every entry.
+        let ascending = request.sort_by.is_some() && request.sort_order.as_deref() != Some("desc");
+        let direction = if ascending { "forward" } else { "backward" };
         let mut entries = self
-            .entries(&query, &start, &end, MAX_RETURNED_ENTRIES, "backward")
+            .entries(&query, &start, &end, MAX_RETURNED_ENTRIES, direction)
             .await?;
         let saturated = entries.len() >= MAX_RETURNED_ENTRIES;
         let time_sorted = request.sort_by.as_deref().is_none_or(|field| field == "_time");
         if saturated && !time_sorted {
             return Err(LokiError::TooManyEntries);
         }
-        let ascending = request.sort_by.is_some() && request.sort_order.as_deref() != Some("desc");
-        if saturated && ascending {
-            // The backward fetch holds the newest entries; an ascending page needs the oldest.
-            let limit = (offset as usize).saturating_add(request.size);
-            entries = self.entries(&query, &start, &end, limit, "forward").await?;
-        }
         if let Some(range) = time_range {
             entries.retain(|entry| entry.timestamp >= range.start && entry.timestamp <= range.end);
         }
-        entries.sort_by(|left, right| compare_entries(left, right, request));
+        order_page(&mut entries, request, (offset as usize).saturating_add(request.size));
         let first_page = request.cursor.as_deref().is_none_or(str::is_empty);
         let wants_histogram = first_page
             && request.histogram_field.is_some()
@@ -544,7 +546,7 @@ impl LokiClient {
                 MAX_RETURNED_ENTRIES,
             )?;
         }
-        samples.sort_by(|left, right| compare_entries(left, right, request));
+        order_page(&mut samples, request, (offset as usize).saturating_add(request.size));
         let total = samples.len() as u64;
         let end_offset = offset.checked_add(request.size as u64).ok_or(LokiError::InvalidQuery)?;
         let hits = samples
@@ -655,40 +657,51 @@ impl LokiClient {
             .and_then(|value| value.checked_mul(NANOS_PER_MILLI))
             .ok_or(LokiError::InvalidQuery)?
             - 1;
-        let totals = self
-            .instant_counts(query, range.end + 1 - range.start, last_nanos, breakdown)
-            .await?;
+        let total_counts = self.instant_counts(query, range.end + 1 - range.start, last_nanos, breakdown);
         let Some(options) = options else {
-            return Ok((totals.count, None));
+            return Ok((total_counts.await?.count, None));
         };
         let (interval, millis, mut buckets) = histogram_grid(range, options)?;
         let first = *buckets.keys().next().ok_or(LokiError::InvalidQuery)?;
         let last = *buckets.keys().next_back().ok_or(LokiError::InvalidQuery)?;
-        if last > first {
-            buckets.insert(
-                last,
+        // The total, the last bucket, and the interior buckets are independent queries, so they
+        // run concurrently: one round trip of latency instead of three.
+        let last_counts = async {
+            if last > first {
                 self.instant_counts(query, range.end + 1 - last, last_nanos, breakdown)
-                    .await?,
-            );
-        }
-        if last - millis > first {
+                    .await
+                    .map(Some)
+            } else {
+                Ok(None)
+            }
+        };
+        let interior = async {
+            if last - millis <= first {
+                return Ok(None);
+            }
             let expression = count_expression(query, millis, breakdown);
             let start = (first + 2 * millis).saturating_mul(NANOS_PER_MILLI).to_string();
             let end = last.saturating_mul(NANOS_PER_MILLI).to_string();
             let step = format!("{millis}ms");
-            let data = self
-                .query_data(
-                    "loki/api/v1/query_range",
-                    "matrix",
-                    &[
-                        ("query", expression.as_str()),
-                        ("start", start.as_str()),
-                        ("end", end.as_str()),
-                        ("step", step.as_str()),
-                        ("timeout", QUERY_TIMEOUT),
-                    ],
-                )
-                .await?;
+            self.query_data(
+                "loki/api/v1/query_range",
+                "matrix",
+                &[
+                    ("query", expression.as_str()),
+                    ("start", start.as_str()),
+                    ("end", end.as_str()),
+                    ("step", step.as_str()),
+                    ("timeout", QUERY_TIMEOUT),
+                ],
+            )
+            .await
+            .map(Some)
+        };
+        let (totals, last_counts, interior) = tokio::try_join!(total_counts, last_counts, interior)?;
+        if let Some(counts) = last_counts {
+            buckets.insert(last, counts);
+        }
+        if let Some(data) = interior {
             for series in data
                 .get("result")
                 .and_then(Value::as_array)
@@ -884,10 +897,8 @@ fn parse_matrix(series: &[Value], limit: usize) -> Result<Vec<LogEntry>, LokiErr
                     .map_or_else(|| json!(value), |number| json!(number)),
             );
             let source = Value::Object(source);
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            source.to_string().hash(&mut hasher);
             entries.push(LogEntry {
-                id: format!("sample-{:016x}-{}", hasher.finish(), entries.len()),
+                id: format!("sample-{:016x}-{}", crate::data_connectors::json_hash(&source), entries.len()),
                 timestamp: millis,
                 source,
             });
@@ -931,10 +942,8 @@ fn parse_streams(streams: &[Value], limit: usize) -> Result<Vec<LogEntry>, LokiE
             source.insert("_time".to_owned(), json!(time));
             source.insert("_msg".to_owned(), json!(line));
             let source = Value::Object(source);
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            source.to_string().hash(&mut hasher);
             entries.push(LogEntry {
-                id: format!("log-{:016x}-{}", hasher.finish(), entries.len()),
+                id: format!("log-{:016x}-{}", crate::data_connectors::json_hash(&source), entries.len()),
                 timestamp: millis,
                 source,
             });
@@ -946,22 +955,34 @@ fn parse_streams(streams: &[Value], limit: usize) -> Result<Vec<LogEntry>, LokiE
     Ok(entries)
 }
 
-fn compare_entries(left: &LogEntry, right: &LogEntry, request: &crate::search::SearchRequest) -> Ordering {
+/// Puts the first `end` entries in request order; the rest stay unordered, since no page reaches
+/// them. Each sort value is serialized once per entry rather than on every comparison, and only
+/// the reachable prefix is sorted: O(n + k log k) for a prefix of k instead of O(n log n).
+fn order_page(entries: &mut Vec<LogEntry>, request: &crate::search::SearchRequest, end: usize) {
     let field = request.sort_by.as_deref().unwrap_or("_time");
-    let mut ordering = match (left.source.get(field), right.source.get(field)) {
-        (Some(Value::String(left)), Some(Value::String(right))) if field == "_time" => {
-            left.cmp(right)
-        }
-        (Some(left), Some(right)) => left.to_string().cmp(&right.to_string()),
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-    };
     let descending = request.sort_by.is_none() || request.sort_order.as_deref() == Some("desc");
-    if descending {
-        ordering = ordering.reverse();
+    // Entries missing the field sort first; `_time` is always text, compared without quoting.
+    let mut keyed = entries
+        .drain(..)
+        .map(|entry| {
+            let key = entry.source.get(field).map(|value| match value {
+                Value::String(text) if field == "_time" => text.clone(),
+                other => other.to_string(),
+            });
+            (key, entry)
+        })
+        .collect::<Vec<_>>();
+    // Ids are unique, so this is a total order and unstable sorting is deterministic.
+    let compare = |(left_key, left): &(Option<String>, LogEntry), (right_key, right): &(Option<String>, LogEntry)| {
+        let ordering = left_key.cmp(right_key);
+        if descending { ordering.reverse() } else { ordering }.then_with(|| left.id.cmp(&right.id))
+    };
+    let end = end.min(keyed.len());
+    if end < keyed.len() {
+        keyed.select_nth_unstable_by(end, compare);
     }
-    ordering.then_with(|| left.id.cmp(&right.id))
+    keyed[..end].sort_unstable_by(compare);
+    entries.extend(keyed.into_iter().map(|(_, entry)| entry));
 }
 
 fn sample_histogram(
@@ -970,19 +991,28 @@ fn sample_histogram(
     options: &HistogramOptions,
 ) -> Result<(Vec<HistogramBucket>, String), LokiError> {
     let (interval, millis, mut buckets) = histogram_grid(range, options)?;
+    // Grid buckets are consecutive, so an entry's bucket is found by arithmetic instead of a map
+    // lookup; an entry outside the grid still gets a bucket of its own.
+    let starts = buckets.keys().copied().collect::<Vec<_>>();
+    let mut counts = starts.iter().map(|_| BucketCounts::default()).collect::<Vec<_>>();
+    let first = starts.first().copied().unwrap_or_default();
     for entry in entries {
         let timestamp = entry.timestamp.div_euclid(millis) * millis;
+        // String values are borrowed; the bucket copies a key only the first time it sees it.
         let key = options.breakdown_field.as_deref().and_then(|field| {
             let value = entry.source.get(field).filter(|value| !value.is_null())?;
-            Some(
-                value
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| value.to_string()),
-            )
+            Some(value.as_str().map_or_else(|| Cow::Owned(value.to_string()), Cow::Borrowed))
         });
-        buckets.entry(timestamp).or_default().add(key.as_deref(), 1);
+        let index = timestamp
+            .checked_sub(first)
+            .and_then(|offset| usize::try_from(offset / millis).ok())
+            .filter(|index| starts.get(*index) == Some(&timestamp));
+        match index {
+            Some(index) => counts[index].add(key.as_deref(), 1),
+            None => buckets.entry(timestamp).or_default().add(key.as_deref(), 1),
+        }
     }
+    buckets.extend(starts.into_iter().zip(counts));
     Ok(finish_histogram(
         buckets,
         interval,
@@ -1602,6 +1632,45 @@ mod tests {
         serde_json::from_value(request).unwrap()
     }
 
+    #[test]
+    fn page_order_matches_a_full_sort_for_every_reachable_prefix() {
+        let entries = (0..60)
+            .map(|index| {
+                let mut source = json!({"_time": format!("2026-01-01T00:00:{:02}Z", (index * 7) % 60)});
+                // Repeated, numeric, and missing values exercise ties, quoting, and absent fields.
+                match index % 4 {
+                    0 => source["level"] = json!(["error", "info", "warn"][index % 3]),
+                    1 => source["level"] = json!(index % 5),
+                    2 => source["level"] = json!("info"),
+                    _ => {}
+                }
+                LogEntry { id: format!("log-{index:03}"), timestamp: index as i64, source }
+            })
+            .collect::<Vec<_>>();
+        for extra in [json!({}), json!({"sort_by":"level","sort_order":"asc"}), json!({"sort_by":"level","sort_order":"desc"}), json!({"sort_by":"_time","sort_order":"asc"})] {
+            let request = saturated_request(extra.clone());
+            let field = request.sort_by.as_deref().unwrap_or("_time");
+            let descending = request.sort_by.is_none() || request.sort_order.as_deref() == Some("desc");
+            let mut expected = entries.clone();
+            expected.sort_by(|left, right| {
+                let ordering = match (left.source.get(field), right.source.get(field)) {
+                    (Some(Value::String(left)), Some(Value::String(right))) if field == "_time" => left.cmp(right),
+                    (Some(left), Some(right)) => left.to_string().cmp(&right.to_string()),
+                    (left, right) => left.is_some().cmp(&right.is_some()),
+                };
+                if descending { ordering.reverse() } else { ordering }.then_with(|| left.id.cmp(&right.id))
+            });
+            for end in [0, 1, 17, 59, 60, 100] {
+                let mut actual = entries.clone();
+                order_page(&mut actual, &request, end);
+                assert_eq!(actual.len(), entries.len());
+                let ids = |items: &[LogEntry]| items.iter().map(|entry| entry.id.clone()).collect::<Vec<_>>();
+                let end = end.min(entries.len());
+                assert_eq!(ids(&actual[..end]), ids(&expected[..end]), "{extra} end {end}");
+            }
+        }
+    }
+
     async fn mount_backward(server: &MockServer) {
         Mock::given(matchers::path("/loki/api/v1/query_range"))
             .and(matchers::query_param("direction", "backward"))
@@ -1719,9 +1788,11 @@ mod tests {
     async fn uncountable_large_results_keep_rows_with_a_lower_bound() {
         let server = MockServer::start().await;
         mount_backward(&server).await;
+        // The total and last-bucket counts are sent together, so both may arrive before the first
+        // failure cancels the other.
         Mock::given(matchers::path("/loki/api/v1/query"))
             .respond_with(ResponseTemplate::new(400))
-            .expect(1)
+            .expect(1..=2)
             .mount(&server)
             .await;
         let request = saturated_request(json!({"histogram_field":"_time","histogram_interval":"1s"}));
@@ -1749,18 +1820,30 @@ mod tests {
 
     #[tokio::test]
     async fn large_ascending_pages_fetch_the_oldest_entries_and_other_sorts_stay_bounded() {
+        async fn mount_forward(server: &MockServer) {
+            // The oldest entry first, then later ones up to the cap, as a forward query returns them.
+            let oldest_first = std::iter::once(json!(["86400000000000", "oldest"]))
+                .chain((1..MAX_RETURNED_ENTRIES as i64).map(|index| {
+                    json!([((86_400_001 + index % 2_999) * NANOS_PER_MILLI).to_string(), format!("line {index}")])
+                }))
+                .collect();
+            Mock::given(matchers::path("/loki/api/v1/query_range"))
+                .and(matchers::query_param("direction", "forward"))
+                .and(matchers::query_param("limit", MAX_RETURNED_ENTRIES.to_string()))
+                .respond_with(streams(oldest_first))
+                .expect(1)
+                .mount(server)
+                .await;
+            // One fetch from the oldest end; the newest end is never requested.
+            Mock::given(matchers::path("/loki/api/v1/query_range"))
+                .and(matchers::query_param("direction", "backward"))
+                .respond_with(streams(Vec::new()))
+                .expect(0)
+                .mount(server)
+                .await;
+        }
         let server = MockServer::start().await;
-        mount_backward(&server).await;
-        Mock::given(matchers::path("/loki/api/v1/query_range"))
-            .and(matchers::query_param("direction", "forward"))
-            .and(matchers::query_param("limit", "2"))
-            .respond_with(streams(vec![
-                json!(["86400000000000", "oldest"]),
-                json!(["86400001000000", "next"]),
-            ]))
-            .expect(1)
-            .mount(&server)
-            .await;
+        mount_forward(&server).await;
         Mock::given(matchers::path("/loki/api/v1/query"))
             .and(matchers::query_param(
                 "query",
@@ -1778,7 +1861,7 @@ mod tests {
         assert_eq!(result["hits"][0]["source"]["_msg"], "oldest");
 
         let server = MockServer::start().await;
-        mount_backward(&server).await;
+        mount_forward(&server).await;
         let request = saturated_request(json!({"sort_by":"level","sort_order":"asc"}));
         let error = Connector::search(&client(&server.uri()), request)
             .await

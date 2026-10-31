@@ -9,10 +9,12 @@
 //!   case-insensitive and matches whole words.
 //! - `Regex` matches the whole value; see `PortableRegex`.
 
+use std::collections::{hash_map::Entry, HashMap, HashSet};
+
 use super::{FilterValue, PortableRegex, TranslationError};
 
 /// A field as named by the source query, and once resolved, as it exists in the target.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Field {
     pub name: String,
     /// The type the target reported; empty until the field is resolved.
@@ -299,41 +301,50 @@ impl Expr {
     pub fn merge_equalities(self) -> Self {
         match self {
             Self::Or(items) => {
-                let mut merged: Vec<Expr> = Vec::new();
+                let mut merged: Vec<Expr> = Vec::with_capacity(items.len());
+                // Each merge target's position in `merged` and the values it holds, so merging is
+                // linear in the items and values rather than rescanning both for every item.
+                let mut targets: HashMap<(Option<Field>, bool), (usize, HashSet<FilterValue>)> =
+                    HashMap::new();
                 for item in items.into_iter().map(Self::merge_equalities) {
                     let values = match &item {
                         Self::Leaf(Leaf {
                             op: Op::Eq(value), ..
-                        }) => Some(vec![value.clone()]),
+                        }) => std::slice::from_ref(value),
                         Self::Leaf(Leaf {
                             op: Op::In(values), ..
-                        }) => Some(values.clone()),
-                        _ => None,
-                    };
-                    let target = match (&item, &values) {
-                        (Self::Leaf(leaf), Some(_)) => merged.iter_mut().find(|existing| {
-                            matches!(existing, Self::Leaf(other)
-                                if other.field == leaf.field
-                                    && other.case_insensitive == leaf.case_insensitive
-                                    && matches!(other.op, Op::Eq(_) | Op::In(_)))
-                        }),
-                        _ => None,
-                    };
-                    match (target, values) {
-                        (Some(Self::Leaf(existing)), Some(values)) => {
-                            let mut all = match &existing.op {
-                                Op::Eq(value) => vec![value.clone()],
-                                Op::In(values) => values.clone(),
-                                _ => unreachable!(),
-                            };
-                            for value in values {
-                                if !all.contains(&value) {
-                                    all.push(value);
-                                }
-                            }
-                            existing.op = Op::In(all);
+                        }) => values.as_slice(),
+                        _ => {
+                            merged.push(item);
+                            continue;
                         }
-                        _ => merged.push(item),
+                    };
+                    let Self::Leaf(leaf) = &item else {
+                        unreachable!()
+                    };
+                    match targets.entry((leaf.field.clone(), leaf.case_insensitive)) {
+                        Entry::Occupied(mut target) => {
+                            let (index, seen) = target.get_mut();
+                            let Self::Leaf(existing) = &mut merged[*index] else {
+                                unreachable!()
+                            };
+                            if let Op::Eq(value) = &existing.op {
+                                existing.op = Op::In(vec![value.clone()]);
+                            }
+                            let Op::In(all) = &mut existing.op else {
+                                unreachable!()
+                            };
+                            all.extend(
+                                values
+                                    .iter()
+                                    .filter(|value| seen.insert((*value).clone()))
+                                    .cloned(),
+                            );
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert((merged.len(), values.iter().cloned().collect()));
+                            merged.push(item);
+                        }
                     }
                 }
                 Self::Or(merged).simplify()
@@ -420,6 +431,30 @@ mod tests {
                     ])
                 )),
                 eq("b", "2"),
+            ])
+        );
+    }
+
+    #[test]
+    fn value_lists_merge_only_with_matching_equalities() {
+        let text = |value: &str| FilterValue::String(value.to_owned());
+        let merged = Expr::Or(vec![
+            Expr::Leaf(Leaf::new("a", Op::Prefix("p".to_owned()))),
+            Expr::Leaf(Leaf::new("a", Op::In(vec![text("1"), text("2")]))),
+            Expr::Leaf(Leaf::new("a", Op::Eq(text("1"))).insensitive()),
+            Expr::Leaf(Leaf::new("a", Op::In(vec![text("2"), text("3")]))),
+            eq("a", "4"),
+        ])
+        .merge_equalities();
+        assert_eq!(
+            merged,
+            Expr::Or(vec![
+                Expr::Leaf(Leaf::new("a", Op::Prefix("p".to_owned()))),
+                Expr::Leaf(Leaf::new(
+                    "a",
+                    Op::In(vec![text("1"), text("2"), text("3"), text("4")])
+                )),
+                Expr::Leaf(Leaf::new("a", Op::Eq(text("1"))).insensitive()),
             ])
         );
     }

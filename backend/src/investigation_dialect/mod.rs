@@ -78,7 +78,7 @@ impl FilterOperator {
 }
 
 /// A scalar filter value; arrays, objects, and null never reach a translator.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FilterValue {
     String(String),
     Number(Number),
