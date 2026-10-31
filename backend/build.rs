@@ -74,7 +74,7 @@ fn main() {
     for (name, _, _) in &integrations {
         generated.push_str(&format!("assert_eq!({name}::descriptor().id, {name:?}, \"Integration id must match folder\");\n"));
     }
-    generated.push_str("}\npub fn connect(id: &str, config: &ConnectionConfig) -> Result<std::sync::Arc<dyn Connector>, ConnectorError> { validate_registry(); match id {\n");
+    generated.push_str("}\npub fn connect(id: &str, config: &ConnectionConfig) -> Result<std::sync::Arc<dyn Connector>, ConnectorError> { static VALIDATED: std::sync::Once = std::sync::Once::new(); VALIDATED.call_once(validate_registry); match id {\n");
     for (name, _, _) in &integrations {
         generated.push_str(&format!(
             "{name:?} => {name}::connect(config).map(|inner| logged_connector({name:?}, inner)),\n"
