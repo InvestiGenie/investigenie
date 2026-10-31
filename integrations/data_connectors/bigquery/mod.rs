@@ -51,6 +51,7 @@ pub fn descriptor() -> IntegrationDescriptor {
             json!({"name":"service_account_json","label":"Service-account JSON key","input_type":"password","required":true,"secret":true,"editable":true,"group":"credentials","placeholder":"Paste the JSON key contents"}),
         ],
         query: json!({"placeholder":"SELECT * FROM `{index}`","default_query":"SELECT * FROM `{index}`","field_query":"SELECT {field} FROM `{index}`","identifier_quote":"","help":"Read-only BigQuery Standard SQL. Each query is limited to 10 GiB billed bytes.","document_mode":"inline","sort_requires_projection":true,"histogram_total_from_buckets":false,"schema_label":"BigQuery table schema"}),
+        ..Default::default()
     }
 }
 

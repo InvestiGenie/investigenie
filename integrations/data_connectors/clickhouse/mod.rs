@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use crate::data_connectors::IntegrationDescriptor;
 use crate::search::{BreakdownCount, HistogramOptions, BREAKDOWN_OTHER_KEY, MAX_BREAKDOWN_VALUES};
 mod connector;
+pub mod investigation;
 pub use connector::connect;
 use reqwest::{Client, Response, Url};
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,7 @@ pub fn descriptor() -> IntegrationDescriptor {
             serde_json::json!({"name":"password","label":"Password","input_type":"password","required":false,"secret":true,"editable":true,"group":"credentials","placeholder":""}),
         ],
         query: serde_json::json!({"placeholder":"SELECT * FROM {index} LIMIT 50","default_query":"SELECT * FROM {index} LIMIT 50","field_query":"SELECT {field} FROM {index}","identifier_quote":"`","help":"Read-only SQL runs against the selected ClickHouse table","document_mode":"inline","sort_requires_projection":true,"histogram_total_from_buckets":true,"schema_label":"ClickHouse table schema"}),
+        ..Default::default()
     }
 }
 

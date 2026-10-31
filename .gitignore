@@ -16,6 +16,8 @@ data/
 *_data/
 configuration.snapshot
 configuration.lock
+graphify*/
+agent-plans/
 
 # Playground
 playground/.playground-state

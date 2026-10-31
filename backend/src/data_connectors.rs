@@ -1,7 +1,14 @@
 use axum::http::StatusCode;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap},
+    future::Future,
+    hash::Hasher,
+    pin::Pin,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
+    time::Duration,
+};
 use tracing::Instrument;
 
 pub type ConnectionConfig = Map<String, Value>;
@@ -10,6 +17,11 @@ pub type ConnectorFuture<'a, T> =
 
 pub trait Connector: Send + Sync {
     fn public_configuration(&self) -> ConnectionConfig {
+        ConnectionConfig::new()
+    }
+    /// Settings learned from the source by `test_connection`, such as server limits, which are
+    /// saved with the connection so later requests can respect them.
+    fn learned_configuration(&self) -> ConnectionConfig {
         ConnectionConfig::new()
     }
     fn test_connection(&self) -> ConnectorFuture<'_, ()>;
@@ -92,6 +104,10 @@ impl Connector for LoggedConnector {
         self.inner.public_configuration()
     }
 
+    fn learned_configuration(&self) -> ConnectionConfig {
+        self.inner.learned_configuration()
+    }
+
     fn test_connection(&self) -> ConnectorFuture<'_, ()> {
         self.observe("test_connection", self.inner.test_connection(), |_| None)
     }
@@ -147,7 +163,7 @@ impl Connector for LoggedConnector {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct IntegrationDescriptor {
     pub id: &'static str,
     pub display_name: &'static str,
@@ -156,6 +172,65 @@ pub struct IntegrationDescriptor {
     pub description: &'static str,
     pub connection_fields: Vec<Value>,
     pub query: Value,
+    /// Derived by the generated registry: true when the connector folder has an `investigation.rs`
+    /// dialect. Connectors leave it to `..Default::default()`.
+    pub ai_investigation: bool,
+    /// Derived by the generated registry: the languages Explore translates into this source's
+    /// query language, native first, as `{language, example}`. Empty without a dialect.
+    pub query_languages: Vec<Value>,
+}
+
+/// An HTTP client with `timeout` that never follows redirects, shared by the whole process.
+///
+/// Connectors are rebuilt from stored settings on every request, so a client per connector would
+/// open a new connection, and TLS session, for every search. Sharing keeps the pool warm across
+/// requests. Credentials and tenant headers are set on each request, never on the client, so
+/// connections with different settings can share it; callers pass a constant `timeout`, which
+/// keeps the cache to a handful of entries.
+pub fn shared_http_client(timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
+    let build = || {
+        reqwest::Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+    };
+    // Each test runs on its own runtime, and a pooled connection belongs to the runtime that
+    // opened it; the server runs one runtime.
+    if cfg!(test) {
+        return build();
+    }
+    static CLIENTS: OnceLock<Mutex<HashMap<Duration, reqwest::Client>>> = OnceLock::new();
+    let mut clients = CLIENTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(client) = clients.get(&timeout) {
+        return Ok(client.clone());
+    }
+    let client = build()?;
+    clients.insert(timeout, client.clone());
+    Ok(client)
+}
+
+/// The hash of `value`'s compact JSON, equal to hashing `value.to_string()`, but written straight
+/// into the hasher instead of building the string. Row ids derive from it, so it must not change.
+pub fn json_hash(value: &Value) -> u64 {
+    struct HashWriter<'a>(&'a mut DefaultHasher);
+    impl std::io::Write for HashWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.write(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut hasher = DefaultHasher::new();
+    // Writing into a hasher cannot fail.
+    let _ = serde_json::to_writer(HashWriter(&mut hasher), value);
+    // `str`'s `Hash` ends with this marker byte, which keeps ids equal to hashing the text.
+    hasher.write_u8(0xff);
+    hasher.finish()
 }
 
 pub fn string_setting(
@@ -246,6 +321,22 @@ pub fn public_configuration(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn json_hash_keeps_the_ids_hashing_the_serialized_text_gave() {
+        use std::hash::Hash;
+        let long = "x".repeat(10_000);
+        for value in [
+            json!({"service":"api","_time":"2026-01-01T00:00:00.000Z","_msg":"quote \" slash \\ tab \t é 😀","n":-1.5e300,"ok":true,"none":null,"list":[1,{"a":[]}]}),
+            json!({"_msg": long}),
+            json!(""),
+            json!(null),
+        ] {
+            let mut hasher = DefaultHasher::new();
+            value.to_string().hash(&mut hasher);
+            assert_eq!(json_hash(&value), hasher.finish(), "{value}");
+        }
+    }
 
     #[tokio::test]
     async fn debug_connector_logs_all_operations_without_private_values() {
@@ -371,6 +462,7 @@ mod tests {
             ("victoriametrics", "http://localhost:8428"),
             ("victorialogs", "http://localhost:9428"),
             ("loki", "http://localhost:3100"),
+            ("mimir", "http://localhost:9009/prometheus"),
             ("clickhouse", "http://localhost:8123"),
             ("elasticsearch", "http://localhost:9200"),
         ] {
@@ -473,6 +565,7 @@ mod tests {
             for key in ["id", "display_name", "query_language", "description"] {
                 assert!(serialized[key].is_string());
             }
+            assert!(serialized["ai_investigation"].is_boolean());
             for field in &descriptor.connection_fields {
                 for key in ["name", "label", "placeholder"] {
                     assert!(field[key].is_string(), "{field}");

@@ -491,6 +491,58 @@ describe('Discover', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Cannot reach the InvestiGenie API');
   });
 
+  it('translates a query written in another supported language and shows what was sent', async () => {
+    const translating = {
+      ...elasticsearchIntegration,
+      query_languages: [
+        { language: 'Lucene', example: 'service:"checkout"' },
+        { language: 'SQL', example: "service = 'checkout' AND status >= 500" },
+      ],
+    };
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/api/integrations')) return jsonResponse({ integrations: [translating] });
+      if (url.endsWith('/api/connections')) return jsonResponse({ connections: [connectionFixture(translating, { id: 'es-local', name: 'Logs' })] });
+      if (url.endsWith('/api/data-views')) return jsonResponse({ data_views: [{ id: 'logs-view', revision: 'logs-revision', name: 'Logs', connection_id: 'es-local', index: 'logs-*', time_field: '@timestamp' }] });
+      if (url.endsWith('/api/connections/es-local/indices/logs-*/fields')) return jsonResponse({ fields: [{ name: '@timestamp', field_type: 'date' }, { name: 'service', field_type: 'keyword' }] });
+      if (url.endsWith('/api/connections/es-local/search')) {
+        const body = JSON.parse(String(init?.body));
+        return jsonResponse({
+          took: 1, timed_out: false, total: 0, total_relation: 'eq', hits: [], histogram: [],
+          ...(body.query_language ? { query_language: body.query_language, translated_query: 'service:"checkout" AND status:[500 TO *]' } : {}),
+        });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+
+    renderExplore();
+    expect(await screen.findByText('0 matching documents')).toBeInTheDocument();
+    const language = screen.getByRole('combobox', { name: 'Query language' });
+    expect(language).toHaveValue('Lucene');
+    expect(within(language).getByRole('option', { name: 'Lucene (native)' })).toBeInTheDocument();
+    fireEvent.change(language, { target: { value: 'SQL' } });
+    const input = screen.getByRole('textbox', { name: 'SQL query' });
+    expect(input).toHaveAttribute('placeholder', "service = 'checkout' AND status >= 500");
+    expect(screen.getByText('Field comparisons joined by AND are translated to Lucene before searching.')).toBeInTheDocument();
+    // Field shortcuts insert native syntax, so they do nothing while another language is chosen.
+    const fieldShortcut = document.querySelector<HTMLButtonElement>('.field-item[title="service"]');
+    expect(fieldShortcut).not.toBeNull();
+    fireEvent.click(fieldShortcut!);
+    expect(input).toHaveValue('');
+    fireEvent.change(input, { target: { value: "service = 'checkout' AND status >= 500" } });
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+
+    const sent = await screen.findByRole('status', { name: 'Query sent as Lucene' });
+    expect(sent).toHaveTextContent('service:"checkout" AND status:[500 TO *]');
+    const searches = fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/search'));
+    expect(JSON.parse(String(searches.at(-1)![1]?.body))).toMatchObject({ query: "service = 'checkout' AND status >= 500", query_language: 'SQL' });
+    expect(JSON.parse(String(searches[0][1]?.body))).not.toHaveProperty('query_language');
+
+    fireEvent.change(language, { target: { value: 'Lucene' } });
+    expect(screen.getByRole('textbox', { name: 'Lucene query' })).toBeInTheDocument();
+  });
+
   it('switches query language and searches the selected saved data view', async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockImplementation(async (input) => {

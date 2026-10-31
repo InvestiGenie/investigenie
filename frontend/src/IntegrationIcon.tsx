@@ -3,6 +3,7 @@ import bigQueryLogo from './assets/connectors/bigquery.svg';
 import clickHouseLogo from './assets/connectors/clickhouse.svg';
 import elasticsearchLogo from './assets/connectors/elasticsearch.svg';
 import lokiLogo from './assets/connectors/loki.png';
+import mimirLogo from './assets/connectors/mimir.png';
 import prometheusLogo from './assets/connectors/prometheus.svg';
 import victoriaLogsLogo from './assets/connectors/victorialogs.svg';
 import victoriaMetricsLogo from './assets/connectors/victoriametrics.svg';
@@ -13,6 +14,7 @@ const connectorLogos: Record<IntegrationIconKey, string> = {
   clickhouse: clickHouseLogo,
   elasticsearch: elasticsearchLogo,
   loki: lokiLogo,
+  mimir: mimirLogo,
   prometheus: prometheusLogo,
   victorialogs: victoriaLogsLogo,
   victoriametrics: victoriaMetricsLogo,

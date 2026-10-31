@@ -32,6 +32,7 @@ pub fn descriptor() -> IntegrationDescriptor {
             json!({"name":"project_id","label":"Project ID","input_type":"text","required":false,"secret":false,"editable":true,"placeholder":"0"}),
         ],
         query: json!({"placeholder":"Enter a LogsQL filter, e.g. error AND app:api","default_query":"","field_query":"{query} AND {field}:*","identifier_quote":"`","help":"LogsQL filters run against the selected VictoriaLogs source","document_mode":"inline","sort_requires_projection":false,"histogram_total_from_buckets":false,"schema_label":"VictoriaLogs fields"}),
+        ..Default::default()
     }
 }
 

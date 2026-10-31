@@ -22,8 +22,11 @@ use tracing::Instrument;
 use crate::ai::{self, InvestigationRequest};
 use crate::ai_connectors::AiSettings;
 use crate::data_connectors::{
-    connect, editable_configuration, public_configuration, registered, validate_registry,
-    ConnectionConfig, Connector, ConnectorError, IntegrationDescriptor,
+    connect, editable_configuration, investigation_dialect, public_configuration, registered,
+    validate_registry, ConnectionConfig, Connector, ConnectorError, IntegrationDescriptor,
+};
+use crate::investigation_dialect::{
+    bucket_ends, dialect_for_language, format_duration, translate_query, Schema, WriteContext,
 };
 use crate::search::{SearchRequest, SearchWindow};
 use crate::storage::{
@@ -743,6 +746,7 @@ enum ApiError {
     Unavailable,
     InvalidTimeRange,
     InvalidSearchWindow(&'static str),
+    QueryTranslation(String),
     InvalidConnection,
     InvalidDataView,
     Connector(ConnectorError),
@@ -791,6 +795,11 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST,
                 "invalid_search_window",
                 message.to_owned(),
+            ),
+            Self::QueryTranslation(message) => (
+                StatusCode::BAD_REQUEST,
+                "query_translation_failed",
+                message,
             ),
             Self::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -895,6 +904,7 @@ async fn add_connection(
     let connector = connect(integration.id, &config)?;
     let _permit = acquire(&state).await?;
     connector.test_connection().await?;
+    config.extend(connector.learned_configuration());
     let connection = StoredConnection {
         id: id.clone(),
         name: request.name,
@@ -922,10 +932,12 @@ async fn update_connection(
     }
     let mut settings = request.settings;
     settings.insert("url".to_owned(), Value::String(request.url));
-    let config = editable_configuration(&existing.integration, &existing.record.config, &settings)?;
+    let mut config =
+        editable_configuration(&existing.integration, &existing.record.config, &settings)?;
     let connector = connect(existing.integration.id, &config)?;
     let _permit = acquire(&state).await?;
     connector.test_connection().await?;
+    config.extend(connector.learned_configuration());
     let updated = StoredConnection {
         id: new_id.clone(),
         name: request.name,
@@ -1003,18 +1015,105 @@ async fn connection_document(
     Ok(Json(connection.connector.document(&index, &id).await?))
 }
 
+#[derive(Deserialize)]
+struct ExploreSearch {
+    #[serde(flatten)]
+    request: SearchRequest,
+    /// The language `query` is written in when it is not the Data View's own.
+    #[serde(default)]
+    query_language: Option<String>,
+}
+
 async fn connection_search(
     State(state): State<AppState>,
     Path(connection_id): Path<String>,
-    Json(mut request): Json<SearchRequest>,
+    Json(search): Json<ExploreSearch>,
 ) -> Result<Json<Value>, ApiError> {
+    let ExploreSearch {
+        mut request,
+        query_language,
+    } = search;
     validate_search(&request)?;
     let window = SearchWindow::prepare(&mut request).map_err(ApiError::InvalidSearchWindow)?;
     let _permit = acquire(&state).await?;
     let connection = get_connection(&state, &connection_id).await?;
+    let translated = match query_language.as_deref().map(str::trim) {
+        Some(language)
+            if !language.is_empty()
+                && !language.eq_ignore_ascii_case(connection.integration.query_language)
+                && !request.query.trim().is_empty() =>
+        {
+            Some(translate_search_query(&connection, &mut request, language).await?)
+        }
+        _ => None,
+    };
     let mut result = connection.connector.search(request).await?;
     window.finish(&mut result);
+    if let Some((language, query)) = translated {
+        result["query_language"] = json!(language);
+        result["translated_query"] = json!(query);
+    }
     Ok(Json(result))
+}
+
+/// Rewrites `request.query` from `language` into the Data View's language, typing each field
+/// from the Data View's own schema; returns the canonical language name and the sent query.
+async fn translate_search_query(
+    connection: &ResolvedConnection,
+    request: &mut SearchRequest,
+    language: &str,
+) -> Result<(&'static str, String), ApiError> {
+    let source = dialect_for_language(language).ok_or_else(|| {
+        ApiError::QueryTranslation(format!(
+            "Queries can be translated from {}",
+            translatable_languages()
+        ))
+    })?;
+    let target = investigation_dialect(connection.integration.id).ok_or_else(|| {
+        ApiError::QueryTranslation(format!(
+            "{} Data Views accept {} queries only",
+            connection.integration.display_name, connection.integration.query_language
+        ))
+    })?;
+    let schema: Schema = connection
+        .connector
+        .fields(&request.index)
+        .await?
+        .into_iter()
+        .map(|field| (field.name, field.field_type))
+        .collect();
+    let context = WriteContext {
+        index: &request.index,
+        time_field: request.histogram_field.as_deref(),
+        time_range: request.time_range,
+        schema: &schema,
+    };
+    let translation = translate_query(source.language(), &request.query, target, &context)
+        .map_err(|error| ApiError::QueryTranslation(error.to_string()))?;
+    // A computation's buckets are its range, so the search steps by exactly that range, at
+    // multiples of it since the epoch as SQL buckets are.
+    if let Some(range_ms) = translation.range_ms {
+        request.histogram_interval = Some(format_duration(range_ms));
+        if let Some(range) = request.time_range.as_mut() {
+            *range = bucket_ends(*range, range_ms).ok_or_else(|| {
+                ApiError::QueryTranslation(
+                    "The time range must contain the end of at least one bucket of the computation's range".to_owned(),
+                )
+            })?;
+        }
+    }
+    request.query.clone_from(&translation.query);
+    Ok((source.language(), translation.query))
+}
+
+fn translatable_languages() -> String {
+    let mut languages = crate::data_connectors::investigation_dialects()
+        .into_iter()
+        .map(|dialect| dialect.language())
+        .collect::<Vec<_>>();
+    languages.sort_unstable();
+    languages.dedup();
+    languages.join(", ")
 }
 
 fn validate_search(request: &SearchRequest) -> Result<(), ApiError> {
