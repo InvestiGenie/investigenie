@@ -18,7 +18,7 @@ integrations/
 
 Shared contracts and registration live in `backend/src/data_connectors.rs` and `backend/src/ai_connectors.rs`. The integration folders contain concrete implementations, each with its own `mod.rs` entry point.
 
-Data connectors provide connection metadata, schema, read-only search, paging, and histograms. Their forms and Explore/Data Views behavior are metadata-driven. Investigation query translation must also support a source before AI evidence gathering can use it; adding a datasource does not automatically implement that translation.
+Data connectors provide connection metadata, schema, read-only search, paging, and histograms. Their forms and Explore/Data Views behavior are metadata-driven. AI evidence gathering also needs a connector dialect: a `dialect.rs` file beside the connector's `mod.rs` that implements `ConnectorDialect` from `backend/src/connector_dialect.rs` (currently Elasticsearch and ClickHouse). Adding a datasource does not add one automatically. `backend/build.rs` discovers the file and derives the descriptor's `ai_investigation` flag from it. The AI page disables Data Views from other sources, and investigations that include them fail with `unsupported_integration` before any source or model call.
 
 Built in: `elasticsearch` (Query DSL / Lucene), `clickhouse` (SQL `WHERE` clauses, read-only), `bigquery` (Standard SQL, read-only), `victorialogs` (LogsQL, read-only), `victoriametrics` (raw metrics selectors, read-only), `prometheus` (PromQL range queries, read-only), and `loki` (LogQL, read-only).
 
@@ -92,4 +92,4 @@ npm run test:web
 npm run build:web
 ```
 
-Then start the app, add a connection on **Connections**, create a Data View, and try Explore. Test InvestiGenie AI only when the source-specific investigation translation is implemented; registering a datasource alone does not enable it.
+Then start the app, add a connection on **Connections**, create a Data View, and try Explore. Test InvestiGenie AI only when the connector has a `dialect.rs` dialect; registering a datasource alone does not enable it.

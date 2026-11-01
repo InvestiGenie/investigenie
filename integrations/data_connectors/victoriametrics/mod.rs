@@ -41,6 +41,7 @@ pub fn descriptor() -> IntegrationDescriptor {
             json!({"name":"password","label":"Password","input_type":"password","required":false,"secret":true,"editable":true,"group":"credentials","placeholder":""}),
         ],
         query: json!({"placeholder":"Enter a metric selector, e.g. http_requests_total{job=\"api\"}","default_query":"{__name__!=\"\"}","field_query":"{query}","identifier_quote":"","help":"Enter a read-only MetricsQL series selector; Explore displays raw samples, not evaluated range-query values","document_mode":"inline","sort_requires_projection":false,"histogram_total_from_buckets":false,"schema_label":"VictoriaMetrics labels"}),
+        ..Default::default()
     }
 }
 

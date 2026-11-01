@@ -655,6 +655,76 @@ async fn ai_investigation_does_not_treat_timed_out_searches_as_complete_evidence
     assert_bounded_ai_evidence(false, true).await;
 }
 
+#[tokio::test]
+async fn ai_investigation_rejects_unsupported_integrations_before_contacting_sources_or_models() {
+    let (_directory, storage) = status_storage().await;
+    let upstream = MockServer::start().await;
+    Mock::given(matchers::any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    for (id, integration_id) in [("checkout", "elasticsearch"), ("logs", "victorialogs")] {
+        storage
+            .create_connection(StoredConnection {
+                id: id.to_owned(),
+                name: id.to_owned(),
+                integration_id: integration_id.to_owned(),
+                config: serde_json::from_value(json!({"url":upstream.uri()})).unwrap(),
+                revision: String::new(),
+            })
+            .await
+            .unwrap();
+        let revision = storage.connection(id).await.unwrap().record.revision;
+        storage
+            .save_view(
+                DataView {
+                    id: format!("{id}-view"),
+                    name: format!("{id} view"),
+                    connection_id: id.to_owned(),
+                    index: "events".to_owned(),
+                    time_field: "@timestamp".to_owned(),
+                    revision: String::new(),
+                },
+                &revision,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let model = storage
+        .create_ai_model(StoredAiModel {
+            id: String::new(),
+            revision: String::new(),
+            name: "Test model".to_owned(),
+            api_url: upstream.uri() + "/v1",
+            api_key: "unused".to_owned(),
+            model: "test-model".to_owned(),
+        })
+        .await
+        .unwrap();
+    let app = router("http://localhost:5173".parse().unwrap(), storage);
+    let response = app
+        .oneshot(json_request(
+            "/api/ai/investigate",
+            json!({"question":"Why are checkouts failing?","data_view_ids":["checkout-view","logs-view"],"ai_model_id":model.id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_integration");
+    assert_eq!(
+        body["error"]["message"],
+        "Data View \"logs view\" uses VictoriaLogs, which does not support AI investigations"
+    );
+}
+
 async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool) {
     let (_directory, storage) = status_storage().await;
     let source = MockServer::start().await;

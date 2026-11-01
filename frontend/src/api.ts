@@ -45,6 +45,7 @@ export type IntegrationDescriptor = {
   description: string;
   connection_fields: ConnectionField[];
   query: QueryDescriptor;
+  ai_investigation: boolean;
 };
 
 export type ConnectionSummary = {

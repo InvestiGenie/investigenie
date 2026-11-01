@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import { ArrowUp, BookOpen, BrainCircuit, Check, CircleAlert, CirclePause, Database, Play, Save, Search, Square, Trash2, X } from 'lucide-react';
-import { api, type AIConversation, type AIConversationSummary, type AIModelSummary, type DataViewSummary, type InvestigationJob, type InvestigationResult, type KnowledgeInput, type SearchRequest } from './api';
+import { api, type AIConversation, type AIConversationSummary, type AIModelSummary, type ConnectionSummary, type DataViewSummary, type InvestigationJob, type InvestigationResult, type KnowledgeInput, type SearchRequest } from './api';
 import TimeRangePicker from './TimeRangePicker';
 import { getPreference, setPreference, type PreferenceName } from './preferences';
 import { errorMessage } from './format';
@@ -158,13 +158,14 @@ function InvestigationResultView({ result, label, draftContext, onOpenKnowledge 
 
 type InvestiGenieAIPageProps = {
   dataViews: DataViewSummary[];
+  connections: ConnectionSummary[];
   onManageModels?: () => void;
   initialDocument?: DocumentInvestigationSeed | null;
   onDocumentInvestigationConsumed?: (requestId: string) => void;
   onOpenKnowledge?: (id: string) => void;
 };
 
-export default function InvestiGenieAIPage({ dataViews, onManageModels, initialDocument, onDocumentInvestigationConsumed, onOpenKnowledge }: InvestiGenieAIPageProps) {
+export default function InvestiGenieAIPage({ dataViews, connections, onManageModels, initialDocument, onDocumentInvestigationConsumed, onOpenKnowledge }: InvestiGenieAIPageProps) {
   const [models, setModels] = useState<AIModelSummary[]>([]);
   const [modelStatus, setModelStatus] = useState<'loading' | 'ready' | 'empty' | 'failed'>('loading');
   const [modelError, setModelError] = useState('');
@@ -247,8 +248,13 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
     setEndDate(initialDocument.timeRange ? new Date(initialDocument.timeRange.end).toISOString().slice(0, 19) : '');
     setError('');
 
-    if (!dataViews.some((view) => view.id === initialDocument.dataViewId)) {
+    const documentView = dataViews.find((view) => view.id === initialDocument.dataViewId);
+    if (!documentView) {
       setError('The document’s Data View is no longer available.');
+      return;
+    }
+    if (!connections.some((connection) => connection.id === documentView.connection_id && connection.integration.ai_investigation)) {
+      setError('The document’s Data View does not support AI investigations.');
       return;
     }
     if (modelStatus !== 'ready') {
@@ -256,7 +262,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
       return;
     }
     void startNewInvestigation(prompt, [initialDocument.dataViewId], selectedModelId, initialDocument.timeRange);
-  }, [initialDocument, modelStatus, selectedModelId, modelError, dataViews, onDocumentInvestigationConsumed]);
+  }, [initialDocument, modelStatus, selectedModelId, modelError, dataViews, connections, onDocumentInvestigationConsumed]);
 
   useEffect(() => {
     if (!dataViewPickerOpen) return;
@@ -306,6 +312,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
     !normalizedViewFilter || `${view.name} ${view.index} ${view.time_field}`.toLocaleLowerCase().includes(normalizedViewFilter),
   );
   const visibleDataViews = filteredDataViews.slice(0, 20);
+  const aiConnectionIds = new Set(connections.filter((connection) => connection.integration.ai_investigation).map((connection) => connection.id));
   const selectedDataViews = selectedIds.flatMap((id) => {
     const view = dataViews.find((item) => item.id === id);
     return view ? [view] : [];
@@ -479,10 +486,11 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
           <div className="ai-view-result-count">{filteredDataViews.length} matches{filteredDataViews.length > visibleDataViews.length ? ` · showing first ${visibleDataViews.length}` : ''}</div>
           <div className="ai-source-list">{visibleDataViews.map((view) => {
             const checked = selectedIds.includes(view.id);
-            return <label className={`ai-source${checked ? ' selected' : ''}`} key={view.id}>
-              <input type="checkbox" checked={checked} disabled={!checked && selectedIds.length >= 5} onChange={() => toggleDataView(view.id)} />
+            const supported = aiConnectionIds.has(view.connection_id);
+            return <label className={`ai-source${checked ? ' selected' : ''}${supported ? '' : ' unsupported'}`} key={view.id}>
+              <input type="checkbox" checked={checked} disabled={!supported || (!checked && selectedIds.length >= 5)} onChange={() => toggleDataView(view.id)} />
               <span className="ai-source-check" aria-hidden="true">{checked && <Check size={12} />}</span>
-              <span className="ai-source-name"><strong>{view.name}</strong><small>{view.index} · {view.time_field}</small></span>
+              <span className="ai-source-name"><strong>{view.name}</strong><small>{view.index} · {view.time_field}{supported ? '' : ' · Not supported by AI'}</small></span>
             </label>;
           })}{visibleDataViews.length === 0 && <p className="ai-empty-sources">No Data Views match that search.</p>}</div>
         </div>}

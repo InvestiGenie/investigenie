@@ -147,7 +147,7 @@ impl Connector for LoggedConnector {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct IntegrationDescriptor {
     pub id: &'static str,
     pub display_name: &'static str,
@@ -156,6 +156,9 @@ pub struct IntegrationDescriptor {
     pub description: &'static str,
     pub connection_fields: Vec<Value>,
     pub query: Value,
+    /// Derived by the generated registry: true when the connector folder has a `dialect.rs`
+    /// dialect. Connectors leave it to `..Default::default()`.
+    pub ai_investigation: bool,
 }
 
 pub fn string_setting(
@@ -473,6 +476,7 @@ mod tests {
             for key in ["id", "display_name", "query_language", "description"] {
                 assert!(serialized[key].is_string());
             }
+            assert!(serialized["ai_investigation"].is_boolean());
             for field in &descriptor.connection_fields {
                 for key in ["name", "label", "placeholder"] {
                     assert!(field[key].is_string(), "{field}");
