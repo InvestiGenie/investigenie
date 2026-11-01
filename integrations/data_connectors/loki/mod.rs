@@ -1,17 +1,17 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
-    hash::{Hash, Hasher},
     time::{Duration, Instant},
 };
 
+use crate::http_auth::HttpAuth;
 use crate::data_connectors::IntegrationDescriptor;
 use crate::search::{
     BreakdownCount, HistogramInterval, HistogramOptions, TimeRange, BREAKDOWN_OTHER_KEY,
     MAX_BREAKDOWN_VALUES,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
-use reqwest::{header, redirect::Policy, Client, Response, Url};
+use reqwest::{header, Client, Response, Url};
 use serde_json::{json, Value};
 use thiserror::Error;
 
@@ -36,34 +36,25 @@ pub fn descriptor() -> IntegrationDescriptor {
         description: "Read-only log queries over Loki streams",
         connection_fields: vec![
             json!({"name":"url","label":"URL","input_type":"url","required":true,"secret":false,"editable":true,"placeholder":"http://localhost:3100"}),
-            json!({"name":"auth_type","label":"Authentication","input_type":"select","required":false,"secret":false,"editable":true,"group":"authentication","placeholder":"","options":[{"value":"none","label":"None"},{"value":"basic","label":"Basic"},{"value":"bearer","label":"Bearer token"}]}),
-            json!({"name":"username","label":"Username","input_type":"text","required":true,"secret":true,"editable":true,"group":"credentials","placeholder":"","visible_when":{"field":"auth_type","value":"basic"}}),
-            json!({"name":"password","label":"Password","input_type":"password","required":true,"secret":true,"editable":true,"group":"credentials","placeholder":"","visible_when":{"field":"auth_type","value":"basic"}}),
-            json!({"name":"bearer_token","label":"Bearer token","input_type":"password","required":true,"secret":true,"editable":true,"group":"credentials","placeholder":"","visible_when":{"field":"auth_type","value":"bearer"}}),
-            json!({"name":"tenant_id","label":"Tenant ID (optional)","input_type":"text","required":false,"secret":false,"editable":true,"placeholder":"X-Scope-OrgID"}),
-        ],
+        ]
+        .into_iter()
+        .chain(crate::http_auth::connection_fields())
+        .chain([json!({"name":"tenant_id","label":"Tenant ID (optional)","input_type":"text","required":false,"secret":false,"editable":true,"placeholder":"X-Scope-OrgID"})])
+        .collect(),
         query: json!({"placeholder":"Enter a LogQL query, e.g. {app=\"api\"} |= \"error\"","default_query":"{}","field_query":"{query}","identifier_quote":"","help":"LogQL query runs against the selected Loki log dataset","document_mode":"inline","sort_requires_projection":false,"histogram_total_from_buckets":false,"schema_label":"Loki stream labels"}),
     }
 }
 
-#[derive(Clone)]
 pub struct LokiSettings {
     pub url: Url,
-    pub auth_type: String,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub bearer_token: Option<String>,
+    pub auth: HttpAuth,
     pub tenant_id: Option<String>,
 }
 
-#[derive(Clone)]
 pub struct LokiClient {
     base_url: Url,
     client: Client,
-    auth_type: &'static str,
-    username: Option<String>,
-    password: Option<String>,
-    bearer_token: Option<String>,
+    auth: HttpAuth,
     tenant_id: Option<String>,
 }
 
@@ -85,6 +76,8 @@ pub enum LokiError {
     Request,
     #[error("Loki rejected the request with HTTP {status}")]
     Rejected { status: u16 },
+    #[error("Could not obtain an OAuth 2.0 access token for Loki")]
+    Authentication,
     #[error("Loki returned an invalid response")]
     InvalidResponse,
 }
@@ -122,34 +115,6 @@ impl LokiClient {
         {
             return Err(LokiError::InvalidUrl);
         }
-        let (auth_type, username, password, bearer_token) = match settings.auth_type.as_str() {
-            "none" if settings.username.is_none()
-                && settings.password.is_none()
-                && settings.bearer_token.is_none() => ("none", None, None, None),
-            "basic"
-                if settings.username.as_deref().is_some_and(|value| !value.trim().is_empty())
-                    && settings.password.as_deref().is_some_and(|value| !value.is_empty())
-                    && settings.bearer_token.is_none() =>
-            {
-                (
-                    "basic",
-                    settings.username,
-                    settings.password,
-                    None,
-                )
-            }
-            "bearer"
-                if settings.username.is_none()
-                    && settings.password.is_none()
-                    && settings
-                        .bearer_token
-                        .as_deref()
-                        .is_some_and(|value| !value.trim().is_empty()) =>
-            {
-                ("bearer", None, None, settings.bearer_token)
-            }
-            _ => return Err(LokiError::InvalidConfiguration),
-        };
         let tenant_id = settings.tenant_id.filter(|value| !value.trim().is_empty());
         if tenant_id
             .as_deref()
@@ -157,25 +122,28 @@ impl LokiClient {
         {
             return Err(LokiError::InvalidConfiguration);
         }
-        let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(Policy::none())
-            .build()
+        let client = crate::data_connectors::shared_http_client(REQUEST_TIMEOUT)
             .map_err(|_| LokiError::ClientConfiguration)?;
         Ok(Self {
             base_url: settings.url,
             client,
-            auth_type,
-            username,
-            password,
-            bearer_token,
+            auth: settings.auth,
             tenant_id,
         })
     }
 
+    pub fn auth(&self) -> &HttpAuth {
+        &self.auth
+    }
+
+    pub fn tenant_id(&self) -> Option<&str> {
+        self.tenant_id.as_deref()
+    }
+
     pub async fn test_connection(&self) -> Result<(), LokiError> {
         let response = self
-            .request("loki/api/v1/labels")?
+            .request("loki/api/v1/labels")
+            .await?
             .query(&[("limit", "1")])
             .send()
             .await
@@ -193,7 +161,8 @@ impl LokiClient {
     ) -> Result<Vec<crate::data_connectors::FieldSummary>, LokiError> {
         validate_index(index)?;
         let response = self
-            .request("loki/api/v1/labels")?
+            .request("loki/api/v1/labels")
+            .await?
             .send()
             .await
             .map_err(|_| LokiError::Request)?;
@@ -281,7 +250,8 @@ impl LokiClient {
             ("timeout".to_owned(), QUERY_TIMEOUT.to_owned()),
         ];
         let response = self
-            .request("loki/api/v1/query_range")?
+            .request("loki/api/v1/query_range")
+            .await?
             .query(&params)
             .send()
             .await
@@ -358,7 +328,7 @@ impl LokiClient {
         Ok(result)
     }
 
-    fn request(&self, path: &str) -> Result<reqwest::RequestBuilder, LokiError> {
+    async fn request(&self, path: &str) -> Result<reqwest::RequestBuilder, LokiError> {
         let mut endpoint = self.base_url.clone();
         let mut segments = endpoint
             .path_segments_mut()
@@ -368,21 +338,11 @@ impl LokiClient {
             segments.push(segment);
         }
         drop(segments);
-        let mut request = self.client.get(endpoint);
-        request = match self.auth_type {
-            "basic" => request.basic_auth(
-                self.username.as_deref().unwrap_or_default(),
-                self.password.as_deref(),
-            ),
-            "bearer" => {
-                let token = self.bearer_token.as_deref().ok_or(LokiError::InvalidConfiguration)?;
-                let mut value = header::HeaderValue::from_str(&format!("Bearer {token}"))
-                    .map_err(|_| LokiError::InvalidConfiguration)?;
-                value.set_sensitive(true);
-                request.header(header::AUTHORIZATION, value)
-            }
-            _ => request,
-        };
+        let mut request = self
+            .auth
+            .authorize(self.client.get(endpoint))
+            .await
+            .map_err(|_| LokiError::Authentication)?;
         if let Some(tenant_id) = self.tenant_id.as_deref() {
             let value = header::HeaderValue::from_str(tenant_id)
                 .map_err(|_| LokiError::InvalidConfiguration)?;
@@ -447,10 +407,12 @@ fn parse_streams(streams: &[Value]) -> Result<Vec<LogEntry>, LokiError> {
             source.insert("_time".to_owned(), json!(time));
             source.insert("_msg".to_owned(), json!(line));
             let source = Value::Object(source);
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            source.to_string().hash(&mut hasher);
             entries.push(LogEntry {
-                id: format!("log-{:016x}-{}", hasher.finish(), entries.len()),
+                id: format!(
+                    "log-{:016x}-{}",
+                    crate::data_connectors::json_hash(&source),
+                    entries.len()
+                ),
                 timestamp: millis,
                 source,
             });
@@ -608,32 +570,44 @@ mod tests {
     fn client(url: &str) -> LokiClient {
         LokiClient::new(LokiSettings {
             url: Url::parse(url).unwrap(),
-            auth_type: "none".to_owned(),
-            username: None,
-            password: None,
-            bearer_token: None,
+            auth: HttpAuth::None,
             tenant_id: None,
         })
         .unwrap()
     }
 
-    #[test]
-    fn auth_configuration_rejects_mixed_or_partial_credentials() {
-        for (auth_type, username, password, bearer_token) in [
-            ("basic", Some("user".to_owned()), None, None),
-            ("bearer", None, None, Some("   ".to_owned())),
-            ("none", None, None, Some("token".to_owned())),
-        ] {
-            assert!(LokiClient::new(LokiSettings {
-                url: Url::parse("http://localhost:3100").unwrap(),
-                auth_type: auth_type.to_owned(),
-                username,
-                password,
-                bearer_token,
-                tenant_id: None,
-            })
-            .is_err());
-        }
+    fn labels(data: Value) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({"status":"success","data":data}))
+    }
+
+    #[tokio::test]
+    async fn oauth_tokens_authorize_every_loki_request_without_exposing_secrets() {
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"access_token":"loki-token","token_type":"Bearer","expires_in":300}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::path("/loki/api/v1/labels"))
+            .and(matchers::header("authorization", "Bearer loki-token"))
+            .and(matchers::header("x-scope-orgid", "team-a"))
+            .respond_with(labels(json!(["app"])))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let config = json!({
+            "url":server.uri(),"auth_type":"oauth2","oauth_token_url":format!("{}/token", server.uri()),
+            "oauth_client_id":"loki-reader","oauth_client_secret":"loki-secret","tenant_id":"team-a"
+        });
+        let connector = connector::connect(config.as_object().unwrap()).unwrap();
+        connector.test_connection().await.unwrap();
+        connector.fields("logs").await.unwrap();
+        let public = Value::Object(connector.public_configuration()).to_string();
+        assert!(public.contains("oauth2") && public.contains("/token") && public.contains("team-a"));
+        assert!(!public.contains("loki-secret") && !public.contains("loki-reader"));
     }
 
     #[test]

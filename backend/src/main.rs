@@ -3,6 +3,7 @@ mod ai_connectors;
 mod api;
 mod config;
 mod data_connectors;
+mod http_auth;
 mod logging;
 mod search;
 mod storage;
