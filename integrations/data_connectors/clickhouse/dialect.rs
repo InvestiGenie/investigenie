@@ -64,7 +64,7 @@ impl ConnectorDialect for SqlDialect {
 fn sql_filter(filter: &FilterPredicate) -> Result<String, TranslationError> {
     let field = quote_identifier(&filter.field);
     let value = match &filter.value {
-        FilterValue::String(value) => format!("'{}'", value.replace('\'', "''")),
+        FilterValue::String(value) => string_literal(value),
         FilterValue::Number(_) | FilterValue::Bool(_) => filter.value.text(),
     };
     Ok(match filter.operator {
@@ -74,11 +74,8 @@ fn sql_filter(filter: &FilterPredicate) -> Result<String, TranslationError> {
                 return Err(TranslationError("Contains filters require string values"));
             };
             format!(
-                "{field} LIKE '%{}%'",
-                text.replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_")
-                    .replace('\'', "''")
+                "{field} LIKE {}",
+                string_literal(&format!("%{}%", like_pattern(text)))
             )
         }
         FilterOperator::Gt => format!("{field} > {value}"),
@@ -86,6 +83,19 @@ fn sql_filter(filter: &FilterPredicate) -> Result<String, TranslationError> {
         FilterOperator::Lt => format!("{field} < {value}"),
         FilterOperator::Lte => format!("{field} <= {value}"),
     })
+}
+
+/// ClickHouse processes backslash escapes inside string literals, so both `\` and `'` are
+/// escaped; doubling `'` alone lets a value ending in `\` close the string early.
+fn string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// Escapes `LIKE` wildcards and the escape character; the result still needs `string_literal`.
+fn like_pattern(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 #[cfg(test)]
@@ -103,7 +113,28 @@ mod tests {
         }];
         assert_eq!(
             build_query(dialect(), "database.events", &filters).unwrap(),
-            "SELECT * FROM `database`.`events` WHERE `message` LIKE '%error\\%'' OR 1=1 --%'"
+            r"SELECT * FROM `database`.`events` WHERE `message` LIKE '%error\\%\' OR 1=1 --%'"
+        );
+        // A backslash before the quote used to end the string early and match every row.
+        let filters = [FilterPredicate {
+            field: "s".to_owned(),
+            field_type: String::new(),
+            operator: FilterOperator::Eq,
+            value: FilterValue::String(r"x\' OR 1=1 --".to_owned()),
+        }];
+        assert_eq!(
+            build_query(dialect(), "probe", &filters).unwrap(),
+            r"SELECT * FROM `probe` WHERE `s` = 'x\\\' OR 1=1 --'"
+        );
+        let filters = [FilterPredicate {
+            field: "path".to_owned(),
+            field_type: String::new(),
+            operator: FilterOperator::Contains,
+            value: FilterValue::String(r"a_b\".to_owned()),
+        }];
+        assert_eq!(
+            build_query(dialect(), "probe", &filters).unwrap(),
+            r"SELECT * FROM `probe` WHERE `path` LIKE '%a\\_b\\\\%'"
         );
         let filters = [FilterPredicate {
             field: "status".to_owned(),
