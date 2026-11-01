@@ -3,11 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import InvestiGenieAIPage from './InvestiGenieAIPage';
 import { api, type AIConversation, type InvestigationJob, type InvestigationResult } from './api';
 import { clearPreference, getPreference } from './preferences';
+import { connectionFixture, elasticsearchIntegration, thirdIntegration } from './test-fixtures';
 
 const dataViews = [
   { id: 'service-one', revision: 'r1', name: 'Service 1', connection_id: 'source', index: 'service-one-*', time_field: '@timestamp' },
   { id: 'service-two', revision: 'r1', name: 'Service 2', connection_id: 'source', index: 'service-two-*', time_field: '@timestamp' },
 ];
+const connections = [connectionFixture(elasticsearchIntegration)];
 
 const result: InvestigationResult = {
   summary: 'Service 2 timeouts rose after Service 1 errors increased.',
@@ -64,7 +66,7 @@ describe('InvestiGenieAIPage', () => {
       sources: [{ ...result.sources[0], records_examined: 3, sample_records_available: 3, sample_limit: 8, aggregate_records: 102,
         evidence_queries: [{ sampling: 'latest', query_summary: 'Filtered checkout events; last 30 minutes', records_returned: 2, aggregate_records: 102 }, { sampling: 'earliest', query_summary: 'Filtered checkout events; last 30 minutes', records_returned: 2, aggregate_records: null }] }],
     } }));
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     await screen.findByRole('combobox', { name: /AI model/ });
     openDataViewPicker(); fireEvent.click(screen.getByLabelText(/Service 1/));
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Investigate errors' } });
@@ -80,7 +82,7 @@ describe('InvestiGenieAIPage', () => {
 
   it('does not turn insufficient evidence into an incident draft or an all-clear', async () => {
     vi.spyOn(api, 'startInvestigation').mockResolvedValue(job({ result: { ...result, findings: [], summary: 'Insufficient sampled evidence.', evidence_status: 'insufficient_evidence', conclusions_verified: false } }));
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     await screen.findByRole('combobox', { name: /AI model/ });
     openDataViewPicker(); fireEvent.click(screen.getByLabelText(/Service 1/));
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Investigate errors' } });
@@ -93,7 +95,7 @@ describe('InvestiGenieAIPage', () => {
     vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
     const save = vi.spyOn(api, 'addKnowledge').mockImplementation(async (body) => ({ ...body, id: 'draft-1', revision: 'draft-revision', created_at_ms: 1, updated_at_ms: 1 }));
     const open = vi.fn();
-    render(<InvestiGenieAIPage dataViews={dataViews} onOpenKnowledge={open} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} onOpenKnowledge={open} />);
     await screen.findByRole('combobox', { name: /AI model/ });
     openDataViewPicker();
     fireEvent.click(screen.getByLabelText(/Service 1/));
@@ -116,7 +118,7 @@ describe('InvestiGenieAIPage', () => {
     vi.mocked(api.aiConversations).mockResolvedValue([{ id: 'chat-1', revision: 'rev-1', title: 'Saved case', updated_at_ms: 10 }]);
     vi.mocked(api.aiConversation).mockResolvedValue({ id: 'chat-1', revision: 'rev-1', title: 'Saved case', updated_at_ms: 10, created_at_ms: 5, model_id: 'original-model', data_view_ids: ['service-two'], messages: [{ role: 'user', content: 'Original case question' }, { role: 'assistant', content: result.summary, result }] });
     const save = vi.spyOn(api, 'addKnowledge').mockImplementation(async (body) => ({ ...body, id: 'draft-2', revision: 'r2', created_at_ms: 1, updated_at_ms: 1 }));
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     await screen.findByRole('option', { name: 'Saved case' });
     fireEvent.change(screen.getByLabelText('AI conversation history'), { target: { value: 'chat-1' } });
     fireEvent.click(await screen.findByRole('button', { name: 'Save as knowledge draft' }));
@@ -131,7 +133,7 @@ describe('InvestiGenieAIPage', () => {
     let finish!: () => void;
     const pending = new Promise<void>((resolve) => { finish = resolve; });
     const save = vi.spyOn(api, 'addKnowledge').mockImplementation(async (body) => { await pending; return { ...body, id: 'draft-pending', revision: 'r1', created_at_ms: 1, updated_at_ms: 1 }; });
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     await screen.findByRole('combobox', { name: /AI model/ });
     openDataViewPicker(); fireEvent.click(screen.getByLabelText(/Service 1/));
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Investigate errors' } });
@@ -147,7 +149,7 @@ describe('InvestiGenieAIPage', () => {
   it('does not promote partial findings reopened from history', async () => {
     vi.mocked(api.aiConversations).mockResolvedValue([{ id: 'partial-case', revision: 'r1', title: 'Partial case', updated_at_ms: 2 }]);
     vi.mocked(api.aiConversation).mockResolvedValue({ id: 'partial-case', revision: 'r1', title: 'Partial case', created_at_ms: 1, updated_at_ms: 2, model_id: 'model-primary', data_view_ids: ['service-one'], messages: [{ role: 'user', content: 'Investigate errors' }, { role: 'assistant', content: result.summary, result: { ...result, complete: false } }] });
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     await screen.findByRole('option', { name: 'Partial case' });
     fireEvent.change(screen.getByLabelText('AI conversation history'), { target: { value: 'partial-case' } });
     await screen.findByText(result.summary);
@@ -157,7 +159,7 @@ describe('InvestiGenieAIPage', () => {
   it('keeps results visible and allows retry after a draft save fails', async () => {
     vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
     const save = vi.spyOn(api, 'addKnowledge').mockRejectedValueOnce(new Error('Knowledge storage unavailable')).mockImplementationOnce(async (body) => ({ ...body, id: 'draft-3', revision: 'r3', created_at_ms: 1, updated_at_ms: 1 }));
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     await screen.findByRole('combobox', { name: /AI model/ });
     openDataViewPicker(); fireEvent.click(screen.getByLabelText(/Service 1/));
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Investigate errors' } });
@@ -172,7 +174,7 @@ describe('InvestiGenieAIPage', () => {
 
   it.each(['running', 'awaiting_decision', 'terminated', 'failed'] as const)('does not offer knowledge drafts for a %s investigation', async (status) => {
     vi.spyOn(api, 'startInvestigation').mockResolvedValue(job({ status, result: { ...result, complete: false } }));
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     await screen.findByRole('combobox', { name: /AI model/ });
     openDataViewPicker(); fireEvent.click(screen.getByLabelText(/Service 1/));
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Investigate errors' } });
@@ -184,7 +186,7 @@ describe('InvestiGenieAIPage', () => {
   it.each(['\u{1f600}', '\u0000'])('bounds Unicode and escaped draft content by UTF-8 and request-body bytes (%j)', async (character) => {
     vi.spyOn(api, 'startInvestigation').mockResolvedValue(job({ result: { ...result, summary: character.repeat(12_000) } }));
     const save = vi.spyOn(api, 'addKnowledge').mockImplementation(async (body) => ({ ...body, id: 'draft-4', revision: 'r4', created_at_ms: 1, updated_at_ms: 1 }));
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     await screen.findByRole('combobox', { name: /AI model/ });
     openDataViewPicker(); fireEvent.click(screen.getByLabelText(/Service 1/));
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: '\u{1f600}'.repeat(100) } });
@@ -201,7 +203,7 @@ describe('InvestiGenieAIPage', () => {
 
   it('requires a selected model and views and submits their IDs with the question', async () => {
     const investigate = vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     expect(await screen.findByRole('combobox', { name: /AI model/ })).toHaveValue('model-primary');
     expect(screen.getByRole('button', { name: 'Run investigation' })).toBeDisabled();
     openDataViewPicker();
@@ -219,6 +221,7 @@ describe('InvestiGenieAIPage', () => {
     const consumed = vi.fn();
     render(<InvestiGenieAIPage
       dataViews={dataViews}
+      connections={connections}
       initialDocument={{
         requestId: 'document-request-1',
         dataViewId: 'service-one',
@@ -242,6 +245,26 @@ describe('InvestiGenieAIPage', () => {
     expect(consumed).toHaveBeenCalledWith('document-request-1');
   });
 
+  it('does not start a document investigation for a source without AI support', async () => {
+    const investigate = vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
+    render(<InvestiGenieAIPage
+      dataViews={dataViews}
+      connections={[connectionFixture(thirdIntegration)]}
+      initialDocument={{
+        requestId: 'document-request-2',
+        dataViewId: 'service-one',
+        dataViewName: 'Service 1',
+        index: 'service-one-2026.10.22',
+        documentId: 'event-17',
+        source: { message: 'gateway returned 503' },
+        timeRange: null,
+      }}
+    />);
+
+    expect(await screen.findByText('The document’s Data View does not support AI investigations.')).toBeInTheDocument();
+    expect(investigate).not.toHaveBeenCalled();
+  });
+
   it('reopens a saved investigation and continues with its transcript', async () => {
     const summary = { id: 'chat-1', revision: 'revision-1', title: 'Why did checkout fail?', updated_at_ms: 10 };
     const conversation: AIConversation = {
@@ -263,7 +286,7 @@ describe('InvestiGenieAIPage', () => {
     vi.mocked(api.aiConversation).mockResolvedValue(conversation);
     const followUp = vi.spyOn(api, 'continueAIConversation').mockResolvedValue(updated);
     const remove = vi.spyOn(api, 'removeAIConversation').mockResolvedValue(undefined);
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     const history = await screen.findByRole('combobox', { name: 'AI conversation history' });
     await screen.findByRole('option', { name: 'Why did checkout fail?' });
     fireEvent.change(history, { target: { value: 'chat-1' } });
@@ -291,7 +314,7 @@ describe('InvestiGenieAIPage', () => {
 
   it('renders findings, confidence, evidence and bounded sources', async () => {
     vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     await screen.findByRole('combobox', { name: /AI model/ });
     openDataViewPicker();
     fireEvent.click(screen.getByLabelText(/Service 1/));
@@ -308,7 +331,7 @@ describe('InvestiGenieAIPage', () => {
 
   it('shows provider setup errors without losing the question', async () => {
     vi.spyOn(api, 'startInvestigation').mockRejectedValue(new Error('InvestiGenie AI is not configured'));
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     await screen.findByRole('combobox', { name: /AI model/ });
     openDataViewPicker();
     fireEvent.click(screen.getByLabelText(/Service 1/));
@@ -322,16 +345,25 @@ describe('InvestiGenieAIPage', () => {
     const views = Array.from({ length: 6 }, (_, index) => ({
       ...dataViews[0], id: `view-${index}`, name: `View ${index}`,
     }));
-    render(<InvestiGenieAIPage dataViews={views} />);
+    render(<InvestiGenieAIPage dataViews={views} connections={connections} />);
     openDataViewPicker();
     for (let index = 0; index < 5; index++) fireEvent.click(screen.getByLabelText(new RegExp(`View ${index}`)));
     expect(screen.getByRole('button', { name: 'Choose Data Views' })).toHaveTextContent('5/5');
     expect(screen.getByLabelText(/View 5/)).toBeDisabled();
   });
 
+  it('disables Data Views whose source does not support AI investigations', () => {
+    const views = [...dataViews, { ...dataViews[0], id: 'archive-view', name: 'Archive events', connection_id: 'archive' }];
+    render(<InvestiGenieAIPage dataViews={views} connections={[...connections, connectionFixture(thirdIntegration, { id: 'archive' })]} />);
+    openDataViewPicker();
+    expect(screen.getByLabelText(/Archive events/)).toBeDisabled();
+    expect(screen.getByLabelText(/Archive events/).closest('label')).toHaveTextContent('Not supported by AI');
+    expect(screen.getByLabelText(/Service 1/)).toBeEnabled();
+  });
+
   it('submits with Enter while Shift+Enter keeps the composer open for multiline text', async () => {
     const investigate = vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     await screen.findByRole('combobox', { name: /AI model/ });
     openDataViewPicker();
     fireEvent.click(screen.getByLabelText(/Service 1/));
@@ -346,7 +378,7 @@ describe('InvestiGenieAIPage', () => {
   });
 
   it('closes the Data View dropdown with Escape and restores trigger focus', () => {
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     const trigger = screen.getByRole('button', { name: 'Choose Data Views' });
     fireEvent.click(trigger);
     const search = screen.getByLabelText('Search Data Views');
@@ -360,7 +392,7 @@ describe('InvestiGenieAIPage', () => {
     const views = Array.from({ length: 120 }, (_, index) => ({
       ...dataViews[0], id: `view-${index}`, name: `Service ${index}`, index: `logs-${index}`,
     }));
-    render(<InvestiGenieAIPage dataViews={views} />);
+    render(<InvestiGenieAIPage dataViews={views} connections={connections} />);
     openDataViewPicker();
     fireEvent.change(screen.getByLabelText('Search Data Views'), { target: { value: 'Service 10' } });
     expect(screen.getByText('11 matches')).toBeInTheDocument();
@@ -372,14 +404,14 @@ describe('InvestiGenieAIPage', () => {
   });
 
   it('shows an empty-state hint when no data views exist', () => {
-    render(<InvestiGenieAIPage dataViews={[]} />);
+    render(<InvestiGenieAIPage dataViews={[]} connections={connections} />);
     expect(screen.getByText('Create a Data View before starting an investigation.')).toBeInTheDocument();
     expect(screen.getByLabelText('Ask InvestiGenie AI')).toBeDisabled();
   });
 
   it('uses the Explore timeframe picker and keeps the model below the chat', async () => {
     const investigate = vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     const model = await screen.findByRole('combobox', { name: 'AI model' });
     expect(model.closest('.ai-composer-footer')).not.toBeNull();
     expect(screen.getByRole('heading', { name: 'Start a new investigation' })).toBeInTheDocument();
@@ -401,7 +433,7 @@ describe('InvestiGenieAIPage', () => {
 
   it('sends an explicit all-time scope when the time window is cleared', async () => {
     const investigate = vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     await screen.findByRole('combobox', { name: 'AI model' });
     fireEvent.click(screen.getByRole('button', { name: 'Clear time window' }));
     expect(screen.getByText('All time')).toBeInTheDocument();
@@ -414,7 +446,7 @@ describe('InvestiGenieAIPage', () => {
 
   it('sends saved timeout and check-in controls with the investigation', async () => {
     const investigate = vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     await screen.findByRole('combobox', { name: 'AI model' });
     fireEvent.change(screen.getByLabelText('AI response timeout'), { target: { value: '300' } });
     fireEvent.change(screen.getByLabelText('Ask to continue after'), { target: { value: '600' } });
@@ -434,7 +466,7 @@ describe('InvestiGenieAIPage', () => {
       .mockResolvedValueOnce(job({ status: 'awaiting_decision', result: partial, pause_reason: 'The investigation has run for 2 minutes without finishing.' }))
       .mockResolvedValueOnce(job());
     const decide = vi.spyOn(api, 'decideInvestigation').mockResolvedValue(job({ status: 'running', result: partial }));
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     await screen.findByRole('combobox', { name: 'AI model' });
     openDataViewPicker();
     fireEvent.click(screen.getByLabelText(/Service 1/));
@@ -457,7 +489,7 @@ describe('InvestiGenieAIPage', () => {
     const partial = { ...result, complete: false };
     vi.spyOn(api, 'startInvestigation').mockResolvedValue(job({ status: 'awaiting_decision', result: partial, pause_reason: 'The AI provider did not respond within the configured timeout.' }));
     const decide = vi.spyOn(api, 'decideInvestigation').mockResolvedValue(job({ status: 'terminated', result: partial }));
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     await screen.findByRole('combobox', { name: 'AI model' });
     openDataViewPicker();
     fireEvent.click(screen.getByLabelText(/Service 1/));
@@ -473,7 +505,7 @@ describe('InvestiGenieAIPage', () => {
   it('reports failed background investigations', async () => {
     vi.spyOn(api, 'startInvestigation').mockResolvedValue(job({ status: 'running', result: null }));
     vi.spyOn(api, 'investigation').mockResolvedValue(job({ status: 'failed', result: null, error: { code: 'source_query_failed', message: 'A batched source query failed' } }));
-    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} />);
     await screen.findByRole('combobox', { name: 'AI model' });
     openDataViewPicker();
     fireEvent.click(screen.getByLabelText(/Service 1/));
@@ -485,7 +517,7 @@ describe('InvestiGenieAIPage', () => {
   it('links to model management and disables investigations when no profile exists', async () => {
     vi.mocked(api.aiModels).mockResolvedValue([]);
     const onManageModels = vi.fn();
-    render(<InvestiGenieAIPage dataViews={dataViews} onManageModels={onManageModels} />);
+    render(<InvestiGenieAIPage dataViews={dataViews} connections={connections} onManageModels={onManageModels} />);
     expect(await screen.findByText('No saved AI models')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Open AI model management' }));
     expect(onManageModels).toHaveBeenCalledOnce();

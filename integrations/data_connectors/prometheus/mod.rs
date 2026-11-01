@@ -38,6 +38,7 @@ pub fn descriptor() -> IntegrationDescriptor {
             json!({"name":"password","label":"Password","input_type":"password","required":false,"secret":true,"editable":true,"group":"credentials","placeholder":""}),
         ],
         query: json!({"placeholder":"Enter a PromQL expression, e.g. rate(http_requests_total[5m])","default_query":"{__name__!=\"\"}","field_query":"{query}","identifier_quote":"","help":"PromQL range queries return evaluated samples at a bounded step; missing samples may be filled by Prometheus lookback semantics","document_mode":"inline","sort_requires_projection":false,"histogram_total_from_buckets":true,"schema_label":"Prometheus labels"}),
+        ..Default::default()
     }
 }
 

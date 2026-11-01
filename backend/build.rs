@@ -23,27 +23,42 @@ fn main() {
             }),
             "Integration folder must be a Rust identifier: {name}"
         );
-        integrations.push((name.to_owned(), path.join("mod.rs").canonicalize().unwrap()));
+        let investigation = path.join("dialect.rs").is_file();
+        integrations.push((
+            name.to_owned(),
+            path.join("mod.rs").canonicalize().unwrap(),
+            investigation,
+        ));
     }
     integrations.sort_by(|left, right| left.0.cmp(&right.0));
     let mut generated = String::new();
-    for (name, path) in &integrations {
+    for (name, path, _) in &integrations {
         generated.push_str(&format!(
             "#[path = {:?}]\npub mod {name};\n",
             path.to_str().unwrap()
         ));
     }
+    // AI support is derived from the dialect file, so the flag cannot drift from the translator.
     generated.push_str("pub fn registered() -> Vec<IntegrationDescriptor> { vec![\n");
-    for (name, _) in &integrations {
-        generated.push_str(&format!("{name}::descriptor(),\n"));
+    for (name, _, investigation) in &integrations {
+        generated.push_str(&format!(
+            "IntegrationDescriptor {{ ai_investigation: {investigation}, ..{name}::descriptor() }},\n"
+        ));
     }
     generated.push_str("] }\n");
+    generated.push_str("pub fn connector_dialect(id: &str) -> Option<&'static dyn crate::connector_dialect::ConnectorDialect> { match id {\n");
+    for (name, _, investigation) in &integrations {
+        if *investigation {
+            generated.push_str(&format!("{name:?} => Some({name}::dialect::dialect()),\n"));
+        }
+    }
+    generated.push_str("_ => None, } }\n");
     generated.push_str("pub fn validate_registry() { let descriptors = registered(); let mut ids = std::collections::HashSet::new(); for descriptor in &descriptors { assert!(ids.insert(descriptor.id), \"Duplicate integration id\"); }\n");
-    for (name, _) in &integrations {
+    for (name, _, _) in &integrations {
         generated.push_str(&format!("assert_eq!({name}::descriptor().id, {name:?}, \"Integration id must match folder\");\n"));
     }
-    generated.push_str("}\npub fn connect(id: &str, config: &ConnectionConfig) -> Result<std::sync::Arc<dyn Connector>, ConnectorError> { validate_registry(); match id {\n");
-    for (name, _) in &integrations {
+    generated.push_str("}\npub fn connect(id: &str, config: &ConnectionConfig) -> Result<std::sync::Arc<dyn Connector>, ConnectorError> { static VALIDATED: std::sync::Once = std::sync::Once::new(); VALIDATED.call_once(validate_registry); match id {\n");
+    for (name, _, _) in &integrations {
         generated.push_str(&format!(
             "{name:?} => {name}::connect(config).map(|inner| logged_connector({name:?}, inner)),\n"
         ));

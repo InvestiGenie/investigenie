@@ -2,6 +2,7 @@ mod ai;
 mod ai_connectors;
 mod api;
 mod config;
+mod connector_dialect;
 mod data_connectors;
 mod logging;
 mod search;
