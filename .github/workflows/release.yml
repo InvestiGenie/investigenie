@@ -227,3 +227,48 @@ jobs:
             org.opencontainers.image.licenses=Apache-2.0
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  notify-slack:
+    name: Slack release notification
+    needs: [prepare, build, docker]
+    if: ${{ github.event_name == 'push' && needs.prepare.result == 'success' && needs.build.result == 'success' && needs.docker.result == 'success' }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Send release notes to #releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          SLACK_RELEASE_WEBHOOK_URL: ${{ secrets.SLACK_RELEASE_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SLACK_RELEASE_WEBHOOK_URL" ]]; then
+            echo "::notice title=Slack notification skipped::Configure the SLACK_RELEASE_WEBHOOK_URL Actions secret with an incoming webhook for #releases."
+            exit 0
+          fi
+
+          release_json="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json name,body,url,isPrerelease)"
+          release_name="$(jq -r '.name // empty' <<< "$release_json")"
+          release_url="$(jq -r '.url // empty' <<< "$release_json")"
+          release_notes="$(jq -r '.body // empty' <<< "$release_json")"
+          is_prerelease="$(jq -r '.isPrerelease' <<< "$release_json")"
+          release_name="${release_name:-$RELEASE_TAG}"
+          release_notes="${release_notes:-No release notes were provided.}"
+          release_kind="release"
+          if [[ "$is_prerelease" == "true" ]]; then
+            release_kind="pre-release"
+          fi
+
+          message="$(printf '*InvestiGenie %s (%s)*\n<%s|View release>\n\n%s' "$release_name" "$release_kind" "$release_url" "$release_notes")"
+          payload="$(jq -n --arg text "$message" '{text: $text, unfurl_links: false, unfurl_media: false}')"
+          response="$(curl --fail --silent --show-error \
+            --header 'Content-Type: application/json' \
+            --data "$payload" \
+            "$SLACK_RELEASE_WEBHOOK_URL")"
+          if [[ "$response" != "ok" ]]; then
+            echo "Slack did not accept the release notification." >&2
+            exit 1
+          fi

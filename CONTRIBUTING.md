@@ -74,7 +74,7 @@ npm run build:web
 1. Bump the Cargo workspace and frontend package versions and matching lock entries; update the workflow's manual tag default.
 2. Obtain approval for a short commit message and user-facing release notes. Save the approved notes in `.github/release-notes/<tag>.md` with What's Changed and a Full Changelog link; omit test-count boilerplate.
 3. Validate, commit, and push the approved annotated tag (`X.Y.Z` or `X.Y.Z-alpha`). Never move an existing release tag or launch duplicate runs.
-4. `.github/workflows/release.yml` checks out the tag, requires a non-empty notes file, and publishes that body when creating/updating the release. It builds Linux, Windows, and macOS archives and pushes `ghcr.io/investigenie/investigenie:<tag>` (`latest` for stable releases).
+4. `.github/workflows/release.yml` checks out the tag, requires a non-empty notes file, and publishes that body when creating/updating the release. It builds Linux, Windows, and macOS archives and pushes `ghcr.io/investigenie/investigenie:<tag>` (`latest` for stable releases). After all build jobs succeed on a tag push, it posts the release notes to Slack `#releases` when the `SLACK_RELEASE_WEBHOOK_URL` Actions secret is configured; manual dispatches do not notify.
 5. Verify the public notes, all three platform archives, Docker platform manifests/pull access, and workflow status before declaring the release complete. Report registry-permission limits explicitly; do not silently change package visibility.
 
 ## License
