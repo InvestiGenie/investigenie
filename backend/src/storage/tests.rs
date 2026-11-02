@@ -129,6 +129,7 @@ fn view(id: &str, source: &str) -> DataView {
         connection_id: source.to_owned(),
         index: "events".to_owned(),
         time_field: "timestamp".to_owned(),
+        explore_mode: ExploreMode::Logs,
         revision: String::new(),
     }
 }

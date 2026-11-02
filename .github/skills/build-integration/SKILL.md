@@ -36,7 +36,7 @@ Choose the native query language, read-only credentials, stable record identity,
 ## Descriptor and Configuration Rules
 
 - Supply `id`, `display_name`, `icon`, `query_language`, `description`, `connection_fields`, and `query` with the exact types expected by the shared contract. `icon` selects a bundled connector brand asset (`elasticsearch`, `clickhouse`, `bigquery`, `loki`, `prometheus`, `victorialogs`, or `victoriametrics`); missing or unsupported values fall back to the generic database icon.
-- `explore_modes` is optional descriptor metadata. Include `"metrics"` only when the connector implements metric-name discovery and bounded range queries; the UI must not infer chart support from a datasource ID or query language.
+- `explore_modes` is optional descriptor metadata. A saved Data View stores one advertised mode, and the API validates it against this list. Include `"metrics"` only when the connector implements metric-name discovery and bounded range queries; the UI must not infer chart support from a datasource ID or query language. Do not advertise Traces until the connector and trace-specific API/UI are implemented.
 - Include a required, editable, non-secret `url` field under the current UI contract. Validate the native endpoint and configuration in `connect`; do not bypass validation by leaving placeholders.
 - Field metadata includes `name`, `label`, `input_type`, `placeholder`, `required`, `secret`, and `editable`. Supported inputs are text, url, password, checkbox, and select. Use existing select options, groups, and `visible_when` patterns.
 - Mark API keys, passwords, bearer tokens, and sensitive usernames as secrets. Only advertise replacement with `editable: true` when supported.

@@ -28,7 +28,7 @@ use crate::data_connectors::{
 use crate::search::{SearchRequest, SearchWindow};
 use crate::storage::{
     AiConversationSummary, AiModelSummary, DataView, ResolvedConnection, Storage, StorageError,
-    StoredAiConversation, StoredAiConversationMessage, StoredAiModel, StoredConnection,
+    ExploreMode, StoredAiConversation, StoredAiConversationMessage, StoredAiModel, StoredConnection,
     MAX_AI_CONVERSATION_MESSAGES,
 };
 
@@ -58,6 +58,8 @@ struct CreateDataViewRequest {
     connection_id: String,
     index: String,
     time_field: String,
+    #[serde(default)]
+    explore_mode: Option<ExploreMode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -694,6 +696,20 @@ async fn validate_data_view(
 
     let _permit = acquire(state).await?;
     let connection = get_connection(state, &request.connection_id).await?;
+    let supported_modes = if connection.integration.explore_modes.is_empty() {
+        vec!["logs"]
+    } else {
+        connection.integration.explore_modes.clone()
+    };
+    let explore_mode = request.explore_mode.unwrap_or_else(|| {
+        supported_modes
+            .iter()
+            .find_map(|mode| ExploreMode::parse(mode))
+            .unwrap_or_default()
+    });
+    if !supported_modes.contains(&explore_mode.as_str()) {
+        return Err(ApiError::InvalidDataView);
+    }
     let time_field = validate_source(
         connection.connector.as_ref(),
         &request.index,
@@ -707,6 +723,7 @@ async fn validate_data_view(
             connection_id: request.connection_id,
             index: request.index,
             time_field,
+            explore_mode,
             revision: String::new(),
         },
         connection.record.revision,

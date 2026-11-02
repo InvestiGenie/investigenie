@@ -31,7 +31,7 @@ pub(super) struct Snapshot {
 impl Snapshot {
     fn empty() -> Self {
         Self {
-            version: 1,
+            version: 2,
             verifier: String::from_utf8(VERIFIER.to_vec()).unwrap(),
             connections: BTreeMap::new(),
             views: BTreeMap::new(),
@@ -45,8 +45,35 @@ impl Snapshot {
         }
     }
 
+    fn upgrade_legacy_explore_modes(&mut self) -> bool {
+        if self.version >= 2 {
+            return false;
+        }
+        let modes_by_integration = crate::data_connectors::registered()
+            .into_iter()
+            .filter_map(|descriptor| {
+                descriptor
+                    .explore_modes
+                    .first()
+                    .and_then(|mode| ExploreMode::parse(mode))
+                    .map(|mode| (descriptor.id.to_owned(), mode))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for view in self.views.values_mut() {
+            let mode = self
+                .connections
+                .get(&view.connection_id)
+                .and_then(|connection| modes_by_integration.get(&connection.integration_id))
+                .copied()
+                .unwrap_or_default();
+            view.explore_mode = mode;
+        }
+        self.version = 2;
+        true
+    }
+
     fn validate(&self) -> Result<(), StorageError> {
-        if self.version != 1 {
+        if !matches!(self.version, 1 | 2) {
             return Err(StorageError::Schema);
         }
         if self.verifier.as_bytes() != VERIFIER && self.verifier.as_bytes() != legacy_verifier() {
@@ -202,8 +229,12 @@ impl FileStorage {
         };
         if regular_path(&storage.root.join(SNAPSHOT_NAME), false)? {
             let mut snapshot = storage.load()?;
-            if snapshot.verifier.as_bytes() != VERIFIER {
+            let modes_changed = snapshot.upgrade_legacy_explore_modes();
+            let verifier_changed = snapshot.verifier.as_bytes() != VERIFIER;
+            if verifier_changed {
                 snapshot.verifier = String::from_utf8(VERIFIER.to_vec()).unwrap();
+            }
+            if verifier_changed || modes_changed {
                 if let Some(error) = storage.commit(&snapshot)? {
                     return Err(error);
                 }

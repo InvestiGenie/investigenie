@@ -814,6 +814,7 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
                 connection_id: "checkout".to_owned(),
                 index: "events".to_owned(),
                 time_field: "@timestamp".to_owned(),
+                explore_mode: crate::storage::ExploreMode::Logs,
                 revision: String::new(),
             },
             &revision,
@@ -1072,6 +1073,36 @@ async fn metric_routes_discover_names_bound_ranges_and_preserve_series() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     server.verify().await;
+}
+
+#[tokio::test]
+async fn data_view_rejects_explore_modes_not_advertised_by_the_connector() {
+    let (_directory, storage) = status_storage().await;
+    storage
+        .create_connection(StoredConnection {
+            id: "warehouse".to_owned(),
+            name: "Warehouse".to_owned(),
+            integration_id: "clickhouse".to_owned(),
+            config: serde_json::from_value(json!({"url":"http://127.0.0.1:8123"})).unwrap(),
+            revision: String::new(),
+        })
+        .await
+        .unwrap();
+    let error = validate_data_view(
+        &state(storage.clone()),
+        "warehouse-view".to_owned(),
+        CreateDataViewRequest {
+            name: "Warehouse events".to_owned(),
+            connection_id: "warehouse".to_owned(),
+            index: "events".to_owned(),
+            time_field: "created_at".to_owned(),
+            explore_mode: Some(crate::storage::ExploreMode::Metrics),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, ApiError::InvalidDataView));
+    assert!(storage.views().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1969,7 +2000,8 @@ async fn api_views_validate_before_writes_and_cascade_delete() {
                 name: "Logs view".to_owned(),
                 connection_id: source.to_owned(),
                 index: index.to_owned(),
-                time_field: field.to_owned()
+                time_field: field.to_owned(),
+                explore_mode: Some(crate::storage::ExploreMode::Logs),
             })
         )
         .await
@@ -1982,6 +2014,7 @@ async fn api_views_validate_before_writes_and_cascade_delete() {
             connection_id: "source".to_owned(),
             index: "logs".to_owned(),
             time_field: "timestamp".to_owned(),
+            explore_mode: Some(crate::storage::ExploreMode::Logs),
         })
     };
     let created = create_data_view(State(state.clone()), request())

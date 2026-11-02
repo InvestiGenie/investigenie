@@ -43,7 +43,7 @@ pub fn descriptor() -> IntegrationDescriptor {
             json!({"name":"tenant_id","label":"Tenant ID (optional)","input_type":"text","required":false,"secret":false,"editable":true,"placeholder":"X-Scope-OrgID"}),
         ],
         query: json!({"placeholder":"Enter a LogQL query, e.g. {app=\"api\"} |= \"error\"","default_query":"{}","field_query":"{query}","identifier_quote":"","help":"LogQL query runs against the selected Loki log dataset","document_mode":"inline","sort_requires_projection":false,"histogram_total_from_buckets":false,"schema_label":"Loki stream labels"}),
-        explore_modes: Vec::new(),
+        explore_modes: vec!["logs"],
     }
 }
 

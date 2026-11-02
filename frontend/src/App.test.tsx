@@ -115,7 +115,7 @@ describe('Discover', () => {
       id: 'prometheus',
       display_name: 'Prometheus',
       query_language: 'PromQL',
-      explore_modes: ['metrics'],
+      explore_modes: ['metrics' as const],
     };
     vi.spyOn(api, 'connections').mockResolvedValue([connectionFixture(prometheusIntegration)]);
     vi.spyOn(api, 'dataViews').mockResolvedValue([{ id: 'metrics-view', revision: 'r1', name: 'Service metrics', connection_id: 'source', index: 'metrics', time_field: '_time' }]);
@@ -148,6 +148,39 @@ describe('Discover', () => {
     expect(await screen.findByText('Tempo trace exploration is not available yet')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Logs' }));
     expect(await screen.findByRole('region', { name: 'Search results' })).toBeInTheDocument();
+  });
+
+  it('filters Logs and Metrics selectors by each saved Data View mode', async () => {
+    const prometheusIntegration = {
+      ...elasticsearchIntegration,
+      id: 'prometheus',
+      display_name: 'Prometheus',
+      query_language: 'PromQL',
+      explore_modes: ['metrics' as const],
+    };
+    vi.spyOn(api, 'connections').mockResolvedValue([
+      connectionFixture(elasticsearchIntegration, { id: 'logs-source', name: 'Logs source' }),
+      connectionFixture(prometheusIntegration, { id: 'metrics-source', name: 'Metrics source' }),
+    ]);
+    vi.spyOn(api, 'dataViews').mockResolvedValue([
+      { id: 'logs-view', revision: 'r1', name: 'Application logs', connection_id: 'logs-source', index: 'logs', time_field: '@timestamp', explore_mode: 'logs' },
+      { id: 'metrics-view', revision: 'r2', name: 'Service metrics', connection_id: 'metrics-source', index: 'metrics', time_field: '_time', explore_mode: 'metrics' },
+    ]);
+    vi.spyOn(api, 'fields').mockResolvedValue([{ name: '@timestamp', field_type: 'date', is_time_field: true }]);
+    vi.spyOn(api, 'search').mockResolvedValue({ took: 1, timed_out: false, total: 0, total_relation: 'eq', hits: [], histogram: [] });
+    vi.spyOn(api, 'metricNames').mockResolvedValue({ names: ['up'], truncated: false });
+    vi.spyOn(api, 'metricQuery').mockResolvedValue({ step_ms: 15_000, series: [], truncated: false });
+    renderExplore();
+
+    await screen.findByRole('region', { name: 'Search results' });
+    const logsPicker = screen.getByRole('combobox', { name: 'DATA VIEW' });
+    expect(within(logsPicker).getByRole('option', { name: 'Application logs' })).toBeInTheDocument();
+    expect(within(logsPicker).queryByRole('option', { name: 'Service metrics' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Metrics' }));
+    const metricsPicker = await screen.findByLabelText('Metric Data View');
+    expect(within(metricsPicker).getByRole('option', { name: 'Service metrics' })).toBeInTheDocument();
+    expect(within(metricsPicker).queryByRole('option', { name: 'Application logs' })).not.toBeInTheDocument();
   });
 
   it('renders an empty histogram for an applied week-long timeframe', async () => {
@@ -726,7 +759,7 @@ describe('Discover', () => {
       throw new Error(`Unexpected request: ${url}`);
     });
     renderExplore();
-    expect(await screen.findByRole('option', { name: 'No data views available' })).toBeInTheDocument();
+    expect(await screen.findByRole('option', { name: 'No log data views' })).toBeInTheDocument();
     expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/indices'))).toBe(false);
     fireEvent.click(screen.getByRole('button', { name: 'Data Views' }));
     fireEvent.click(screen.getByRole('button', { name: /Add data view/ }));

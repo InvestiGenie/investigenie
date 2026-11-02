@@ -37,6 +37,8 @@ export type QueryDescriptor = {
   schema_label: string;
 };
 
+export type ExploreMode = 'logs' | 'metrics' | 'traces';
+
 export type IntegrationDescriptor = {
   id: ConnectionType;
   display_name: string;
@@ -45,7 +47,7 @@ export type IntegrationDescriptor = {
   description: string;
   connection_fields: ConnectionField[];
   query: QueryDescriptor;
-  explore_modes?: string[];
+  explore_modes?: ExploreMode[];
 };
 
 export type ConnectionSummary = {
@@ -67,6 +69,7 @@ export type DataViewSummary = {
   connection_id: string;
   index: string;
   time_field: string;
+  explore_mode?: ExploreMode;
 };
 
 export type AIModelSummary = {

@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { api, type ConnectionSummary, type DataViewSummary, type FieldSummary, type IndexSummary } from './api';
+import { api, type ConnectionSummary, type DataViewSummary, type ExploreMode, type FieldSummary, type IndexSummary } from './api';
 import IntegrationIcon from './IntegrationIcon';
 import SearchableSelect from './SearchableSelect';
 import { errorMessage, formatCount } from './format';
@@ -25,12 +25,22 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
   const [connectionId, setConnectionId] = useState('');
   const [index, setIndex] = useState('');
   const [timeField, setTimeField] = useState('');
+  const [exploreMode, setExploreMode] = useState<ExploreMode>('logs');
   const [indices, setIndices] = useState<IndexSummary[]>([]);
   const [indicesLoading, setIndicesLoading] = useState(false);
   const [fields, setFields] = useState<FieldSummary[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const selectedConnection = connections.find((connection) => connection.id === connectionId);
+  const supportedModes: ExploreMode[] = selectedConnection?.integration.explore_modes?.length
+    ? selectedConnection.integration.explore_modes
+    : ['logs'];
+
+  function defaultMode(nextConnectionId: string): ExploreMode {
+    const modes = connections.find((connection) => connection.id === nextConnectionId)?.integration.explore_modes;
+    return modes?.[0] ?? 'logs';
+  }
 
   useEffect(() => {
     if (stage !== 'configure' || !connectionId) {
@@ -83,6 +93,7 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
     setConnectionId(view?.connection_id ?? '');
     setIndex(view?.index ?? '');
     setTimeField(view?.time_field ?? '');
+    setExploreMode(view?.explore_mode ?? defaultMode(view?.connection_id ?? ''));
     setStage('configure');
   }
 
@@ -93,7 +104,7 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
     setError('');
     setNotice('');
     try {
-      const request = { name: name.trim(), connection_id: connectionId, index, time_field: timeField };
+      const request = { name: name.trim(), connection_id: connectionId, index, time_field: timeField, explore_mode: exploreMode };
       if (editingViewId) await api.updateDataView(editingViewId, request, editingRevision);
       else await api.addDataView(request);
       await onDataViewsChange();
@@ -137,7 +148,7 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
           return <article className="data-view-row" key={view.id}>
             <IntegrationIcon integration={connection?.integration} />
             <div className="connection-info"><strong>{view.name}</strong><span>{connection?.name ?? 'Unavailable connection'} · {view.index}</span></div>
-            <span className="connection-kind">Time field · {view.time_field}</span>
+            <span className="connection-kind">{(view.explore_mode ?? defaultMode(view.connection_id)).toUpperCase()} Explore · {view.time_field}</span>
             <div className="connection-actions"><button className="edit-connection" aria-label={`Edit ${view.name}`} title={`Edit ${view.name}`} onClick={() => configureDataView(view)}>✎</button><button className="remove-connection" aria-label={`Remove ${view.name}`} title={`Remove ${view.name}`} onClick={() => void removeDataView(view)}>×</button></div>
           </article>;
         })}</div>}
@@ -150,7 +161,7 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
         : <form className="connection-form" onSubmit={(event) => void createDataView(event)}>
           <div className="form-grid">
             <label>Data view name<input required maxLength={64} value={name} onChange={(event) => setName(event.target.value)} placeholder="Application logs" /></label>
-            <label>Connection<select required value={connectionId} onChange={(event) => { setConnectionId(event.target.value); setIndex(''); setTimeField(''); setError(''); }}><option value="">Select a connection</option>{connections.map((connection) => <option key={connection.id} value={connection.id}>{connection.name}</option>)}</select></label>
+            <label>Connection<select required value={connectionId} onChange={(event) => { setConnectionId(event.target.value); setExploreMode(defaultMode(event.target.value)); setIndex(''); setTimeField(''); setError(''); }}><option value="">Select a connection</option>{connections.map((connection) => <option key={connection.id} value={connection.id}>{connection.name}</option>)}</select></label>
             <div className="form-field"><span className="form-field-label" aria-hidden="true">Index / table</span><SearchableSelect
               label="Index / table"
               value={index}
@@ -169,6 +180,10 @@ export default function DataViewsPage({ connections, dataViews, onDataViewsChang
               onChange={(value) => { setIndex(value); setTimeField(''); setError(''); }}
             /></div>
             <label>Time series time field<select required value={timeField} disabled={!index || fields.filter(isTimeField).length === 0} onChange={(event) => setTimeField(event.target.value)}><option value="">Select a date/time field</option>{fields.filter(isTimeField).map((field) => <option key={field.name} value={field.name}>{field.name} · {field.field_type}</option>)}</select></label>
+            <label>Explore in<select aria-label="Explore mode" required value={exploreMode} disabled={!connectionId} onChange={(event) => setExploreMode(event.target.value as ExploreMode)}>
+              {supportedModes.map((mode) => <option key={mode} value={mode}>{mode === 'logs' ? 'Logs' : mode === 'metrics' ? 'Metrics' : 'Traces'}</option>)}
+              {!supportedModes.includes('traces') && <option value="traces" disabled>Traces (Tempo not connected)</option>}
+            </select></label>
           </div>
           {index && fields.length > 0 && fields.filter(isTimeField).length === 0 && <p className="connections-empty">The selected source has no date/time fields; this index/table cannot be used for a time-series data view.</p>}
           <div className="connection-form-footer"><span>InvestiGenie data views</span><button className="search-button" type="submit" disabled={busy || !connectionId || !fields.some((field) => field.name === timeField && isTimeField(field))}>{busy ? <span className="spinner" /> : <span aria-hidden="true">＋</span>}{busy ? 'Validating' : editingViewId ? 'Save changes' : 'Create data view'}</button></div>

@@ -112,6 +112,7 @@ fn view(id: &str, connection_id: &str) -> DataView {
         connection_id: connection_id.to_owned(),
         index: "events".to_owned(),
         time_field: "timestamp".to_owned(),
+        explore_mode: ExploreMode::Logs,
         revision: String::new(),
     }
 }
@@ -223,12 +224,42 @@ async fn ai_model_secrets_are_encrypted_and_profiles_survive_reopen() {
 #[test]
 fn version_one_snapshots_without_optional_collections_remain_readable() {
     let mut snapshot = serde_json::to_value(Snapshot::empty()).unwrap();
+    snapshot["version"] = json!(1);
     snapshot.as_object_mut().unwrap().remove("ai_models");
     snapshot.as_object_mut().unwrap().remove("knowledge");
+    for (id, integration_id) in [
+        ("logs-source", "clickhouse"),
+        ("metrics-source", "prometheus"),
+    ] {
+        let mut connection = record(id);
+        connection.integration_id = integration_id.to_owned();
+        connection.revision = Uuid::new_v4().to_string();
+        let mut view = view(&format!("{id}-view"), id);
+        view.name = format!("{id} view");
+        view.revision = Uuid::new_v4().to_string();
+        snapshot["connections"][id] = serde_json::to_value(connection).unwrap();
+        let view_value = serde_json::to_value(view).unwrap();
+        let mut view_object = view_value.as_object().unwrap().clone();
+        view_object.remove("explore_mode");
+        snapshot["views"][format!("{id}-view")] = Value::Object(view_object);
+    }
     let snapshot: Snapshot = serde_json::from_value(snapshot).unwrap();
     assert!(snapshot.ai_models.is_empty());
     assert!(snapshot.knowledge.is_empty());
     assert!(snapshot.validate().is_ok());
+
+    let mut snapshot = snapshot;
+    assert!(snapshot.upgrade_legacy_explore_modes());
+    assert_eq!(snapshot.version, 2);
+    assert_eq!(
+        snapshot.views["logs-source-view"].explore_mode,
+        ExploreMode::Logs
+    );
+    assert_eq!(
+        snapshot.views["metrics-source-view"].explore_mode,
+        ExploreMode::Metrics
+    );
+    assert!(!snapshot.upgrade_legacy_explore_modes());
 }
 
 #[tokio::test]
@@ -480,7 +511,7 @@ async fn invalid_snapshot_schema_records_references_names_and_settings_are_not_o
     snapshot.views.insert(events.id.clone(), events);
     let mut invalid = Vec::new();
     let mut changed = snapshot.clone();
-    changed.version = 2;
+    changed.version = 3;
     invalid.push(changed);
     let mut changed = snapshot.clone();
     changed.verifier.clear();

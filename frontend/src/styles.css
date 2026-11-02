@@ -666,9 +666,10 @@ th[aria-sort="ascending"] .column-sort-button, th[aria-sort="descending"] .colum
 .explore-mode-switch button.active { color: var(--ink); background: var(--paper); box-shadow: 0 1px 3px #16251f22; }
 .metric-explore { grid-column: 1 / -1; grid-row: 2; min-width: 0; }
 .metric-query-panel { margin-bottom: 14px; background: var(--paper); border: 1px solid var(--line); border-radius: 6px; }
-.metric-query-controls { min-height: 48px; display: grid; grid-template-columns: minmax(180px, 1fr) auto minmax(112px, 140px); align-items: center; gap: 10px; padding: 7px 10px; border-bottom: 1px solid var(--line); }
-.metric-view-control, .metric-step-control { min-width: 0; display: grid; gap: 4px; color: var(--muted); font: 500 9px var(--mono); }
-.metric-view-control select, .metric-step-control select { min-width: 0; width: 100%; height: 30px; padding: 0 7px; color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 4px; font: 11px 'DM Sans', 'Segoe UI', sans-serif; }
+.metric-query-controls { min-height: 48px; gap: 8px 10px; padding: 6px 10px; }
+.metric-query-controls .time-window { margin-left: auto; }
+.metric-step-control { min-width: 0; display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font: 500 9px var(--mono); }
+.metric-step-control select { min-width: 112px; height: 30px; padding: 0 7px; color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 4px; font: 11px 'DM Sans', 'Segoe UI', sans-serif; }
 .metric-query-form { min-height: 46px; display: grid; grid-template-columns: minmax(150px, 230px) minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 7px 9px; }
 .metric-query-form select, .metric-query-form input { width: 100%; min-width: 0; height: 34px; padding: 0 9px; color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 4px; font: 11px var(--mono); }
 .metric-query-form input::placeholder { color: var(--muted); }
@@ -711,7 +712,6 @@ th[aria-sort="ascending"] .column-sort-button, th[aria-sort="descending"] .colum
 :root[data-theme="dark"] .metric-query-panel { background: var(--paper); border-color: var(--line); }
 :root[data-theme="dark"] .metric-query-form select,
 :root[data-theme="dark"] .metric-query-form input,
-:root[data-theme="dark"] .metric-view-control select,
 :root[data-theme="dark"] .metric-step-control select,
 :root[data-theme="dark"] .metric-browser-row select,
 :root[data-theme="dark"] .metric-browser-row input { color: var(--ink); background: var(--paper); border-color: var(--line); }
@@ -721,14 +721,14 @@ th[aria-sort="ascending"] .column-sort-button, th[aria-sort="descending"] .colum
 :root[data-theme="dark"] .metric-result-toggle button[aria-pressed="true"] { background: var(--paper); }
 @media (max-width: 1000px) {
   .explore-mode-switch, .metric-explore, .metric-empty-state, .trace-explore-state { grid-column: 1; }
-  .metric-query-controls { grid-template-columns: minmax(0, 1fr) minmax(112px, 140px); }
-  .metric-query-controls .time-window { grid-column: 1 / -1; justify-self: end; }
 }
 @media (max-width: 620px) {
   .explore-mode-switch { width: 100%; }
   .explore-mode-switch button { min-width: 0; flex: 1; }
-  .metric-query-controls { grid-template-columns: minmax(0, 1fr); }
-  .metric-query-controls .time-window { grid-column: 1; justify-self: stretch; }
+  .metric-query-controls { justify-content: space-between; }
+  .metric-query-controls .select-label { flex: 0 0 auto; }
+  .metric-query-controls #metric-data-view-select { max-width: min(52vw, 260px); }
+  .metric-query-controls .time-window { width: 100%; margin-left: 0; justify-content: flex-end; }
   .metric-query-controls .time-range-trigger { width: 100%; justify-content: flex-start; }
   .metric-query-form { grid-template-columns: minmax(0, 1fr); }
   .metric-query-form .search-button { width: 100%; }

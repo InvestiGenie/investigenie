@@ -158,7 +158,7 @@ export default function MetricsExplore({
 }: MetricsExploreProps) {
   const metricViews = dataViews.filter((view) => {
     const connection = connections.find((candidate) => candidate.id === view.connection_id);
-    return connection?.integration.explore_modes?.includes('metrics');
+    return (view.explore_mode ?? connection?.integration.explore_modes?.[0] ?? 'logs') === 'metrics';
   });
   const [selectedViewId, setSelectedViewId] = useState('');
   const [query, setQuery] = useState('');
@@ -268,15 +268,14 @@ export default function MetricsExplore({
 
   return <section className="metric-explore" aria-label="Metrics Explore">
     <div className="metric-query-panel">
-      <div className="metric-query-controls">
-        <label className="metric-view-control">METRIC DATA VIEW
-          <select aria-label="Metric Data View" value={selectedView?.id ?? ''} onChange={(event) => { setSelectedViewId(event.target.value); setResult(null); }}>
-            {!metricViews.length && <option value="">No metric data views</option>}
-            {metricViews.map((view) => <option key={view.id} value={view.id}>{view.name}</option>)}
-          </select>
-        </label>
+      <div className="query-topline metric-query-controls">
+        <label className="select-label" htmlFor="metric-data-view-select">DATA VIEW</label>
+        <select id="metric-data-view-select" aria-label="Metric Data View" value={selectedView?.id ?? ''} onChange={(event) => { setSelectedViewId(event.target.value); setResult(null); }}>
+          {!metricViews.length && <option value="">No metric data views</option>}
+          {metricViews.map((view) => <option key={view.id} value={view.id}>{view.name}</option>)}
+        </select>
         <TimeRangePicker start={startDate} end={endDate} timeZone={timeZone} onTimeZoneChange={onTimeZoneChange} onChange={onTimeRangeChange} />
-        <label className="metric-step-control">STEP
+        <label className="metric-step-control"><span>STEP</span>
           <select aria-label="Metric query step" value={stepMs} onChange={(event) => setStepMs(Number(event.target.value))}>
             {METRIC_STEPS.map((step) => <option key={step.value} value={step.value} disabled={!appliedRange || Math.floor((appliedRange.end - appliedRange.start) / step.value) + 1 > 500}>{step.label}</option>)}
           </select>

@@ -229,7 +229,11 @@ export default function App() {
     return () => controller.abort();
   }, []);
 
-  const selectedDataView = dataViews.find((view) => view.id === selectedDataViewId);
+  const logDataViews = dataViews.filter((view) => {
+    const source = connections.find((connection) => connection.id === view.connection_id);
+    return (view.explore_mode ?? source?.integration.explore_modes?.[0] ?? 'logs') === 'logs';
+  });
+  const selectedDataView = logDataViews.find((view) => view.id === selectedDataViewId) ?? logDataViews[0];
   const selectedConnectionId = selectedDataView?.connection_id ?? '';
   const selectedIndex = selectedDataView?.index ?? '';
   const selectedConnection = connections.find((connection) => connection.id === selectedConnectionId);
@@ -561,9 +565,9 @@ export default function App() {
             <section className="query-panel" aria-label="Search controls">
               <div className="query-topline">
                 <label className="select-label" htmlFor="data-view-select">DATA VIEW</label>
-                <select id="data-view-select" value={selectedDataViewId} onChange={(event) => { setSelectedDataViewId(event.target.value); setQuery(''); setSortBy(''); setSortOrder('desc'); setBreakdownField(''); setResults(null); }}>
-                  {dataViews.length === 0 && <option value="">No data views available</option>}
-                  {dataViews.map((view) => <option key={view.id} value={view.id}>{view.name}</option>)}
+                <select id="data-view-select" value={selectedDataView?.id ?? ''} onChange={(event) => { setSelectedDataViewId(event.target.value); setQuery(''); setSortBy(''); setSortOrder('desc'); setBreakdownField(''); setResults(null); }}>
+                  {logDataViews.length === 0 && <option value="">No log data views</option>}
+                  {logDataViews.map((view) => <option key={view.id} value={view.id}>{view.name}</option>)}
                 </select>
                 <TimeRangePicker start={startDate} end={endDate} timeZone={timeZone} onTimeZoneChange={setTimeZone} onChange={(start, end) => { setStartDate(start); setEndDate(end); setError(''); }} />
               </div>

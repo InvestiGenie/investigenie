@@ -60,7 +60,7 @@ describe('DataViewsPage', () => {
     expect(updates).toHaveLength(1);
     expect(updates[0][1]).toMatchObject({ headers: { 'If-Match': '"original-revision"' } });
     expect(JSON.parse(String(updates[0][1]?.body))).toEqual({
-      name: 'Draft logs', connection_id: 'logs-source', index: 'logs', time_field: 'event_time',
+      name: 'Draft logs', connection_id: 'logs-source', index: 'logs', time_field: 'event_time', explore_mode: 'logs',
     });
     expect(vi.mocked(fetch)).toHaveBeenCalledTimes(3);
     if (conflict) {
@@ -163,7 +163,7 @@ describe('DataViewsPage', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('Data view validated and created.');
     const createCall = vi.mocked(fetch).mock.calls.find(([, init]) => init?.method === 'POST');
     expect(JSON.parse(String(createCall?.[1]?.body))).toEqual({
-      name: 'Daily logs', connection_id: 'logs-source', index: 'logs-*,metrics-*', time_field: 'timestamp',
+      name: 'Daily logs', connection_id: 'logs-source', index: 'logs-*,metrics-*', time_field: 'timestamp', explore_mode: 'logs',
     });
   });
 
@@ -177,7 +177,7 @@ describe('DataViewsPage', () => {
     expect(refresh).toHaveBeenCalledOnce();
     const createCall = vi.mocked(fetch).mock.calls.find(([, init]) => init?.method === 'POST');
     expect(JSON.parse(String(createCall?.[1]?.body))).toEqual({
-      name: 'Application logs', connection_id: 'logs-source', index: 'logs', time_field: 'timestamp',
+      name: 'Application logs', connection_id: 'logs-source', index: 'logs', time_field: 'timestamp', explore_mode: 'logs',
     });
   });
 
@@ -216,7 +216,7 @@ describe('DataViewsPage', () => {
     expect(String(updateCall?.[0])).toContain('/api/data-views/application-logs');
     expect(updateCall?.[1]).toMatchObject({ headers: { 'If-Match': '"view-revision"' } });
     expect(JSON.parse(String(updateCall?.[1]?.body))).toEqual({
-      name: 'Renamed logs', connection_id: 'logs-source', index: 'logs', time_field: 'event_time',
+      name: 'Renamed logs', connection_id: 'logs-source', index: 'logs', time_field: 'event_time', explore_mode: 'logs',
     });
     expect(refresh).toHaveBeenCalledOnce();
     expect(screen.queryByLabelText('Data view name')).not.toBeInTheDocument();
@@ -237,6 +237,30 @@ describe('DataViewsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(screen.getByRole('button', { name: 'Edit Application logs' })).toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('defaults metric Data Views to Metrics and persists the selected Explore mode', async () => {
+    const metricsConnection = connectionFixture({
+      ...elasticsearchIntegration,
+      id: 'prometheus',
+      display_name: 'Prometheus',
+      query_language: 'PromQL',
+      explore_modes: ['metrics'],
+    });
+    const refresh = vi.fn().mockResolvedValue(undefined);
+    render(<DataViewsPage connections={[metricsConnection]} dataViews={[]} onDataViewsChange={refresh} />);
+    fireEvent.click(screen.getByRole('button', { name: /Add data view/ }));
+    fireEvent.change(screen.getByLabelText('Data view name'), { target: { value: 'Service metrics' } });
+    fireEvent.change(screen.getByLabelText('Connection'), { target: { value: 'source' } });
+    fireEvent.click(screen.getByRole('combobox', { name: 'Index / table' }));
+    fireEvent.click(await screen.findByRole('option', { name: 'logs' }));
+    await waitFor(() => expect(screen.getByLabelText('Time series time field')).toHaveValue('timestamp'));
+    expect(screen.getByLabelText('Explore mode')).toHaveValue('metrics');
+    expect(within(screen.getByLabelText('Explore mode')).getByRole('option', { name: 'Traces (Tempo not connected)' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Create data view' }));
+    await screen.findByRole('status');
+    const createCall = vi.mocked(fetch).mock.calls.find(([, init]) => init?.method === 'POST');
+    expect(JSON.parse(String(createCall?.[1]?.body))).toMatchObject({ explore_mode: 'metrics' });
   });
 
   it('removes a saved view and refreshes the list', async () => {

@@ -36,7 +36,7 @@ Responses are JSON except for no-content deletes such as knowledge deletion (204
 | `POST /api/connections/{id}/search` | Documents + histogram. |
 | `GET /api/connections/{id}/indices/{index}/metrics/names` | Metric names for a Metrics-capable connector; capped at 500 with a `truncated` flag. |
 | `POST /api/connections/{id}/metrics/query` | Bounded metric range query; not subject to document paging. |
-| `/api/data-views[/{id}]` | Data View CRUD; validated against the source. |
+| `/api/data-views[/{id}]` | Data View CRUD; persists `explore_mode` (`logs`, `metrics`, or `traces`) and validates it against the connector's advertised modes. Omitted modes default to the connector's first advertised mode, or Logs. |
 | `GET, POST /api/knowledge` | List `{entries}` or create `{entry}` (201). |
 | `GET, PUT, DELETE /api/knowledge/{id}` | Read/update `{entry}` or delete (204); updates/deletes require quoted `If-Match`. |
 | `/api/ai/models[/{id}]` | AI model profiles; tested before save; the key is never returned. |
@@ -144,7 +144,7 @@ path = "data"
 
 Quickstart (no persistence mode, encryption key, or database URL) generates a key beside the data. The example uses `data/`; deployments without a file retain the executable-relative default. Keep private TOML files out of Git and Docker build contexts; datasource and AI credentials still belong in the UI/API, not TOML. `VITE_API_BASE_URL` remains an explicit process-environment build-time override, not a backend TOML field. Playground `.env` files configure Compose/seeding and are separate from application configuration.
 
-Run `investigenie-api migrate` after upgrading a PostgreSQL-backed deployment, including the `202610230001_knowledge.sql` migration for knowledge entries. Filesystem snapshots add optional history and knowledge maps compatibly when next written.
+Run `investigenie-api migrate` after upgrading a PostgreSQL-backed deployment, including `202610230001_knowledge.sql` for knowledge entries and `202611020001_explore_mode.sql` for per-Data View Explore modes. The latter defaults existing views to Logs and backfills Prometheus/VictoriaMetrics views to Metrics. Version-1 filesystem snapshots receive a one-time mode upgrade from each connection's advertised primary Explore mode when loaded; subsequent saves preserve the user's choice. Filesystem snapshots also add optional history and knowledge maps compatibly when next written.
 
 ## Tests
 

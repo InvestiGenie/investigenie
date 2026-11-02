@@ -1941,6 +1941,7 @@ mod tests {
             connection_id: "source".to_owned(),
             index: "events".to_owned(),
             time_field: "timestamp".to_owned(),
+            explore_mode: crate::storage::ExploreMode::Logs,
             revision: "r1".to_owned(),
         }
     }
@@ -2536,6 +2537,7 @@ mod tests {
             connection_id: "ch".to_owned(),
             index: "database.events".to_owned(),
             time_field: "timestamp".to_owned(),
+            explore_mode: crate::storage::ExploreMode::Logs,
             revision: "r1".to_owned(),
         };
         let filters = vec![PlannedFilter {

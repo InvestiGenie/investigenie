@@ -280,7 +280,37 @@ pub struct DataView {
     pub connection_id: String,
     pub index: String,
     pub time_field: String,
+    #[serde(default)]
+    pub explore_mode: ExploreMode,
     pub revision: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExploreMode {
+    #[default]
+    Logs,
+    Metrics,
+    Traces,
+}
+
+impl ExploreMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Logs => "logs",
+            Self::Metrics => "metrics",
+            Self::Traces => "traces",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "logs" => Some(Self::Logs),
+            "metrics" => Some(Self::Metrics),
+            "traces" => Some(Self::Traces),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -521,12 +551,15 @@ fn descriptor(id: &str) -> Result<IntegrationDescriptor, StorageError> {
         .ok_or(StorageError::Configuration)
 }
 fn decode_view(row: PgRow) -> Result<DataView, StorageError> {
+    let explore_mode_value: String = row.try_get("explore_mode")?;
+    let explore_mode = ExploreMode::parse(&explore_mode_value).ok_or(StorageError::Schema)?;
     Ok(DataView {
         id: row.try_get("id")?,
         name: row.try_get("name")?,
         connection_id: row.try_get("connection_id")?,
         index: row.try_get("index_name")?,
         time_field: row.try_get("time_field")?,
+        explore_mode,
         revision: row.try_get("revision")?,
     })
 }
@@ -908,11 +941,11 @@ impl Storage {
         let revision = revision();
         if let Some(expected) = expected_view {
             Self::checked_view(&mut transaction, &view.id, expected).await?;
-            sqlx::query("UPDATE data_views SET name=$2, connection_id=$3, index_name=$4, time_field=$5, revision=$6 WHERE id=$1")
-                .bind(view.id).bind(view.name).bind(view.connection_id).bind(view.index).bind(view.time_field).bind(&revision).execute(&mut *transaction).await?;
+            sqlx::query("UPDATE data_views SET name=$2, connection_id=$3, index_name=$4, time_field=$5, explore_mode=$6, revision=$7 WHERE id=$1")
+                .bind(view.id).bind(view.name).bind(view.connection_id).bind(view.index).bind(view.time_field).bind(view.explore_mode.as_str()).bind(&revision).execute(&mut *transaction).await?;
         } else {
-            sqlx::query("INSERT INTO data_views (id,name,connection_id,index_name,time_field,revision) VALUES ($1,$2,$3,$4,$5,$6)")
-                .bind(view.id).bind(view.name).bind(view.connection_id).bind(view.index).bind(view.time_field).bind(&revision).execute(&mut *transaction).await?;
+            sqlx::query("INSERT INTO data_views (id,name,connection_id,index_name,time_field,explore_mode,revision) VALUES ($1,$2,$3,$4,$5,$6,$7)")
+                .bind(view.id).bind(view.name).bind(view.connection_id).bind(view.index).bind(view.time_field).bind(view.explore_mode.as_str()).bind(&revision).execute(&mut *transaction).await?;
         }
         transaction.commit().await?;
         Ok(revision)
