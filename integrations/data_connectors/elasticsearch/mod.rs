@@ -50,6 +50,7 @@ pub fn descriptor() -> IntegrationDescriptor {
             json!({"name":"tls_insecure","label":"Skip TLS verification","input_type":"checkbox","required":false,"secret":false,"editable":false,"group":"authentication","placeholder":""}),
         ],
         query: json!({"placeholder":"Enter a Lucene query, e.g. response.status_code:500","default_query":"","field_query":"{query} AND {field}:","identifier_quote":"","help":"Lucene query runs against the selected Elasticsearch data view","document_mode":"lookup","sort_requires_projection":false,"histogram_total_from_buckets":false,"schema_label":"Elasticsearch mappings"}),
+        explore_modes: Vec::new(),
     }
 }
 

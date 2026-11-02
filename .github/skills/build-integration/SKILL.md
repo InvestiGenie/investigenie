@@ -36,6 +36,7 @@ Choose the native query language, read-only credentials, stable record identity,
 ## Descriptor and Configuration Rules
 
 - Supply `id`, `display_name`, `icon`, `query_language`, `description`, `connection_fields`, and `query` with the exact types expected by the shared contract. `icon` selects a bundled connector brand asset (`elasticsearch`, `clickhouse`, `bigquery`, `loki`, `prometheus`, `victorialogs`, or `victoriametrics`); missing or unsupported values fall back to the generic database icon.
+- `explore_modes` is optional descriptor metadata. Include `"metrics"` only when the connector implements metric-name discovery and bounded range queries; the UI must not infer chart support from a datasource ID or query language.
 - Include a required, editable, non-secret `url` field under the current UI contract. Validate the native endpoint and configuration in `connect`; do not bypass validation by leaving placeholders.
 - Field metadata includes `name`, `label`, `input_type`, `placeholder`, `required`, `secret`, and `editable`. Supported inputs are text, url, password, checkbox, and select. Use existing select options, groups, and `visible_when` patterns.
 - Mark API keys, passwords, bearer tokens, and sensitive usernames as secrets. Only advertise replacement with `editable: true` when supported.
@@ -61,6 +62,7 @@ Choose the native query language, read-only credentials, stable record identity,
 - `indices`: list datasets as `IndexSummary`, with optional document-count and health strings. Avoid an unbounded scan of every record to enumerate datasets.
 - `fields`: expose selectable leaf fields with native type strings and accurate `is_time_field`. Do not label arbitrary strings/numbers as timestamps without defined conversion semantics. Data Views require a valid time field.
 - `search`: honor query, dataset, sorting, pagination, time filtering, and histogram options. Filtering and sorting happen before pagination.
+- `metric_names` / `metric_query`: optional Metrics Explore methods. The catalog is capped at 500 names. Range queries require a bounded nonnegative `TimeRange`, an 8 KiB maximum query, a 1-second to 1-day step, and at most 500 evaluation points; responses cap at 50 series × 500 points per series. Preserve labels/timestamps, serialize non-finite samples as null gaps, and set `truncated` when either response cap drops data. This contract is separate from document `SearchWindow` paging.
 - `document`: for lookup return `{index,id,found,source}`; missing documents use `found:false` and `source:null`. Inline adapters may reject lookup consistently.
 - Search results contain `took`, `timed_out`, `total`, `total_relation`, `hits`, and `histogram`. Hits have string `index`/`id`, nullable numeric `score`, and object/null `source`. Preserve JSON numbers, booleans, arrays, nesting, and explicit-offset date strings.
 - IDs must identify records consistently across pages and support every advertised lookup capability. Position-based SQL IDs are only presentation IDs, not persistent event identities; document that limitation.

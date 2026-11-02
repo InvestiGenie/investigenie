@@ -50,6 +50,7 @@ pub fn descriptor() -> IntegrationDescriptor {
             serde_json::json!({"name":"password","label":"Password","input_type":"password","required":false,"secret":true,"editable":true,"group":"credentials","placeholder":""}),
         ],
         query: serde_json::json!({"placeholder":"SELECT * FROM {index} LIMIT 50","default_query":"SELECT * FROM {index} LIMIT 50","field_query":"SELECT {field} FROM {index}","identifier_quote":"`","help":"Read-only SQL runs against the selected ClickHouse table","document_mode":"inline","sort_requires_projection":true,"histogram_total_from_buckets":true,"schema_label":"ClickHouse table schema"}),
+        explore_modes: Vec::new(),
     }
 }
 

@@ -5,7 +5,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::data_connectors::IntegrationDescriptor;
+use crate::data_connectors::{
+    metric_result_from_matrix, IntegrationDescriptor, MetricNames, MetricQueryRequest,
+    MetricQueryResult, MAX_METRIC_POINTS,
+};
 use crate::search::{
     BreakdownCount, HistogramInterval, TimeRange, BREAKDOWN_OTHER_KEY, MAX_BREAKDOWN_VALUES,
 };
@@ -24,6 +27,7 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_SAMPLES: usize = 50_000;
 const MAX_PAGE_SIZE: usize = 100;
+const MAX_METRIC_NAMES: usize = 500;
 
 pub fn descriptor() -> IntegrationDescriptor {
     IntegrationDescriptor {
@@ -38,6 +42,7 @@ pub fn descriptor() -> IntegrationDescriptor {
             json!({"name":"password","label":"Password","input_type":"password","required":false,"secret":true,"editable":true,"group":"credentials","placeholder":""}),
         ],
         query: json!({"placeholder":"Enter a PromQL expression, e.g. rate(http_requests_total[5m])","default_query":"{__name__!=\"\"}","field_query":"{query}","identifier_quote":"","help":"PromQL range queries return evaluated samples at a bounded step; missing samples may be filled by Prometheus lookback semantics","document_mode":"inline","sort_requires_projection":false,"histogram_total_from_buckets":true,"schema_label":"Prometheus labels"}),
+        explore_modes: vec!["metrics"],
     }
 }
 
@@ -200,6 +205,46 @@ impl PrometheusClient {
         Ok(fields)
     }
 
+    pub async fn metric_names(&self, index: &str) -> Result<MetricNames, PrometheusError> {
+        validate_index(index)?;
+        let response = self
+            .request("api/v1/label/__name__/values")?
+            .query(&[("timeout", QUERY_TIMEOUT)])
+            .send()
+            .await
+            .map_err(|_| PrometheusError::Request)?;
+        let body = read_bounded(response).await?;
+        let response: Value =
+            serde_json::from_slice(&body).map_err(|_| PrometheusError::InvalidResponse)?;
+        validate_success(&response)?;
+        let data = response
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or(PrometheusError::InvalidResponse)?;
+        let mut names = data
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names.dedup();
+        let truncated = names.len() > MAX_METRIC_NAMES;
+        names.truncate(MAX_METRIC_NAMES);
+        Ok(MetricNames { names, truncated })
+    }
+
+    pub async fn metric_query(
+        &self,
+        request: MetricQueryRequest,
+    ) -> Result<MetricQueryResult, PrometheusError> {
+        validate_index(&request.index)?;
+        validate_metric_request(&request)?;
+        let matrix = self
+            .query_range(&request.query, request.time_range, request.step_ms)
+            .await?;
+        metric_result_from_matrix(&request, &matrix).map_err(|_| PrometheusError::InvalidResponse)
+    }
+
     pub async fn search(
         &self,
         request: crate::search::SearchRequest,
@@ -208,14 +253,20 @@ impl PrometheusClient {
         if request.size == 0 || request.size > MAX_PAGE_SIZE {
             return Err(PrometheusError::InvalidQuery);
         }
-        if request.time_range.is_some_and(|range| !range.is_valid() || range.start < 0) {
+        if request
+            .time_range
+            .is_some_and(|range| !range.is_valid() || range.start < 0)
+        {
             return Err(PrometheusError::InvalidQuery);
         }
         let offset = cursor_offset(request.cursor.as_deref(), request.from)?;
         let options = request
             .histogram_options()
             .map_err(|_| PrometheusError::InvalidQuery)?;
-        if request.sort_order.as_deref().is_some_and(|order| order != "asc" && order != "desc")
+        if request
+            .sort_order
+            .as_deref()
+            .is_some_and(|order| order != "asc" && order != "desc")
             || request
                 .sort_by
                 .as_deref()
@@ -263,9 +314,11 @@ impl PrometheusClient {
             .breakdown_field
             .as_deref()
             .filter(|_| wants_histogram);
-        let time_sorted = request.sort_by.as_deref().is_none_or(|field| field == "_time");
-        let descending =
-            request.sort_by.is_none() || request.sort_order.as_deref() == Some("desc");
+        let time_sorted = request
+            .sort_by
+            .as_deref()
+            .is_none_or(|field| field == "_time");
+        let descending = request.sort_by.is_none() || request.sort_order.as_deref() == Some("desc");
 
         // Count evaluated samples per step on the server so totals and histograms never need every row.
         let counts = match breakdown_field {
@@ -348,7 +401,8 @@ impl PrometheusClient {
             "histogram": histogram,
         });
         if wants_histogram {
-            result["histogram_interval"] = json!(format!("{}{}", interval.count, interval.suffix()));
+            result["histogram_interval"] =
+                json!(format!("{}{}", interval.count, interval.suffix()));
         }
         if let Some(cursor) = next_cursor {
             result["next_cursor"] = json!(cursor);
@@ -470,6 +524,26 @@ impl PrometheusClient {
     }
 }
 
+fn validate_metric_request(request: &MetricQueryRequest) -> Result<(), PrometheusError> {
+    if request.query.trim().is_empty()
+        || request.query.len() > MAX_QUERY_BYTES
+        || request.query.contains(';')
+        || !request.time_range.is_valid()
+        || request.time_range.start < 0
+        || !(1_000..=86_400_000).contains(&request.step_ms)
+        || request
+            .time_range
+            .end
+            .saturating_sub(request.time_range.start)
+            / request.step_ms
+            + 1
+            > MAX_METRIC_POINTS as i64
+    {
+        return Err(PrometheusError::InvalidQuery);
+    }
+    Ok(())
+}
+
 fn validate_index(index: &str) -> Result<(), PrometheusError> {
     if index == "metrics" {
         Ok(())
@@ -483,7 +557,9 @@ fn cursor_offset(cursor: Option<&str>, from: usize) -> Result<u64, PrometheusErr
         None if from <= 10_000 => Ok(from as u64),
         Some("") => Ok(0),
         Some(token) if token.len() <= 15 && token.bytes().all(|byte| byte.is_ascii_digit()) => {
-            token.parse::<u64>().map_err(|_| PrometheusError::InvalidQuery)
+            token
+                .parse::<u64>()
+                .map_err(|_| PrometheusError::InvalidQuery)
         }
         _ => Err(PrometheusError::InvalidQuery),
     }
@@ -697,7 +773,9 @@ fn weighted_histogram(
     }
     let mut buckets = BTreeMap::<i64, BucketCounts>::new();
     for index in 0..bucket_count {
-        let timestamp = range.start.saturating_add(index.saturating_mul(step_millis));
+        let timestamp = range
+            .start
+            .saturating_add(index.saturating_mul(step_millis));
         buckets.insert(timestamp, BucketCounts::default());
     }
     let mut key_totals = HashMap::<String, u64>::new();
@@ -844,8 +922,62 @@ mod tests {
         let descriptor = descriptor();
         assert_eq!(descriptor.id, "prometheus");
         assert_eq!(descriptor.query_language, "PromQL");
+        assert_eq!(descriptor.explore_modes, ["metrics"]);
         assert_eq!(descriptor.query["document_mode"], "inline");
-        assert!(descriptor.query["help"].as_str().unwrap().contains("lookback"));
+        assert!(descriptor.query["help"]
+            .as_str()
+            .unwrap()
+            .contains("lookback"));
+    }
+
+    #[tokio::test]
+    async fn metric_exploration_lists_names_and_returns_bounded_series() {
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/api/v1/label/__name__/values"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":["up","http_requests_total"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/api/v1/query_range"))
+            .and(form_contains(&["query=up", "start=86400.000", "end=86401.000", "step=1000ms"]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"resultType":"matrix","result":[
+                    {"metric":{"__name__":"up","job":"api"},"values":[[86400.0,"1"],[86401.0,"NaN"]]}
+                ]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client(&server.uri());
+        let names = Connector::metric_names(&client, "metrics").await.unwrap();
+        assert_eq!(names.names, ["http_requests_total", "up"]);
+        assert!(!names.truncated);
+        let result = Connector::metric_query(
+            &client,
+            MetricQueryRequest {
+                index: "metrics".to_owned(),
+                query: "up".to_owned(),
+                time_range: TimeRange {
+                    start: 86_400_000,
+                    end: 86_401_000,
+                },
+                step_ms: 1_000,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.step_ms, 1_000);
+        assert_eq!(result.series.len(), 1);
+        assert_eq!(result.series[0].labels["job"], "api");
+        assert_eq!(result.series[0].points[0].value, Some(1.0));
+        assert_eq!(result.series[0].points[1].value, None);
+        assert!(!result.truncated);
+        server.verify().await;
     }
 
     #[test]
@@ -879,7 +1011,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/api/v1/query_range"))
-            .and(form_contains(&["query=count+by+%28job%29+%28up%29", "step=1000ms"]))
+            .and(form_contains(&[
+                "query=count+by+%28job%29+%28up%29",
+                "step=1000ms",
+            ]))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "status":"success","data":{"resultType":"matrix","result":[
                     {"metric":{"job":"api"},"values":[[86400.0,"1"],[86401.0,"1"],[86402.0,"1"]]}
@@ -901,7 +1036,11 @@ mod tests {
             .await;
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/api/v1/query_range"))
-            .and(form_contains(&["query=up&", "start=86401.000", "end=86402.000"]))
+            .and(form_contains(&[
+                "query=up&",
+                "start=86401.000",
+                "end=86402.000",
+            ]))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "status":"success","data":{"resultType":"matrix","result":[
                     {"metric":{"__name__":"up","job":"api"},"values":[[86401.0,"0"],[86402.0,"1"]]}
@@ -912,7 +1051,11 @@ mod tests {
             .await;
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/api/v1/query_range"))
-            .and(form_contains(&["query=up&", "start=86400.000", "end=86400.000"]))
+            .and(form_contains(&[
+                "query=up&",
+                "start=86400.000",
+                "end=86400.000",
+            ]))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "status":"success","data":{"resultType":"matrix","result":[
                     {"metric":{"__name__":"up","job":"api"},"values":[[86400.0,"1"]]}
@@ -1010,7 +1153,12 @@ mod tests {
     fn rejections_use_curated_messages_by_prometheus_error_type() {
         for (status, error_type, expected_status, expected) in [
             (400, "bad_data", StatusCode::BAD_REQUEST, "could not parse"),
-            (422, "execution", StatusCode::BAD_REQUEST, "within its limits"),
+            (
+                422,
+                "execution",
+                StatusCode::BAD_REQUEST,
+                "within its limits",
+            ),
             (503, "timeout", StatusCode::GATEWAY_TIMEOUT, "timed out"),
             (401, "", StatusCode::BAD_GATEWAY, "credentials"),
         ] {
@@ -1051,7 +1199,9 @@ mod tests {
             .mount(&server)
             .await;
         let fields = client(&server.uri()).fields("metrics").await.unwrap();
-        assert!(fields.iter().any(|field| field.name == "_time" && field.is_time_field));
+        assert!(fields
+            .iter()
+            .any(|field| field.name == "_time" && field.is_time_field));
         assert!(fields.iter().any(|field| field.name == "_value"));
         assert!(fields.iter().any(|field| field.name == "job"));
     }

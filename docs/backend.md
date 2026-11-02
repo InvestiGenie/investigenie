@@ -34,6 +34,8 @@ Responses are JSON except for no-content deletes such as knowledge deletion (204
 | `GET /api/connections/{id}/indices[/{index}/fields]` | Datasets and fields. |
 | `GET /api/connections/{id}/indices/{index}/documents/{doc}` | One document (lookup integrations only). |
 | `POST /api/connections/{id}/search` | Documents + histogram. |
+| `GET /api/connections/{id}/indices/{index}/metrics/names` | Metric names for a Metrics-capable connector; capped at 500 with a `truncated` flag. |
+| `POST /api/connections/{id}/metrics/query` | Bounded metric range query; not subject to document paging. |
 | `/api/data-views[/{id}]` | Data View CRUD; validated against the source. |
 | `GET, POST /api/knowledge` | List `{entries}` or create `{entry}` (201). |
 | `GET, PUT, DELETE /api/knowledge/{id}` | Read/update `{entry}` or delete (204); updates/deletes require quoted `If-Match`. |
@@ -42,6 +44,14 @@ Responses are JSON except for no-content deletes such as knowledge deletion (204
 | `GET /api/ai/investigations/{id}` | Job status, progress, partial or final result. |
 | `POST /api/ai/investigations/{id}/decision` | `{"action":"continue"\|"terminate"}`. |
 | `POST /api/ai/investigate` | Synchronous investigation (legacy). |
+
+## Search and histogram
+
+## Metrics range queries
+
+Prometheus and VictoriaMetrics opt into the Metrics Explore mode through `IntegrationDescriptor.explore_modes`. Their `metric_names` connector method returns at most 500 metric names. `metric_query` accepts `{index, query, time_range, step_ms}` and returns `{step_ms, series[{labels, points[{timestamp, value}]}], truncated}`. The API requires a bounded nonnegative time range, a nonempty query of at most 8 KiB, a 1-second to 1-day step, and no more than 500 evaluation points. Responses include at most 50 series and 500 points per series; non-finite samples are null gaps and any series/point truncation is explicit. These bounds are independent of SearchWindow's 50-row/100-record Logs limit. The datasource's range-query API evaluates the expression; this endpoint does not accept mutations or arbitrary HTTP requests.
+
+Connectors without these optional methods return the sanitized `metrics_query_unsupported` error. Traces/Tempo has no connector or trace query API yet.
 
 ## Search and histogram
 

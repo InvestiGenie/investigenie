@@ -13,11 +13,14 @@ import { describeInterval, INTERVAL_CHOICES, resolveInterval, type IntervalChoic
 import investigenieSpark from './investigenie-spark.svg';
 
 const HistogramChart = lazy(() => import('./HistogramChart'));
+const MetricsExplore = lazy(() => import('./MetricsExplore'));
+const TracesExplore = lazy(() => import('./MetricsExplore').then((module) => ({ default: module.TracesExplore })));
 const InvestiGenieAIPage = lazy(() => import('./InvestiGenieAIPage'));
 const AIModelsPage = lazy(() => import('./AIModelsPage'));
 const KnowledgePage = lazy(() => import('./KnowledgePage'));
 
 type Theme = 'light' | 'dark';
+type ExploreMode = 'logs' | 'metrics' | 'traces';
 type AppPage = 'discover' | 'investigenie-ai' | 'connections' | 'data-views' | 'ai-models' | 'knowledge';
 
 const APP_PAGE_HISTORY_KEY = 'investigeniePage';
@@ -99,6 +102,7 @@ export default function App() {
   const [dataViews, setDataViews] = useState<DataViewSummary[]>([]);
   const [selectedDataViewId, setSelectedDataViewId] = useState('');
   const [activePage, setActivePage] = useState<AppPage>('investigenie-ai');
+  const [exploreMode, setExploreMode] = useState<ExploreMode>('logs');
   const activePageRef = useRef<AppPage>(activePage);
   const knowledgeDirty = useRef(false);
   const [knowledgeEntryId, setKnowledgeEntryId] = useState<string | null>(null);
@@ -523,7 +527,36 @@ export default function App() {
           ? <ConnectionsPage connections={connections} onConnectionsChange={refreshConnections} />
           : activePage === 'data-views'
             ? <DataViewsPage connections={connections} dataViews={dataViews} onDataViewsChange={refreshDataViews} />
-            : <main className={`discover-layout${histogramField && results ? ' has-histogram' : ''}`}>
+            : <main className={`discover-layout${exploreMode === 'logs' && histogramField && results ? ' has-histogram' : ''}`}>
+          <div className="explore-mode-switch" role="group" aria-label="Explore data type">
+            {([
+              ['logs', 'Logs'],
+              ['metrics', 'Metrics'],
+              ['traces', 'Traces'],
+            ] as const).map(([mode, label]) => <button
+              key={mode}
+              type="button"
+              aria-pressed={exploreMode === mode}
+              className={exploreMode === mode ? 'active' : ''}
+              onClick={() => setExploreMode(mode)}
+            >{label}</button>)}
+          </div>
+          {exploreMode === 'metrics'
+            ? <Suspense fallback={<div className="loading-state" role="status">Loading Metrics Explore…</div>}>
+                <MetricsExplore
+                  connections={connections}
+                  dataViews={dataViews}
+                  timeZone={timeZone}
+                  startDate={startDate}
+                  endDate={endDate}
+                  onTimeZoneChange={setTimeZone}
+                  onTimeRangeChange={(start, end) => { setStartDate(start); setEndDate(end); }}
+                  onManageDataViews={() => navigateTo('data-views')}
+                />
+              </Suspense>
+            : exploreMode === 'traces'
+              ? <Suspense fallback={<div className="loading-state" role="status">Loading Traces Explore…</div>}><TracesExplore /></Suspense>
+              : <>
           <section className="main-column">
             <section className="query-panel" aria-label="Search controls">
               <div className="query-topline">
@@ -647,6 +680,7 @@ export default function App() {
             </section>)}</div>
             <div className="fields-footnote">{queryMetadata && `Fields loaded from ${applyQueryTemplate(queryMetadata.schema_label, queryMetadata, { index: selectedIndex })}`}</div>
           </aside>
+          </>}
         </main>}
       </div>
 

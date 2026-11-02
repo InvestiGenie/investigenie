@@ -996,6 +996,85 @@ async fn save_status_connection(storage: &Storage, integration_id: &str, url: &s
 }
 
 #[tokio::test]
+async fn metric_routes_discover_names_bound_ranges_and_preserve_series() {
+    let (_directory, storage) = status_storage().await;
+    let server = MockServer::start().await;
+    save_status_connection(&storage, "prometheus", &server.uri()).await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/api/v1/label/__name__/values"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status":"success","data":["up"]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/api/v1/query_range"))
+        .and(|request: &wiremock::Request| {
+            String::from_utf8_lossy(&request.body).contains("query=up")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status":"success","data":{"resultType":"matrix","result":[
+                {"metric":{"__name__":"up","job":"api"},"values":[[86400.0,"1"],[86401.0,"0"]]}
+            ]}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = router("http://localhost".parse().unwrap(), storage);
+
+    let names = app
+        .clone()
+        .oneshot(model_request(
+            Method::GET,
+            "/api/connections/prometheus/indices/metrics/metrics/names",
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(names.status(), StatusCode::OK);
+    let names: Value =
+        serde_json::from_slice(&axum::body::to_bytes(names.into_body(), 4096).await.unwrap())
+            .unwrap();
+    assert_eq!(names["names"], json!(["up"]));
+
+    let request = json!({
+        "index":"metrics","query":"up","step_ms":1_000,
+        "time_range":{"start":86_400_000i64,"end":86_401_000i64}
+    });
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "/api/connections/prometheus/metrics/query",
+            request.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 16_384)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["series"][0]["labels"]["job"], "api");
+    assert_eq!(result["series"][0]["points"][0]["value"], 1.0);
+
+    let mut oversized = request;
+    oversized["time_range"]["end"] = json!(86_400_000i64 + 600_000);
+    let response = app
+        .oneshot(json_request(
+            "/api/connections/prometheus/metrics/query",
+            oversized,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn search_window_routes_cap_continuations_and_reject_deep_offsets() {
     let (_directory, storage) = status_storage().await;
     let server = MockServer::start().await;

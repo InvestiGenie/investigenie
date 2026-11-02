@@ -5,7 +5,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::data_connectors::IntegrationDescriptor;
+use crate::data_connectors::{
+    metric_result_from_matrix, IntegrationDescriptor, MetricNames, MetricQueryRequest,
+    MetricQueryResult, MAX_METRIC_POINTS,
+};
 use crate::search::{
     BreakdownCount, HistogramInterval, HistogramOptions, IntervalUnit, TimeRange,
     BREAKDOWN_OTHER_KEY, MAX_BREAKDOWN_VALUES,
@@ -27,6 +30,7 @@ const MAX_PAGE_SIZE: usize = 100;
 const MAX_GRID_CELLS: i64 = 10_000;
 const DAY_MS: i64 = 86_400_000;
 const MIN_TIMESTAMP_MS: i64 = 86_400_000;
+const MAX_METRIC_NAMES: usize = 500;
 
 pub fn descriptor() -> IntegrationDescriptor {
     IntegrationDescriptor {
@@ -41,6 +45,7 @@ pub fn descriptor() -> IntegrationDescriptor {
             json!({"name":"password","label":"Password","input_type":"password","required":false,"secret":true,"editable":true,"group":"credentials","placeholder":""}),
         ],
         query: json!({"placeholder":"Enter a metric selector, e.g. http_requests_total{job=\"api\"}","default_query":"{__name__!=\"\"}","field_query":"{query}","identifier_quote":"","help":"Enter a read-only MetricsQL series selector; Explore displays raw samples, not evaluated range-query values","document_mode":"inline","sort_requires_projection":false,"histogram_total_from_buckets":false,"schema_label":"VictoriaMetrics labels"}),
+        explore_modes: vec!["metrics"],
     }
 }
 
@@ -207,6 +212,52 @@ impl VictoriaMetricsClient {
         Ok(fields)
     }
 
+    pub async fn metric_names(&self, index: &str) -> Result<MetricNames, VictoriaMetricsError> {
+        validate_index(index)?;
+        let response = self
+            .request("api/v1/label/__name__/values")?
+            .query(&[("timeout", QUERY_TIMEOUT)])
+            .send()
+            .await
+            .map_err(|_| VictoriaMetricsError::Request)?;
+        let body = read_bounded(response).await?;
+        let response: Value =
+            serde_json::from_slice(&body).map_err(|_| VictoriaMetricsError::InvalidResponse)?;
+        validate_api_success(&response)?;
+        let data = response
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or(VictoriaMetricsError::InvalidResponse)?;
+        let mut names = data
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names.dedup();
+        let truncated = names.len() > MAX_METRIC_NAMES;
+        names.truncate(MAX_METRIC_NAMES);
+        Ok(MetricNames { names, truncated })
+    }
+
+    pub async fn metric_query(
+        &self,
+        request: MetricQueryRequest,
+    ) -> Result<MetricQueryResult, VictoriaMetricsError> {
+        validate_index(&request.index)?;
+        validate_metric_request(&request)?;
+        let matrix = self
+            .range_query(
+                &request.query,
+                request.time_range.start,
+                request.time_range.end,
+                request.step_ms,
+            )
+            .await?;
+        metric_result_from_matrix(&request, &matrix)
+            .map_err(|_| VictoriaMetricsError::InvalidResponse)
+    }
+
     pub async fn search(
         &self,
         request: crate::search::SearchRequest,
@@ -215,16 +266,20 @@ impl VictoriaMetricsClient {
         if request.size == 0 || request.size > MAX_PAGE_SIZE {
             return Err(VictoriaMetricsError::InvalidQuery);
         }
-        if request.time_range.is_some_and(|range| {
-            !range.is_valid() || range.start < MIN_TIMESTAMP_MS
-        }) {
+        if request
+            .time_range
+            .is_some_and(|range| !range.is_valid() || range.start < MIN_TIMESTAMP_MS)
+        {
             return Err(VictoriaMetricsError::InvalidQuery);
         }
         let offset = cursor_offset(request.cursor.as_deref(), request.from)?;
         let options = request
             .histogram_options()
             .map_err(|_| VictoriaMetricsError::InvalidQuery)?;
-        if request.sort_order.as_deref().is_some_and(|order| order != "asc" && order != "desc")
+        if request
+            .sort_order
+            .as_deref()
+            .is_some_and(|order| order != "asc" && order != "desc")
             || request
                 .sort_by
                 .as_deref()
@@ -291,7 +346,16 @@ impl VictoriaMetricsClient {
         let reason = (wants_histogram && !utc)
             .then_some("VictoriaMetrics histograms currently support UTC only.");
         let Some(range) = range else {
-            return search_result(request, started, 0, Vec::new(), Vec::new(), None, reason, offset);
+            return search_result(
+                request,
+                started,
+                0,
+                Vec::new(),
+                Vec::new(),
+                None,
+                reason,
+                offset,
+            );
         };
         let span = range.end.saturating_sub(range.start).max(1);
         let interval = options
@@ -322,7 +386,10 @@ impl VictoriaMetricsClient {
             )?;
             histogram_interval = Some(format!("{}{}", interval.count, interval.suffix()));
         }
-        let time_sorted = request.sort_by.as_deref().is_none_or(|field| field == "_time");
+        let time_sorted = request
+            .sort_by
+            .as_deref()
+            .is_none_or(|field| field == "_time");
         let page = if offset >= total {
             Vec::new()
         } else if time_sorted {
@@ -433,7 +500,8 @@ impl VictoriaMetricsClient {
         let body = read_bounded(response).await?;
         let mut samples = parse_export(&body)?;
         if let Some(range) = range {
-            samples.retain(|sample| sample.timestamp >= range.start && sample.timestamp <= range.end);
+            samples
+                .retain(|sample| sample.timestamp >= range.start && sample.timestamp <= range.end);
         }
         samples.sort_by(|left, right| compare_samples(left, right, request));
         Ok(samples)
@@ -624,6 +692,26 @@ impl VictoriaMetricsClient {
     }
 }
 
+fn validate_metric_request(request: &MetricQueryRequest) -> Result<(), VictoriaMetricsError> {
+    if request.query.trim().is_empty()
+        || request.query.len() > MAX_QUERY_BYTES
+        || request.query.contains(';')
+        || !request.time_range.is_valid()
+        || request.time_range.start < MIN_TIMESTAMP_MS
+        || !(1_000..=86_400_000).contains(&request.step_ms)
+        || request
+            .time_range
+            .end
+            .saturating_sub(request.time_range.start)
+            / request.step_ms
+            + 1
+            > MAX_METRIC_POINTS as i64
+    {
+        return Err(VictoriaMetricsError::InvalidQuery);
+    }
+    Ok(())
+}
+
 fn validate_index(index: &str) -> Result<(), VictoriaMetricsError> {
     if index == "metrics" {
         Ok(())
@@ -637,7 +725,9 @@ fn cursor_offset(cursor: Option<&str>, from: usize) -> Result<u64, VictoriaMetri
         None if from <= 10_000 => Ok(from as u64),
         Some("") => Ok(0),
         Some(token) if token.len() <= 15 && token.bytes().all(|byte| byte.is_ascii_digit()) => {
-            token.parse::<u64>().map_err(|_| VictoriaMetricsError::InvalidQuery)
+            token
+                .parse::<u64>()
+                .map_err(|_| VictoriaMetricsError::InvalidQuery)
         }
         _ => Err(VictoriaMetricsError::InvalidQuery),
     }
@@ -810,7 +900,11 @@ fn parse_export(body: &[u8]) -> Result<Vec<MetricSample>, VictoriaMetricsError> 
         for (value, timestamp) in values.iter().zip(timestamps) {
             let timestamp = timestamp
                 .as_i64()
-                .or_else(|| timestamp.as_u64().and_then(|value| i64::try_from(value).ok()))
+                .or_else(|| {
+                    timestamp
+                        .as_u64()
+                        .and_then(|value| i64::try_from(value).ok())
+                })
                 .ok_or(VictoriaMetricsError::InvalidResponse)?;
             let mut source = Map::new();
             source.insert("_time".to_owned(), json!(timestamp));
@@ -1060,13 +1154,64 @@ mod tests {
     fn descriptor_uses_inline_samples_and_selector_query() {
         let descriptor = descriptor();
         assert_eq!(descriptor.id, "victoriametrics");
+        assert_eq!(descriptor.explore_modes, ["metrics"]);
         assert_eq!(descriptor.query["document_mode"], "inline");
         assert_eq!(descriptor.query["schema_label"], "VictoriaMetrics labels");
     }
 
+    #[tokio::test]
+    async fn metric_exploration_lists_names_and_returns_bounded_series() {
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/api/v1/label/__name__/values"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":["up","http_requests_total"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/api/v1/query_range"))
+            .and(form_contains(&["query=up", "step=1000ms", "nocache=1"]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"resultType":"matrix","result":[
+                    {"metric":{"__name__":"up","job":"api"},"values":[[86400.0,"2"],[86401.0,"3"]]}
+                ]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client(&server.uri());
+        let names = Connector::metric_names(&client, "metrics").await.unwrap();
+        assert_eq!(names.names, ["http_requests_total", "up"]);
+        assert!(!names.truncated);
+        let result = Connector::metric_query(
+            &client,
+            MetricQueryRequest {
+                index: "metrics".to_owned(),
+                query: "up".to_owned(),
+                time_range: TimeRange {
+                    start: 86_400_000,
+                    end: 86_401_000,
+                },
+                step_ms: 1_000,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.series.len(), 1);
+        assert_eq!(result.series[0].labels["job"], "api");
+        assert_eq!(result.series[0].points[0].value, Some(2.0));
+        assert_eq!(result.series[0].points[1].value, Some(3.0));
+        assert!(!result.truncated);
+        server.verify().await;
+    }
+
     #[test]
     fn export_jsonl_flattens_samples_and_preserves_label_and_value_types() {
-        let body = br#"{"metric":{"__name__":"up","job":"api"},"values":[1,2],"timestamps":[1000,2000]}"#;
+        let body =
+            br#"{"metric":{"__name__":"up","job":"api"},"values":[1,2],"timestamps":[1000,2000]}"#;
         let samples = parse_export(body).unwrap();
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].source["__name__"], "up");
@@ -1089,7 +1234,13 @@ mod tests {
         for (path, parts, body) in [
             (
                 "/api/v1/query_range",
-                &["query=sum+by+%28job%29", "%5B1000ms%5D", "start=86400.999", "end=86401.999", "nocache=1"][..],
+                &[
+                    "query=sum+by+%28job%29",
+                    "%5B1000ms%5D",
+                    "start=86400.999",
+                    "end=86401.999",
+                    "nocache=1",
+                ][..],
                 json!({"status":"success","data":{"resultType":"matrix","result":[
                     {"metric":{"job":"api"},"values":[[86400.999,"1"],[86401.999,"1"]]}
                 ]}}),
@@ -1259,7 +1410,9 @@ mod tests {
             .mount(&server)
             .await;
         let fields = client(&server.uri()).fields("metrics").await.unwrap();
-        assert!(fields.iter().any(|field| field.name == "_time" && field.is_time_field));
+        assert!(fields
+            .iter()
+            .any(|field| field.name == "_time" && field.is_time_field));
         assert!(fields.iter().any(|field| field.name == "_value"));
         assert!(fields.iter().any(|field| field.name == "job"));
     }
@@ -1270,6 +1423,9 @@ mod tests {
             "index":"metrics","time_zone":"America/Los_Angeles"
         }))
         .unwrap();
-        assert_eq!(request.histogram_options().unwrap().time_zone, "America/Los_Angeles");
+        assert_eq!(
+            request.histogram_options().unwrap().time_zone,
+            "America/Los_Angeles"
+        );
     }
 }

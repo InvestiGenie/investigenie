@@ -1,7 +1,8 @@
 use super::{PrometheusClient, PrometheusError, PrometheusSettings};
 use crate::data_connectors::{
     basic_credentials, string_setting, ConnectionConfig, Connector, ConnectorError,
-    ConnectorFuture, FieldSummary, IndexSummary,
+    ConnectorFuture, FieldSummary, IndexSummary, MetricNames, MetricQueryRequest,
+    MetricQueryResult,
 };
 use crate::search::SearchRequest;
 use axum::http::StatusCode;
@@ -40,6 +41,14 @@ impl Connector for PrometheusClient {
 
     fn search(&self, request: SearchRequest) -> ConnectorFuture<'_, Value> {
         Box::pin(async move { Ok(PrometheusClient::search(self, request).await?) })
+    }
+
+    fn metric_names<'a>(&'a self, index: &'a str) -> ConnectorFuture<'a, MetricNames> {
+        Box::pin(async move { Ok(PrometheusClient::metric_names(self, index).await?) })
+    }
+
+    fn metric_query(&self, request: MetricQueryRequest) -> ConnectorFuture<'_, MetricQueryResult> {
+        Box::pin(async move { Ok(PrometheusClient::metric_query(self, request).await?) })
     }
 
     fn document<'a>(&'a self, _index: &'a str, _id: &'a str) -> ConnectorFuture<'a, Value> {

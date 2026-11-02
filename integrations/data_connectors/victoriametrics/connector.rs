@@ -1,7 +1,8 @@
 use super::{VictoriaMetricsClient, VictoriaMetricsError, VictoriaMetricsSettings};
 use crate::data_connectors::{
     basic_credentials, string_setting, ConnectionConfig, Connector, ConnectorError,
-    ConnectorFuture, FieldSummary, IndexSummary,
+    ConnectorFuture, FieldSummary, IndexSummary, MetricNames, MetricQueryRequest,
+    MetricQueryResult,
 };
 use crate::search::SearchRequest;
 use axum::http::StatusCode;
@@ -12,11 +13,13 @@ pub fn connect(config: &ConnectionConfig) -> Result<Arc<dyn Connector>, Connecto
     let raw_url = string_setting(config, "url")?.ok_or_else(ConnectorError::invalid_connection)?;
     let url = url::Url::parse(&raw_url).map_err(|_| ConnectorError::invalid_connection())?;
     let (username, password) = basic_credentials(config)?.unzip();
-    Ok(Arc::new(VictoriaMetricsClient::new(VictoriaMetricsSettings {
-        url,
-        username,
-        password,
-    })?))
+    Ok(Arc::new(VictoriaMetricsClient::new(
+        VictoriaMetricsSettings {
+            url,
+            username,
+            password,
+        },
+    )?))
 }
 
 impl Connector for VictoriaMetricsClient {
@@ -40,6 +43,14 @@ impl Connector for VictoriaMetricsClient {
 
     fn search(&self, request: SearchRequest) -> ConnectorFuture<'_, Value> {
         Box::pin(async move { Ok(VictoriaMetricsClient::search(self, request).await?) })
+    }
+
+    fn metric_names<'a>(&'a self, index: &'a str) -> ConnectorFuture<'a, MetricNames> {
+        Box::pin(async move { Ok(VictoriaMetricsClient::metric_names(self, index).await?) })
+    }
+
+    fn metric_query(&self, request: MetricQueryRequest) -> ConnectorFuture<'_, MetricQueryResult> {
+        Box::pin(async move { Ok(VictoriaMetricsClient::metric_query(self, request).await?) })
     }
 
     fn document<'a>(&'a self, _index: &'a str, _id: &'a str) -> ConnectorFuture<'a, Value> {

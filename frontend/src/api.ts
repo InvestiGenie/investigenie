@@ -45,6 +45,7 @@ export type IntegrationDescriptor = {
   description: string;
   connection_fields: ConnectionField[];
   query: QueryDescriptor;
+  explore_modes?: string[];
 };
 
 export type ConnectionSummary = {
@@ -256,6 +257,24 @@ export type SearchRequest = {
   time_zone?: string;
 };
 
+export type MetricQueryRequest = {
+  index: string;
+  query: string;
+  time_range: { start: number; end: number };
+  step_ms: number;
+};
+
+export type MetricQueryResult = {
+  step_ms: number;
+  series: Array<{
+    labels: Record<string, unknown>;
+    points: Array<{ timestamp: number; value: number | null }>;
+  }>;
+  truncated: boolean;
+};
+
+export type MetricNames = { names: string[]; truncated: boolean };
+
 // Production builds are served by the API itself, so they default to the same origin.
 const apiBase = (import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:3000' : '')).replace(/\/$/, '');
 
@@ -409,6 +428,18 @@ export const api = {
   },
   search(connectionId: string, body: SearchRequest, signal?: AbortSignal): Promise<SearchResult> {
     return request<SearchResult>(`/api/connections/${encodeURIComponent(connectionId)}/search`, {
+      ...jsonMutation('POST', body),
+      signal,
+    });
+  },
+  async metricNames(connectionId: string, index: string, signal?: AbortSignal): Promise<MetricNames> {
+    return request<MetricNames>(
+      `/api/connections/${encodeURIComponent(connectionId)}/indices/${encodeURIComponent(index)}/metrics/names`,
+      { signal },
+    );
+  },
+  metricQuery(connectionId: string, body: MetricQueryRequest, signal?: AbortSignal): Promise<MetricQueryResult> {
+    return request<MetricQueryResult>(`/api/connections/${encodeURIComponent(connectionId)}/metrics/query`, {
       ...jsonMutation('POST', body),
       signal,
     });

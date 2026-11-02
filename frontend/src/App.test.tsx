@@ -109,6 +109,47 @@ describe('Discover', () => {
     expect(screen.getByRole('button', { name: 'Connections' })).toHaveClass('active');
   });
 
+  it('switches between Logs, Metrics, and Traces and runs a metric range query', async () => {
+    const prometheusIntegration = {
+      ...elasticsearchIntegration,
+      id: 'prometheus',
+      display_name: 'Prometheus',
+      query_language: 'PromQL',
+      explore_modes: ['metrics'],
+    };
+    vi.spyOn(api, 'connections').mockResolvedValue([connectionFixture(prometheusIntegration)]);
+    vi.spyOn(api, 'dataViews').mockResolvedValue([{ id: 'metrics-view', revision: 'r1', name: 'Service metrics', connection_id: 'source', index: 'metrics', time_field: '_time' }]);
+    vi.spyOn(api, 'fields').mockResolvedValue([{ name: '_time', field_type: 'timestamp', is_time_field: true }, { name: '_value', field_type: 'sample value' }, { name: 'job', field_type: 'label' }]);
+    vi.spyOn(api, 'search').mockResolvedValue({ took: 1, timed_out: false, total: 0, total_relation: 'eq', hits: [], histogram: [] });
+    const metricNames = vi.spyOn(api, 'metricNames').mockResolvedValue({ names: ['up', 'http_requests_total'], truncated: false });
+    const metricQuery = vi.spyOn(api, 'metricQuery').mockResolvedValue({
+      step_ms: 15_000,
+      truncated: false,
+      series: [{ labels: { __name__: 'up', job: 'api' }, points: [{ timestamp: 1_000, value: 1 }, { timestamp: 16_000, value: 0 }] }],
+    });
+
+    renderExplore();
+    expect(await screen.findByRole('button', { name: 'Logs' })).toHaveAttribute('aria-pressed', 'true');
+    fireEvent.click(screen.getByRole('button', { name: 'Metrics' }));
+    expect(await screen.findByLabelText('PromQL or MetricsQL query')).toBeInTheDocument();
+    await waitFor(() => expect(metricNames).toHaveBeenCalledWith('source', 'metrics', expect.any(AbortSignal)));
+    fireEvent.change(screen.getByLabelText('Metric name'), { target: { value: 'up' } });
+    expect(screen.getByLabelText('PromQL or MetricsQL query')).toHaveValue('up');
+    fireEvent.change(screen.getByLabelText('Metric label field'), { target: { value: 'job' } });
+    fireEvent.change(screen.getByLabelText('Label value'), { target: { value: 'api' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Insert selector' }));
+    expect(screen.getByLabelText('PromQL or MetricsQL query')).toHaveValue('up{job="api"}');
+    fireEvent.click(screen.getByRole('button', { name: 'Run query' }));
+    await waitFor(() => expect(metricQuery).toHaveBeenCalledWith('source', expect.objectContaining({ index: 'metrics', query: 'up{job="api"}', step_ms: 15_000 }), expect.any(AbortSignal)));
+    expect(await screen.findByRole('img', { name: 'Metric time series chart' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Table' }));
+    expect(screen.getByRole('region', { name: 'Metric series table' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Traces' }));
+    expect(await screen.findByText('Tempo trace exploration is not available yet')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Logs' }));
+    expect(await screen.findByRole('region', { name: 'Search results' })).toBeInTheDocument();
+  });
+
   it('renders an empty histogram for an applied week-long timeframe', async () => {
     vi.spyOn(api, 'connections').mockResolvedValue([connectionFixture(elasticsearchIntegration)]);
     vi.spyOn(api, 'dataViews').mockResolvedValue([{ id: 'view', revision: 'r1', name: 'Events', connection_id: 'source', index: 'events', time_field: '@timestamp' }]);

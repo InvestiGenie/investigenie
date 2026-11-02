@@ -1,5 +1,6 @@
+use crate::search::TimeRange;
 use axum::http::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{future::Future, pin::Pin, sync::Arc};
 use tracing::Instrument;
@@ -7,6 +8,92 @@ use tracing::Instrument;
 pub type ConnectionConfig = Map<String, Value>;
 pub type ConnectorFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ConnectorError>> + Send + 'a>>;
+pub const MAX_METRIC_SERIES: usize = 50;
+pub const MAX_METRIC_POINTS: usize = 500;
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricQueryRequest {
+    pub index: String,
+    pub query: String,
+    pub time_range: TimeRange,
+    pub step_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MetricNames {
+    pub names: Vec<String>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MetricPoint {
+    pub timestamp: i64,
+    pub value: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MetricSeries {
+    pub labels: Map<String, Value>,
+    pub points: Vec<MetricPoint>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MetricQueryResult {
+    pub step_ms: i64,
+    pub series: Vec<MetricSeries>,
+    pub truncated: bool,
+}
+
+pub fn metric_result_from_matrix(
+    request: &MetricQueryRequest,
+    matrix: &[Value],
+) -> Result<MetricQueryResult, ()> {
+    let mut truncated = matrix.len() > MAX_METRIC_SERIES;
+    let mut series_result = Vec::with_capacity(matrix.len().min(MAX_METRIC_SERIES));
+    for series in matrix.iter().take(MAX_METRIC_SERIES) {
+        let labels = series
+            .get("metric")
+            .and_then(Value::as_object)
+            .cloned()
+            .ok_or(())?;
+        let values = series.get("values").and_then(Value::as_array).ok_or(())?;
+        let mut points = Vec::with_capacity(values.len().min(MAX_METRIC_POINTS));
+        for point in values {
+            if points.len() == MAX_METRIC_POINTS {
+                truncated = true;
+                break;
+            }
+            let seconds = point
+                .get(0)
+                .and_then(Value::as_f64)
+                .filter(|time| time.is_finite())
+                .ok_or(())?;
+            let timestamp = (seconds * 1000.0).round();
+            if timestamp < i64::MIN as f64 || timestamp > i64::MAX as f64 {
+                return Err(());
+            }
+            let timestamp = timestamp as i64;
+            if timestamp < request.time_range.start || timestamp > request.time_range.end {
+                continue;
+            }
+            let text = point.get(1).and_then(Value::as_str).ok_or(())?;
+            let value = text.parse::<f64>().map_err(|_| ())?;
+            points.push(MetricPoint {
+                timestamp,
+                value: value.is_finite().then_some(value),
+            });
+        }
+        if !points.is_empty() {
+            series_result.push(MetricSeries { labels, points });
+        }
+    }
+    Ok(MetricQueryResult {
+        step_ms: request.step_ms,
+        series: series_result,
+        truncated,
+    })
+}
 
 pub trait Connector: Send + Sync {
     fn public_configuration(&self) -> ConnectionConfig {
@@ -16,6 +103,12 @@ pub trait Connector: Send + Sync {
     fn indices(&self) -> ConnectorFuture<'_, Vec<IndexSummary>>;
     fn fields<'a>(&'a self, index: &'a str) -> ConnectorFuture<'a, Vec<FieldSummary>>;
     fn search(&self, request: crate::search::SearchRequest) -> ConnectorFuture<'_, Value>;
+    fn metric_names<'a>(&'a self, _index: &'a str) -> ConnectorFuture<'a, MetricNames> {
+        Box::pin(async { Err(ConnectorError::unsupported_metrics()) })
+    }
+    fn metric_query(&self, _request: MetricQueryRequest) -> ConnectorFuture<'_, MetricQueryResult> {
+        Box::pin(async { Err(ConnectorError::unsupported_metrics()) })
+    }
     fn document<'a>(&'a self, index: &'a str, id: &'a str) -> ConnectorFuture<'a, Value>;
 }
 
@@ -32,6 +125,14 @@ impl ConnectorError {
             status: StatusCode::BAD_REQUEST,
             code: "invalid_connection",
             message: "Connection details are invalid or incomplete".to_owned(),
+        }
+    }
+
+    pub fn unsupported_metrics() -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "metrics_query_unsupported",
+            message: "This data source does not support metric exploration".to_owned(),
         }
     }
 }
@@ -138,6 +239,18 @@ impl Connector for LoggedConnector {
         })
     }
 
+    fn metric_names<'a>(&'a self, index: &'a str) -> ConnectorFuture<'a, MetricNames> {
+        self.observe("metric_names", self.inner.metric_names(index), |result| {
+            Some(result.names.len())
+        })
+    }
+
+    fn metric_query(&self, request: MetricQueryRequest) -> ConnectorFuture<'_, MetricQueryResult> {
+        self.observe("metric_query", self.inner.metric_query(request), |result| {
+            Some(result.series.len())
+        })
+    }
+
     fn document<'a>(&'a self, index: &'a str, id: &'a str) -> ConnectorFuture<'a, Value> {
         self.observe("document", self.inner.document(index, id), |value| {
             Some(usize::from(
@@ -156,6 +269,8 @@ pub struct IntegrationDescriptor {
     pub description: &'static str,
     pub connection_fields: Vec<Value>,
     pub query: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub explore_modes: Vec<&'static str>,
 }
 
 pub fn string_setting(
@@ -246,6 +361,35 @@ pub fn public_configuration(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn metric_matrix_results_bound_series_and_points_and_keep_non_finite_gaps() {
+        let request = MetricQueryRequest {
+            index: "metrics".to_owned(),
+            query: "up".to_owned(),
+            time_range: TimeRange {
+                start: 0,
+                end: 500_000,
+            },
+            step_ms: 1_000,
+        };
+        let points = (0..=MAX_METRIC_POINTS)
+            .map(|index| json!([index as f64, if index == 0 { "NaN" } else { "1" }]))
+            .collect::<Vec<_>>();
+        let matrix = json!([{"metric":{"job":"api"},"values":points}]);
+        let parsed = metric_result_from_matrix(&request, matrix.as_array().unwrap()).unwrap();
+        assert_eq!(parsed.series.len(), 1);
+        assert_eq!(parsed.series[0].points.len(), MAX_METRIC_POINTS);
+        assert_eq!(parsed.series[0].points[0].value, None);
+        assert!(parsed.truncated);
+
+        let matrix = (0..=MAX_METRIC_SERIES)
+            .map(|index| json!({"metric":{"job":index.to_string()},"values":[[0.0,"1"]]}))
+            .collect::<Vec<_>>();
+        let parsed = metric_result_from_matrix(&request, &matrix).unwrap();
+        assert_eq!(parsed.series.len(), MAX_METRIC_SERIES);
+        assert!(parsed.truncated);
+    }
 
     #[tokio::test]
     async fn debug_connector_logs_all_operations_without_private_values() {

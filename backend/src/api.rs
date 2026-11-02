@@ -23,7 +23,7 @@ use crate::ai::{self, InvestigationRequest};
 use crate::ai_connectors::AiSettings;
 use crate::data_connectors::{
     connect, editable_configuration, public_configuration, registered, validate_registry,
-    ConnectionConfig, Connector, ConnectorError, IntegrationDescriptor,
+    ConnectionConfig, Connector, ConnectorError, IntegrationDescriptor, MetricQueryRequest,
 };
 use crate::search::{SearchRequest, SearchWindow};
 use crate::storage::{
@@ -33,6 +33,9 @@ use crate::storage::{
 };
 
 const MAX_CONCURRENT_UPSTREAM_REQUESTS: usize = 64;
+const MAX_METRIC_QUERY_BYTES: usize = 8192;
+const MAX_METRIC_QUERY_POINTS: i64 = 500;
+const MAX_METRIC_QUERY_STEP_MS: i64 = 86_400_000;
 const MAX_TRACKED_INVESTIGATIONS: usize = 64;
 const FINISHED_INVESTIGATION_RETENTION: Duration = Duration::from_secs(30 * 60);
 
@@ -149,6 +152,14 @@ pub fn router(web_origin: HeaderValue, storage: Storage, ai_probe_timeout: Durat
         .route(
             "/api/connections/{connection_id}/search",
             post(connection_search),
+        )
+        .route(
+            "/api/connections/{connection_id}/indices/{index}/metrics/names",
+            get(connection_metric_names),
+        )
+        .route(
+            "/api/connections/{connection_id}/metrics/query",
+            post(connection_metric_query),
         )
         .route(
             "/api/ai/investigate",
@@ -742,6 +753,7 @@ enum ApiError {
     Storage(StorageError),
     Unavailable,
     InvalidTimeRange,
+    InvalidMetricQuery,
     InvalidSearchWindow(&'static str),
     InvalidConnection,
     InvalidDataView,
@@ -786,6 +798,11 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST,
                 "invalid_time_range",
                 "A time window requires valid start/end dates, a time field, and start no later than end".to_owned(),
+            ),
+            Self::InvalidMetricQuery => (
+                StatusCode::BAD_REQUEST,
+                "invalid_metric_query",
+                "Metric queries require a valid query, a bounded nonnegative time range, and at most 500 points".to_owned(),
             ),
             Self::InvalidSearchWindow(message) => (
                 StatusCode::BAD_REQUEST,
@@ -1015,6 +1032,49 @@ async fn connection_search(
     let mut result = connection.connector.search(request).await?;
     window.finish(&mut result);
     Ok(Json(result))
+}
+
+async fn connection_metric_names(
+    State(state): State<AppState>,
+    Path((connection_id, index)): Path<(String, String)>,
+) -> Result<Json<crate::data_connectors::MetricNames>, ApiError> {
+    let _permit = acquire(&state).await?;
+    let connection = get_connection(&state, &connection_id).await?;
+    Ok(Json(connection.connector.metric_names(&index).await?))
+}
+
+async fn connection_metric_query(
+    State(state): State<AppState>,
+    Path(connection_id): Path<String>,
+    Json(request): Json<MetricQueryRequest>,
+) -> Result<Json<crate::data_connectors::MetricQueryResult>, ApiError> {
+    validate_metric_query(&request)?;
+    let _permit = acquire(&state).await?;
+    let connection = get_connection(&state, &connection_id).await?;
+    Ok(Json(connection.connector.metric_query(request).await?))
+}
+
+fn validate_metric_query(request: &MetricQueryRequest) -> Result<(), ApiError> {
+    if request.index.trim().is_empty()
+        || request.query.trim().is_empty()
+        || request.query.len() > MAX_METRIC_QUERY_BYTES
+        || request.query.contains(';')
+        || !request.time_range.is_valid()
+        || request.time_range.start < 0
+        || !(1_000..=MAX_METRIC_QUERY_STEP_MS).contains(&request.step_ms)
+    {
+        return Err(ApiError::InvalidMetricQuery);
+    }
+    let points = request
+        .time_range
+        .end
+        .saturating_sub(request.time_range.start)
+        / request.step_ms
+        + 1;
+    if points > MAX_METRIC_QUERY_POINTS {
+        return Err(ApiError::InvalidMetricQuery);
+    }
+    Ok(())
 }
 
 fn validate_search(request: &SearchRequest) -> Result<(), ApiError> {
