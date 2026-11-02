@@ -27,9 +27,9 @@ use crate::data_connectors::{
 };
 use crate::search::{SearchRequest, SearchWindow};
 use crate::storage::{
-    AiConversationSummary, AiModelSummary, DataView, ResolvedConnection, Storage, StorageError,
-    ExploreMode, StoredAiConversation, StoredAiConversationMessage, StoredAiModel, StoredConnection,
-    MAX_AI_CONVERSATION_MESSAGES,
+    AiConversationSummary, AiModelSummary, DataView, ExploreMode, ResolvedConnection, Storage,
+    StorageError, StoredAiConversation, StoredAiConversationMessage, StoredAiModel,
+    StoredConnection, MAX_AI_CONVERSATION_MESSAGES,
 };
 
 const MAX_CONCURRENT_UPSTREAM_REQUESTS: usize = 64;
