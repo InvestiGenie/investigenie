@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Activity, ArrowRight, Search } from 'lucide-react';
+import { Activity, ArrowRight, ChevronDown, Search } from 'lucide-react';
 import { api, type ConnectionSummary, type DataViewSummary, type MetricQueryResult } from './api';
 import TimeRangePicker from './TimeRangePicker';
 import { errorMessage } from './format';
@@ -35,9 +35,20 @@ function metricTimeRange(startDate: string, endDate: string): { start: number; e
   return { start, end };
 }
 
-function seriesName(labels: Record<string, unknown>): string {
-  const entries = Object.entries(labels).filter(([name]) => name !== '__name__');
+function fullSeriesLabel(labels: Record<string, unknown>): string {
+  const entries = Object.entries(labels);
   return entries.length ? entries.map(([name, value]) => `${name}=${String(value)}`).join(', ') : 'Single series';
+}
+
+function seriesSummary(labels: Record<string, unknown>): string {
+  const metricName = labels.__name__;
+  const labelEntries = Object.entries(labels).filter(([name]) => name !== '__name__');
+  const parts = [
+    typeof metricName === 'string' && metricName ? metricName : null,
+    ...labelEntries.slice(0, 2).map(([name, value]) => `${name}=${String(value)}`),
+    labelEntries.length > 2 ? `+${labelEntries.length - 2}` : null,
+  ].filter((part): part is string => part !== null);
+  return parts.length ? parts.join(' · ') : 'Single series';
 }
 
 function numberLabel(value: number): string {
@@ -112,11 +123,21 @@ function MetricSeriesChart({ result, timeZone, timeRange }: {
     <div className="metric-legend" role="list" aria-label="Metric series">
       {result.series.map((series, index) => {
         const lastValue = [...series.points].reverse().find((point) => point.value !== null)?.value;
-        return <div className="metric-legend-item" role="listitem" key={`${seriesName(series.labels)}-${index}`}>
-          <span className="metric-legend-swatch" style={{ backgroundColor: colors[index % colors.length] }} aria-hidden="true" />
-          <span className="metric-legend-name" title={seriesName(series.labels)}>{seriesName(series.labels)}</span>
-          <strong>{lastValue === undefined || lastValue === null ? '—' : numberLabel(lastValue)}</strong>
-        </div>;
+        const summary = seriesSummary(series.labels);
+        const labelEntries = Object.entries(series.labels);
+        return <details className="metric-legend-item" role="listitem" key={`${fullSeriesLabel(series.labels)}-${index}`}>
+          <summary className="metric-legend-trigger">
+            <span className="metric-legend-swatch" style={{ backgroundColor: colors[index % colors.length] }} aria-hidden="true" />
+            <span className="metric-legend-name">{summary}</span>
+            <strong>{lastValue === undefined || lastValue === null ? '—' : numberLabel(lastValue)}</strong>
+            <ChevronDown className="metric-legend-chevron" size={12} aria-hidden="true" />
+          </summary>
+          <dl className="metric-legend-details" aria-label={`Full labels for ${summary}`}>
+            {labelEntries.length
+              ? labelEntries.map(([name, value]) => <div key={name}><dt>{name}</dt><dd>{String(value)}</dd></div>)
+              : <div><dt>Series</dt><dd>Single series</dd></div>}
+          </dl>
+        </details>;
       })}
     </div>
   </section>;
@@ -128,8 +149,8 @@ function MetricSeriesTable({ result }: { result: MetricQueryResult }) {
       <thead><tr><th>Series labels</th><th>Latest value</th><th>Points</th></tr></thead>
       <tbody>{result.series.map((series, index) => {
         const latest = [...series.points].reverse().find((point) => point.value !== null)?.value;
-        return <tr key={`${seriesName(series.labels)}-${index}`}>
-          <td className="metric-series-labels">{seriesName(series.labels)}</td>
+        return <tr key={`${fullSeriesLabel(series.labels)}-${index}`}>
+          <td className="metric-series-labels">{fullSeriesLabel(series.labels)}</td>
           <td>{latest === undefined || latest === null ? '—' : numberLabel(latest)}</td>
           <td>{series.points.length}</td>
         </tr>;

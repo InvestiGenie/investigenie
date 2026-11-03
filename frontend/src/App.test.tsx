@@ -125,7 +125,7 @@ describe('Discover', () => {
     const metricQuery = vi.spyOn(api, 'metricQuery').mockResolvedValue({
       step_ms: 15_000,
       truncated: false,
-      series: [{ labels: { __name__: 'up', job: 'api' }, points: [{ timestamp: 1_000, value: 1 }, { timestamp: 16_000, value: 0 }] }],
+      series: [{ labels: { __name__: 'http_requests_total', job: 'api', instance: 'api-gateway-long-name-01', method: 'GET', route: '/v1/accounts/{accountId}' }, points: [{ timestamp: 1_000, value: 1 }, { timestamp: 16_000, value: 0 }] }],
     });
 
     renderExplore();
@@ -142,6 +142,13 @@ describe('Discover', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Run query' }));
     await waitFor(() => expect(metricQuery).toHaveBeenCalledWith('source', expect.objectContaining({ index: 'metrics', query: 'up{job="api"}', step_ms: 15_000 }), expect.any(AbortSignal)));
     expect(await screen.findByRole('img', { name: 'Metric time series chart' })).toBeInTheDocument();
+    const legendSummary = screen.getByText('http_requests_total · job=api · instance=api-gateway-long-name-01 · +2');
+    expect(legendSummary).toBeInTheDocument();
+    const legendDetails = legendSummary.closest('details');
+    expect(legendDetails).not.toHaveAttribute('open');
+    fireEvent.click(legendSummary);
+    expect(legendDetails).toHaveAttribute('open');
+    expect(await screen.findByText('/v1/accounts/{accountId}')).toBeVisible();
     fireEvent.click(screen.getByRole('button', { name: 'Table' }));
     expect(screen.getByRole('region', { name: 'Metric series table' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Traces' }));
