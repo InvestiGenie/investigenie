@@ -1,5 +1,5 @@
 use super::*;
-use crate::storage::{KnowledgeEntry, KnowledgeKind, KnowledgeStatus};
+use crate::storage::{InvestigationPlaybookStep, KnowledgeEntry, KnowledgeKind, KnowledgeStatus};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -8,6 +8,8 @@ pub(super) struct KnowledgeInput {
     kind: KnowledgeKind,
     status: KnowledgeStatus,
     content: String,
+    #[serde(default)]
+    steps: Vec<InvestigationPlaybookStep>,
     #[serde(default)]
     services: Vec<String>,
     #[serde(default)]
@@ -27,12 +29,14 @@ impl From<KnowledgeInput> for KnowledgeEntry {
         Self {
             id: String::new(),
             revision: String::new(),
+            is_default: false,
             created_at_ms: 0,
             updated_at_ms: 0,
             title: input.title.trim().to_owned(),
             kind: input.kind,
             status: input.status,
             content: input.content,
+            steps: input.steps,
             services: input.services,
             environments: input.environments,
             connection_ids: input.connection_ids,
@@ -98,6 +102,10 @@ pub(super) async fn remove(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let expected = if_match(&headers)?;
-    state.storage.remove_knowledge(&id, &expected).await?;
+    state
+        .storage
+        .remove_knowledge(&id, &expected)
+        .await
+        .map_err(storage_error)?;
     Ok(StatusCode::NO_CONTENT)
 }

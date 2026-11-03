@@ -39,7 +39,7 @@ flowchart LR
 
 **AI investigation:** UI starts a background job → the AI receives field names/types and plans safe filters, sample fields, and an aggregation field → the evidence engine issues bounded source queries for samples and aggregations → the AI forms hypotheses from that evidence → the UI polls the job and can continue or stop it at check-ins.
 
-The investigation evidence pipeline uses metadata-only planning, bounded sample queries and source aggregations before hypothesis generation. Knowledge entries are manually managed and encrypted in either persistence mode; automatic retrieval is not yet connected. See [AI Investigation Pipeline](investigation-pipeline.md) for its stages and future retrieval boundary.
+The investigation pipeline runs published Knowledge Playbook aggregations across selected Data Views before metadata planning, then uses bounded sample queries and source aggregations for hypotheses. Other Knowledge entries remain manually managed and encrypted in either persistence mode; they are not retrieved into investigations. AI conversation history has configurable day-based retention. See [AI Investigation Pipeline](investigation-pipeline.md) for the implemented stages and limits.
 
 **AI history:** each investigation and its result are persisted in encrypted storage. Users can reopen, delete, or continue a conversation; follow-ups receive the saved transcript and findings, not a new source scan.
 

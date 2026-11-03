@@ -10,11 +10,117 @@ fn knowledge_entry() -> KnowledgeEntry {
 }
 
 #[tokio::test]
+async fn default_investigation_playbook_is_seeded_once_and_remains_editable() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(options(directory.path())).await.unwrap();
+    let default = storage
+        .knowledge_entries()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.is_default)
+        .unwrap();
+    assert_eq!(default.kind, KnowledgeKind::InvestigationPlaybook);
+    assert_eq!(default.status, KnowledgeStatus::Published);
+    assert_eq!(default.steps.len(), 1);
+
+    let mut edited = default.clone();
+    edited.steps[0].name = "Overall event volume".to_owned();
+    let edited = storage
+        .update_knowledge(&default.id, &default.revision, edited)
+        .await
+        .unwrap();
+    assert!(matches!(
+        storage.remove_knowledge(&edited.id, &edited.revision).await,
+        Err(StorageError::Invalid)
+    ));
+
+    drop(storage);
+    let storage = Storage::open(options(directory.path())).await.unwrap();
+    let reopened = storage.knowledge_entry(&edited.id).await.unwrap();
+    assert_eq!(reopened.steps[0].name, "Overall event volume");
+    assert!(reopened.is_default);
+    assert_eq!(
+        storage
+            .knowledge_entries()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.is_default)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn history_retention_prunes_completed_and_startup_stale_conversations() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::open(options(directory.path())).await.unwrap();
+    let settings = storage.settings().await.unwrap();
+    assert_eq!(
+        settings.settings["investigation_history_retention_days"],
+        30
+    );
+    let old_timestamp = conversation_timestamp() - 31 * 24 * 60 * 60 * 1_000;
+
+    let mut completed = StoredAiConversation::new(
+        "expired-chat".to_owned(),
+        "model".to_owned(),
+        vec!["view".to_owned()],
+        "Old question".to_owned(),
+    );
+    completed.created_at_ms = old_timestamp;
+    completed.updated_at_ms = old_timestamp;
+    completed.messages.push(StoredAiConversationMessage {
+        role: "assistant".to_owned(),
+        content: "Old result".to_owned(),
+        result: None,
+    });
+    storage.create_ai_conversation(completed).await.unwrap();
+
+    let mut active = StoredAiConversation::new(
+        "active-chat".to_owned(),
+        "model".to_owned(),
+        vec!["view".to_owned()],
+        "Long investigation".to_owned(),
+    );
+    active.created_at_ms = old_timestamp;
+    active.updated_at_ms = old_timestamp;
+    storage.create_ai_conversation(active).await.unwrap();
+
+    let summaries = storage.ai_conversations().await.unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].id, "active-chat");
+
+    let settings = storage.settings().await.unwrap();
+    let mut updated_settings = settings.settings;
+    updated_settings["investigation_history_retention_days"] = json!(1);
+    storage
+        .save_settings(updated_settings, &settings.revision)
+        .await
+        .unwrap();
+    assert_eq!(storage.ai_conversations().await.unwrap().len(), 1);
+
+    drop(storage);
+    let storage = Storage::open(options(directory.path())).await.unwrap();
+    assert!(storage.ai_conversations().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn knowledge_lifecycle_is_encrypted_and_revision_checked() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::open(options(directory.path())).await.unwrap();
     let original = storage.create_knowledge(knowledge_entry()).await.unwrap();
-    assert_eq!(storage.knowledge_entries().await.unwrap().len(), 1);
+    assert_eq!(
+        storage
+            .knowledge_entries()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|entry| !entry.is_default)
+            .count(),
+        1
+    );
     let mut draft = original.clone();
     draft.status = KnowledgeStatus::Published;
     let published = storage
@@ -65,7 +171,9 @@ async fn knowledge_lifecycle_is_encrypted_and_revision_checked() {
         .remove_knowledge(&original.id, &restored.revision)
         .await
         .unwrap();
-    assert!(storage.knowledge_entries().await.unwrap().is_empty());
+    let remaining = storage.knowledge_entries().await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert!(remaining[0].is_default);
     assert!(matches!(
         storage.knowledge_entry(&original.id).await,
         Err(StorageError::KnowledgeNotFound)
@@ -273,8 +381,10 @@ async fn knowledge_entry_capacity_is_bounded() {
         storage.create_knowledge(knowledge_entry()).await,
         Err(StorageError::Invalid)
     ));
+    let entries = storage.knowledge_entries().await.unwrap();
+    assert_eq!(entries.len(), knowledge::MAX_KNOWLEDGE_ENTRIES + 1);
     assert_eq!(
-        storage.knowledge_entries().await.unwrap().len(),
+        entries.iter().filter(|entry| !entry.is_default).count(),
         knowledge::MAX_KNOWLEDGE_ENTRIES
     );
 }
@@ -695,6 +805,7 @@ async fn ai_conversations_survive_reopen_and_are_encrypted_revisioned_and_deleta
 async fn full_ai_history_evicts_the_least_recently_updated_conversation() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::open(options(directory.path())).await.unwrap();
+    let recent_timestamp = conversation_timestamp() - 60_000;
     let mut created = Vec::new();
     for index in 0..MAX_AI_CONVERSATIONS {
         let mut conversation = StoredAiConversation::new(
@@ -703,7 +814,7 @@ async fn full_ai_history_evicts_the_least_recently_updated_conversation() {
             vec!["view-1".to_owned()],
             format!("Question {index}"),
         );
-        conversation.created_at_ms = 1_000 + index as i64;
+        conversation.created_at_ms = recent_timestamp + index as i64;
         conversation.updated_at_ms = conversation.created_at_ms;
         created.push(storage.create_ai_conversation(conversation).await.unwrap());
     }

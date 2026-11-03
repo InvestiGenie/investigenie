@@ -39,7 +39,7 @@ impl Snapshot {
             ai_conversations: BTreeMap::new(),
             knowledge: BTreeMap::new(),
             settings: PublicSettings {
-                settings: json!({"theme":"system", "default_timezone":"UTC"}),
+                settings: json!({"theme":"system", "default_timezone":"UTC", "investigation_history_retention_days":30}),
                 revision: revision(),
             },
         }
@@ -115,7 +115,13 @@ impl Snapshot {
                 return Err(StorageError::Invalid);
             }
         }
-        if self.knowledge.len() > knowledge::MAX_KNOWLEDGE_ENTRIES {
+        if self
+            .knowledge
+            .values()
+            .filter(|entry| !entry.is_default)
+            .count()
+            > knowledge::MAX_KNOWLEDGE_ENTRIES
+        {
             return Err(StorageError::Invalid);
         }
         for (id, entry) in &self.knowledge {

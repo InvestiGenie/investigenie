@@ -1,6 +1,9 @@
 use super::*;
 
 pub(super) const MAX_KNOWLEDGE_ENTRIES: usize = 128;
+pub const MAX_INVESTIGATION_PLAYBOOK_STEPS: usize = 8;
+pub const MAX_INVESTIGATION_PLAYBOOK_QUERY_BYTES: usize = 8_192;
+pub const DEFAULT_INVESTIGATION_PLAYBOOK_ID: &str = "00000000-0000-4000-8000-000000000001";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -8,6 +11,7 @@ pub enum KnowledgeKind {
     ServiceContext,
     Runbook,
     ResolvedIncident,
+    InvestigationPlaybook,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -18,6 +22,17 @@ pub enum KnowledgeStatus {
     Archived,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InvestigationPlaybookStep {
+    pub name: String,
+    #[serde(default)]
+    pub data_view_ids: Vec<String>,
+    pub query: String,
+    #[serde(default)]
+    pub breakdown_field: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct KnowledgeEntry {
@@ -25,10 +40,14 @@ pub struct KnowledgeEntry {
     pub id: String,
     #[serde(default)]
     pub revision: String,
+    #[serde(default)]
+    pub is_default: bool,
     pub title: String,
     pub kind: KnowledgeKind,
     pub status: KnowledgeStatus,
     pub content: String,
+    #[serde(default)]
+    pub steps: Vec<InvestigationPlaybookStep>,
     #[serde(default)]
     pub services: Vec<String>,
     #[serde(default)]
@@ -68,7 +87,32 @@ pub(super) fn validate_entry(entry: &KnowledgeEntry) -> Result<(), StorageError>
                     && url.password().is_none()
             })
     });
+    let steps_valid = match entry.kind {
+        KnowledgeKind::InvestigationPlaybook => {
+            !entry.steps.is_empty()
+                && entry.steps.len() <= MAX_INVESTIGATION_PLAYBOOK_STEPS
+                && entry.steps.iter().all(|step| {
+                    !step.name.trim().is_empty()
+                        && step.name.len() <= 128
+                        && step.query.len() <= MAX_INVESTIGATION_PLAYBOOK_QUERY_BYTES
+                        && step.data_view_ids.len() <= 5
+                        && step.data_view_ids.iter().all(|id| valid_id(id))
+                        && (step.query.trim().is_empty() || !step.data_view_ids.is_empty())
+                        && step
+                            .breakdown_field
+                            .as_ref()
+                            .is_none_or(|field| !field.trim().is_empty() && field.len() <= 1024)
+                        && (step.breakdown_field.is_none() || !step.data_view_ids.is_empty())
+                })
+        }
+        _ => entry.steps.is_empty(),
+    };
+    let default_valid = !entry.is_default
+        || (entry.id == DEFAULT_INVESTIGATION_PLAYBOOK_ID
+            && entry.kind == KnowledgeKind::InvestigationPlaybook);
     if !valid_id(&entry.id)
+        || (entry.id == DEFAULT_INVESTIGATION_PLAYBOOK_ID && !entry.is_default)
+        || !default_valid
         || Uuid::parse_str(&entry.revision).is_err()
         || entry.title.trim().is_empty()
         || entry.title.len() > 256
@@ -79,13 +123,70 @@ pub(super) fn validate_entry(entry: &KnowledgeEntry) -> Result<(), StorageError>
         || !labels_valid
         || !scopes_valid
         || !source_valid
+        || !steps_valid
     {
         return Err(StorageError::Invalid);
     }
     Ok(())
 }
 
+fn default_investigation_playbook() -> KnowledgeEntry {
+    let now = conversation_timestamp();
+    KnowledgeEntry {
+        id: DEFAULT_INVESTIGATION_PLAYBOOK_ID.to_owned(),
+        revision: revision(),
+        is_default: true,
+        title: "Default investigation playbook".to_owned(),
+        kind: KnowledgeKind::InvestigationPlaybook,
+        status: KnowledgeStatus::Published,
+        content: "Collect bounded activity aggregates for each selected Data View. Compare a bounded investigation window with the immediately preceding window of the same duration. For All time, report descriptive aggregates without a baseline.".to_owned(),
+        steps: vec![InvestigationPlaybookStep {
+            name: "Overall activity".to_owned(),
+            data_view_ids: Vec::new(),
+            query: String::new(),
+            breakdown_field: None,
+        }],
+        services: Vec::new(),
+        environments: Vec::new(),
+        connection_ids: Vec::new(),
+        data_view_ids: Vec::new(),
+        tags: vec!["default".to_owned()],
+        source_url: None,
+        created_at_ms: now,
+        updated_at_ms: now,
+    }
+}
+
 impl Storage {
+    pub async fn ensure_default_investigation_playbook(&self) -> Result<(), StorageError> {
+        let entry = default_investigation_playbook();
+        if let Some(file) = &self.file {
+            let id = entry.id.clone();
+            let exists = file
+                .read(move |snapshot| Ok(snapshot.knowledge.contains_key(&id)))
+                .await?;
+            if exists {
+                return Ok(());
+            }
+            return file
+                .mutate(move |snapshot| {
+                    snapshot.knowledge.entry(entry.id.clone()).or_insert(entry);
+                    Ok(())
+                })
+                .await;
+        }
+        let encrypted = self.encode_knowledge(&entry)?;
+        sqlx::query(
+            "INSERT INTO knowledge_entries (id,revision,entry_encrypted) VALUES ($1,$2,$3) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&entry.id)
+        .bind(&entry.revision)
+        .bind(encrypted)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn knowledge_entries(&self) -> Result<Vec<KnowledgeEntry>, StorageError> {
         let mut entries: Vec<KnowledgeEntry> = if let Some(file) = &self.file {
             file.read(|snapshot| Ok(snapshot.knowledge.values().cloned().collect()))
@@ -132,7 +233,9 @@ impl Storage {
         &self,
         mut entry: KnowledgeEntry,
     ) -> Result<KnowledgeEntry, StorageError> {
-        entry.id = Uuid::new_v4().to_string();
+        if !entry.is_default {
+            entry.id = Uuid::new_v4().to_string();
+        }
         entry.revision = revision();
         entry.created_at_ms = conversation_timestamp();
         entry.updated_at_ms = entry.created_at_ms;
@@ -140,7 +243,13 @@ impl Storage {
         if let Some(file) = &self.file {
             return file
                 .mutate(move |snapshot| {
-                    if snapshot.knowledge.len() >= MAX_KNOWLEDGE_ENTRIES {
+                    if snapshot
+                        .knowledge
+                        .values()
+                        .filter(|entry| !entry.is_default)
+                        .count()
+                        >= MAX_KNOWLEDGE_ENTRIES
+                    {
                         return Err(StorageError::Invalid);
                     }
                     snapshot.knowledge.insert(entry.id.clone(), entry.clone());
@@ -153,9 +262,11 @@ impl Storage {
         sqlx::query("SELECT pg_advisory_xact_lock(1229407566, 2)")
             .execute(&mut *transaction)
             .await?;
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM knowledge_entries")
-            .fetch_one(&mut *transaction)
-            .await?;
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM knowledge_entries WHERE id <> $1")
+                .bind(DEFAULT_INVESTIGATION_PLAYBOOK_ID)
+                .fetch_one(&mut *transaction)
+                .await?;
         if count >= MAX_KNOWLEDGE_ENTRIES as i64 {
             return Err(StorageError::Invalid);
         }
@@ -192,6 +303,7 @@ impl Storage {
                         return Err(StorageError::Conflict);
                     }
                     entry.created_at_ms = current.created_at_ms;
+                    entry.is_default = current.is_default;
                     entry.updated_at_ms = entry.updated_at_ms.max(current.updated_at_ms);
                     validate_entry(&entry)?;
                     snapshot.knowledge.insert(entry.id.clone(), entry.clone());
@@ -210,6 +322,7 @@ impl Storage {
             return Err(StorageError::Conflict);
         }
         entry.created_at_ms = current.created_at_ms;
+        entry.is_default = current.is_default;
         entry.updated_at_ms = entry.updated_at_ms.max(current.updated_at_ms);
         validate_entry(&entry)?;
         sqlx::query("UPDATE knowledge_entries SET revision=$2,entry_encrypted=$3 WHERE id=$1")
@@ -235,6 +348,9 @@ impl Storage {
                     if current.revision != expected {
                         return Err(StorageError::Conflict);
                     }
+                    if current.is_default {
+                        return Err(StorageError::Invalid);
+                    }
                     snapshot.knowledge.remove(&id);
                     Ok(())
                 })
@@ -250,6 +366,9 @@ impl Storage {
             None => return Err(StorageError::KnowledgeNotFound),
             Some(actual) if actual != expected => return Err(StorageError::Conflict),
             _ => {}
+        }
+        if id == DEFAULT_INVESTIGATION_PLAYBOOK_ID {
+            return Err(StorageError::Invalid);
         }
         sqlx::query("DELETE FROM knowledge_entries WHERE id=$1")
             .bind(id)

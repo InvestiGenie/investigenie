@@ -2,18 +2,22 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { Archive, BookOpen, Check, Edit3, Plus, RefreshCw, Save, Search, Trash2, Undo2, X } from 'lucide-react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { api, type ConnectionSummary, type DataViewSummary, type KnowledgeEntry, type KnowledgeInput, type KnowledgeKind, type KnowledgeStatus } from './api';
+import { api, type ConnectionSummary, type DataViewSummary, type InvestigationPlaybookStep, type KnowledgeEntry, type KnowledgeInput, type KnowledgeKind, type KnowledgeStatus } from './api';
 import { ErrorAlert, StatusNotice } from './PageFeedback';
 import { errorMessage } from './format';
 import { initialTimeZone } from './time';
 
-const kinds: Record<KnowledgeKind, string> = { service_context: 'Service context', runbook: 'Runbook', resolved_incident: 'Resolved incident' };
+const kinds: Record<KnowledgeKind, string> = { service_context: 'Service context', runbook: 'Runbook', resolved_incident: 'Resolved incident', investigation_playbook: 'Investigation playbook' };
 const statuses: Record<KnowledgeStatus, string> = { draft: 'Draft', published: 'Published', archived: 'Archived' };
-type KnowledgeForm = Omit<KnowledgeInput, 'services' | 'environments' | 'tags' | 'source_url'> & { services: string; environments: string; tags: string; source_url: string };
+type KnowledgeForm = Omit<KnowledgeInput, 'services' | 'environments' | 'tags' | 'source_url' | 'steps'> & { services: string; environments: string; tags: string; source_url: string; steps: InvestigationPlaybookStep[] };
+
+function emptyPlaybookStep(): InvestigationPlaybookStep {
+  return { name: '', data_view_ids: [], query: '', breakdown_field: null };
+}
 
 function formFor(entry?: KnowledgeEntry): KnowledgeForm {
   return {
-    title: entry?.title ?? '', kind: entry?.kind ?? 'runbook', status: entry?.status ?? 'draft', content: entry?.content ?? '',
+    title: entry?.title ?? '', kind: entry?.kind ?? 'runbook', status: entry?.status ?? 'draft', content: entry?.content ?? '', steps: entry?.steps ?? [],
     services: entry?.services.join(', ') ?? '', environments: entry?.environments.join(', ') ?? '', tags: entry?.tags.join(', ') ?? '',
     connection_ids: entry?.connection_ids ?? [], data_view_ids: entry?.data_view_ids ?? [], source_url: entry?.source_url ?? '',
   };
@@ -21,7 +25,20 @@ function formFor(entry?: KnowledgeEntry): KnowledgeForm {
 
 function inputFor(form: KnowledgeForm): KnowledgeInput {
   const labels = (value: string) => [...new Set(value.split(',').map((label) => label.trim()).filter(Boolean))];
-  return { ...form, title: form.title.trim(), services: labels(form.services), environments: labels(form.environments), tags: labels(form.tags), source_url: form.source_url.trim() || null };
+  return {
+    ...form,
+    title: form.title.trim(),
+    services: labels(form.services),
+    environments: labels(form.environments),
+    tags: labels(form.tags),
+    source_url: form.source_url.trim() || null,
+    steps: form.kind === 'investigation_playbook' ? form.steps.map((step) => ({
+      ...step,
+      name: step.name.trim(),
+      query: step.query.trim(),
+      breakdown_field: step.breakdown_field?.trim() || null,
+    })) : [],
+  };
 }
 
 function EntryContent({ content }: { content: string }) {
@@ -120,6 +137,19 @@ export default function KnowledgePage({ connections = [], dataViews = [], onDirt
     event.preventDefault();
     if (!form || busy) return;
     if (contentBytes > 32_768) { setError('Content exceeds the 32768-byte limit.'); return; }
+    if (form.kind === 'investigation_playbook' && (
+      form.steps.length === 0
+      || form.steps.length > 8
+      || form.steps.some((step) => !step.name.trim()
+        || step.data_view_ids.length > 5
+        || new TextEncoder().encode(step.query).length > 8_192
+        || new TextEncoder().encode(step.breakdown_field ?? '').length > 1_024
+        || ((step.query.trim() || step.breakdown_field?.trim()) && step.data_view_ids.length === 0)
+      )
+    )) {
+      setError('Each playbook step needs a name; query or breakdown steps must target at least one Data View.');
+      return;
+    }
     setBusy(true); setError(''); setNotice('');
     try {
       const input = inputFor(form);
@@ -173,7 +203,7 @@ export default function KnowledgePage({ connections = [], dataViews = [], onDirt
       <section className="knowledge-list" aria-label="Knowledge entries">
         <div className="knowledge-list-heading"><h2>Entries</h2><span>{visible.length} / {entries.length}</span></div>
         {loading ? <p role="status">Loading knowledge...</p> : !visible.length ? <div className="knowledge-empty"><BookOpen size={28} aria-hidden="true" /><h3>{entries.length ? 'No matching entries' : 'No knowledge entries'}</h3></div> : visible.map((entry) => <button className={`knowledge-list-item${selected?.id === entry.id ? ' selected' : ''}`} key={entry.id} aria-pressed={selected?.id === entry.id} disabled={busy} onClick={() => open(entry)}>
-          <strong>{entry.title}</strong><span>{kinds[entry.kind]} <span className={`knowledge-status ${entry.status}`}>{statuses[entry.status]}</span></span>
+          <strong>{entry.title}</strong><span>{kinds[entry.kind]} {entry.is_default && <span className="knowledge-default">Default</span>} <span className={`knowledge-status ${entry.status}`}>{statuses[entry.status]}</span></span>
           <span>{entry.services.join(', ') || 'All services'}</span><time dateTime={new Date(entry.updated_at_ms).toISOString()}>{date(entry.updated_at_ms)}</time>
         </button>)}
       </section>
@@ -182,13 +212,29 @@ export default function KnowledgePage({ connections = [], dataViews = [], onDirt
           <div className="knowledge-detail-heading"><h2>{selected ? 'Edit entry' : 'New entry'}</h2><button type="button" className="quiet-button" disabled={busy} onClick={() => { if (canLeave()) { setForm(null); setBaseline(null); setError(''); } }}><X size={14} /> Cancel</button></div>
           <fieldset className="knowledge-fields" disabled={busy}>
             <label className="knowledge-full">Title<input required maxLength={256} value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} /></label>
-            <label>Type<select value={form.kind} onChange={(event) => setForm({ ...form, kind: event.target.value as KnowledgeKind })}>{Object.entries(kinds).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+            <label>Type<select disabled={busy || selected?.is_default === true} value={form.kind} onChange={(event) => {
+              const nextKind = event.target.value as KnowledgeKind;
+              setForm({ ...form, kind: nextKind, steps: nextKind === 'investigation_playbook' ? form.kind === 'investigation_playbook' ? form.steps : [emptyPlaybookStep()] : [] });
+            }}>{Object.entries(kinds).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
             <label>Status<select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value as KnowledgeStatus })}>{Object.entries(statuses).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
             <label>Services<input value={form.services} onChange={(event) => setForm({ ...form, services: event.target.value })} placeholder="payments, checkout" /></label>
             <label>Environments<input value={form.environments} onChange={(event) => setForm({ ...form, environments: event.target.value })} placeholder="production, staging" /></label>
             <label className="knowledge-full">Tags<input value={form.tags} onChange={(event) => setForm({ ...form, tags: event.target.value })} placeholder="database, connection-pool" /></label>
             <label className="knowledge-full">Source link<input type="url" maxLength={2048} value={form.source_url} onChange={(event) => setForm({ ...form, source_url: event.target.value })} /></label>
           </fieldset>
+          {form.kind === 'investigation_playbook' && <section className="knowledge-playbook-steps" aria-label="Investigation playbook steps">
+            <div className="knowledge-playbook-heading"><h3>Investigation steps</h3><button type="button" className="quiet-button" disabled={busy || form.steps.length >= 8} onClick={() => setForm({ ...form, steps: [...form.steps, emptyPlaybookStep()] })}><Plus size={14} /> Add step</button></div>
+            {form.steps.map((step, index) => <fieldset className="knowledge-playbook-step" key={index} disabled={busy}>
+              <legend>Step {index + 1}</legend>
+              <label>Step name<input required maxLength={128} value={step.name} onChange={(event) => setForm({ ...form, steps: form.steps.map((item, itemIndex) => itemIndex === index ? { ...item, name: event.target.value } : item) })} /></label>
+              <fieldset className="knowledge-playbook-targets"><legend>Target Data Views</legend>
+                {dataViews.length === 0 ? <span className="knowledge-muted">No Data Views available</span> : dataViews.map((view) => <label key={view.id}><input type="checkbox" checked={step.data_view_ids.includes(view.id)} onChange={(event) => setForm({ ...form, steps: form.steps.map((item, itemIndex) => itemIndex === index ? { ...item, data_view_ids: event.target.checked ? [...item.data_view_ids, view.id] : item.data_view_ids.filter((id) => id !== view.id) } : item) })} />{view.name}</label>)}
+              </fieldset>
+              <label>Query<textarea aria-label={`Query for step ${index + 1}`} maxLength={8_192} value={step.query} onChange={(event) => setForm({ ...form, steps: form.steps.map((item, itemIndex) => itemIndex === index ? { ...item, query: event.target.value } : item) })} /></label>
+              <label>Breakdown field<input aria-label={`Breakdown field for step ${index + 1}`} maxLength={1_024} value={step.breakdown_field ?? ''} onChange={(event) => setForm({ ...form, steps: form.steps.map((item, itemIndex) => itemIndex === index ? { ...item, breakdown_field: event.target.value || null } : item) })} /></label>
+              <button type="button" className="quiet-button" aria-label={`Remove step ${index + 1}`} disabled={busy || form.steps.length <= 1} onClick={() => setForm({ ...form, steps: form.steps.filter((_, itemIndex) => itemIndex !== index) })}><Trash2 size={14} /> Remove step</button>
+            </fieldset>)}
+          </section>}
           <div className="knowledge-scopes"><ScopePicker label="Connections" disabled={busy} choices={connections} selected={form.connection_ids} onChange={(ids) => setForm({ ...form, connection_ids: ids })} /><ScopePicker label="Data Views" disabled={busy} choices={dataViews} selected={form.data_view_ids} onChange={(ids) => setForm({ ...form, data_view_ids: ids })} /></div>
           <div className="knowledge-editor-heading"><label htmlFor="knowledge-content">Content</label><div role="tablist" aria-label="Content mode"><button type="button" role="tab" aria-selected={!preview} onClick={() => setPreview(false)}>Write</button><button type="button" role="tab" aria-selected={preview} onClick={() => setPreview(true)}>Preview</button></div></div>
           {preview ? <div className="knowledge-preview" role="tabpanel"><EntryContent content={form.content} /></div> : <textarea id="knowledge-content" required maxLength={32_768} disabled={busy} value={form.content} onChange={(event) => setForm({ ...form, content: event.target.value })} />}
@@ -199,8 +245,17 @@ export default function KnowledgePage({ connections = [], dataViews = [], onDirt
             {selected.status === 'draft' && <button className="quiet-button" disabled={busy} onClick={() => void changeStatus('published')}><Check size={14} /> Publish</button>}
             {selected.status === 'published' && <button className="quiet-button" disabled={busy} onClick={() => void changeStatus('draft')}><Undo2 size={14} /> Return to draft</button>}
             {selected.status === 'archived' ? <button className="quiet-button" disabled={busy} onClick={() => void changeStatus('draft')}><Undo2 size={14} /> Restore to draft</button> : <button className="quiet-button" disabled={busy} onClick={() => void changeStatus('archived')}><Archive size={14} /> Archive</button>}
-            <button className="icon-button knowledge-delete" title="Delete entry permanently" aria-label="Delete entry permanently" disabled={busy} onClick={() => void remove()}><Trash2 size={15} /></button>
+            <button className="icon-button knowledge-delete" title={selected.is_default ? 'Default playbook cannot be deleted' : 'Delete entry permanently'} aria-label="Delete entry permanently" disabled={busy || selected.is_default === true} onClick={() => void remove()}><Trash2 size={15} /></button>
           </div>
+          {selected.kind === 'investigation_playbook' && <section className="knowledge-playbook-details" aria-label="Investigation playbook steps">
+            <h3>Investigation steps</h3>
+            {(selected.steps ?? []).map((step, index) => <article key={`${step.name}-${index}`}>
+              <strong>{index + 1}. {step.name}</strong>
+              <span>Data Views: {step.data_view_ids.length ? step.data_view_ids.map((id) => dataViews.find((view) => view.id === id)?.name ?? `${id} (unavailable)`).join(', ') : 'All selected Data Views'}</span>
+              {step.breakdown_field && <span>Breakdown: {step.breakdown_field}</span>}
+              <pre>{step.query || '(empty query; all records)'}</pre>
+            </article>)}
+          </section>}
           <dl className="knowledge-metadata">{([
             ['Services', selected.services.join(', ') || 'All services'], ['Environments', selected.environments.join(', ') || 'All environments'],
             ['Connections', selected.connection_ids.map((id) => connections.find((item) => item.id === id)?.name ?? `${id} (unavailable)`).join(', ') || 'All connections'],

@@ -81,13 +81,27 @@ export type AIModelSummary = {
   has_api_key: true;
 };
 
-export type KnowledgeKind = 'service_context' | 'runbook' | 'resolved_incident';
+export type ApplicationSettings = {
+  theme?: 'system' | 'light' | 'dark';
+  default_timezone?: string;
+  investigation_history_retention_days?: number;
+  [key: string]: unknown;
+};
+
+export type KnowledgeKind = 'service_context' | 'runbook' | 'resolved_incident' | 'investigation_playbook';
 export type KnowledgeStatus = 'draft' | 'published' | 'archived';
+export type InvestigationPlaybookStep = {
+  name: string;
+  data_view_ids: string[];
+  query: string;
+  breakdown_field?: string | null;
+};
 export type KnowledgeInput = {
   title: string;
   kind: KnowledgeKind;
   status: KnowledgeStatus;
   content: string;
+  steps?: InvestigationPlaybookStep[];
   services: string[];
   environments: string[];
   connection_ids: string[];
@@ -100,6 +114,7 @@ export type KnowledgeEntry = KnowledgeInput & {
   revision: string;
   created_at_ms: number;
   updated_at_ms: number;
+  is_default?: boolean;
 };
 
 export type AIModelRequest = {
@@ -125,6 +140,19 @@ export type InvestigationFinding = {
 export type InvestigationResult = {
   summary: string;
   findings: InvestigationFinding[];
+  playbook_evidence?: Array<{
+    playbook_id: string;
+    playbook_title: string;
+    step_name: string;
+    data_view_id: string;
+    data_view_name: string;
+    index: string;
+    query: string;
+    breakdown_field: string | null;
+    current: PlaybookWindowEvidence | null;
+    baseline: PlaybookWindowEvidence | null;
+    error: string | null;
+  }>;
   sources: Array<{
     data_view_id: string;
     name: string;
@@ -147,6 +175,16 @@ export type InvestigationResult = {
   complete?: boolean;
   evidence_status?: 'sample_supported' | 'insufficient_evidence';
   conclusions_verified?: boolean;
+};
+
+export type PlaybookWindowEvidence = {
+  time_range_start_ms: number | null;
+  time_range_end_ms: number | null;
+  matched_records: number | null;
+  total_relation: string | null;
+  aggregate_records: number | null;
+  aggregations: unknown[];
+  histogram_unavailable_reason: string | null;
 };
 
 export type InvestigationControls = {
@@ -315,6 +353,12 @@ function jsonMutation(method: 'POST' | 'PUT' | 'DELETE', body?: unknown, revisio
 }
 
 export const api = {
+  async settings(signal?: AbortSignal): Promise<{ settings: ApplicationSettings; revision: string }> {
+    return request<{ settings: ApplicationSettings; revision: string }>('/api/settings', { signal });
+  },
+  async updateSettings(settings: ApplicationSettings, revision: string): Promise<{ settings: ApplicationSettings; revision: string }> {
+    return request<{ settings: ApplicationSettings; revision: string }>('/api/settings', jsonMutation('PUT', { settings }, revision));
+  },
   async knowledgeEntries(signal?: AbortSignal): Promise<KnowledgeEntry[]> {
     return (await request<{ entries: KnowledgeEntry[] }>('/api/knowledge', { signal })).entries;
   },

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import { ArrowUp, BookOpen, BrainCircuit, Check, CircleAlert, CirclePause, Database, Play, Save, Search, Square, Trash2, X } from 'lucide-react';
-import { api, type AIConversation, type AIConversationSummary, type AIModelSummary, type DataViewSummary, type InvestigationJob, type InvestigationResult, type KnowledgeInput, type SearchRequest } from './api';
+import { api, type AIConversation, type AIConversationSummary, type AIModelSummary, type ApplicationSettings, type DataViewSummary, type InvestigationJob, type InvestigationResult, type KnowledgeInput, type SearchRequest } from './api';
 import TimeRangePicker from './TimeRangePicker';
 import { getPreference, setPreference, type PreferenceName } from './preferences';
 import { errorMessage } from './format';
@@ -10,6 +10,7 @@ const CHECK_IN_OPTIONS = [60, 120, 300, 600, 1800, 3600];
 const ACTIVE_POLL_MS = 1_000;
 const PAUSED_POLL_MS = 5_000;
 const MAX_DOCUMENT_SOURCE_CHARS = 6_000;
+const DEFAULT_HISTORY_RETENTION_DAYS = 30;
 
 export type DocumentInvestigationSeed = {
   requestId: string;
@@ -115,12 +116,36 @@ function InvestigationResultView({ result, label, draftContext, onOpenKnowledge 
     }
   }
 
+  function playbookWindowLabel(window: NonNullable<InvestigationResult['playbook_evidence']>[number]['current'], baseline = false) {
+    if (!window) return baseline ? 'Not run (All time or unavailable range)' : 'Unavailable';
+    if (window.time_range_start_ms === null || window.time_range_end_ms === null) return 'All time';
+    return `${window.time_range_start_ms} to ${window.time_range_end_ms} Unix ms`;
+  }
+
   return <article className="ai-result">
     <div className="ai-result-label"><BrainCircuit size={15} aria-hidden="true" /> {label}</div>
     <p className="ai-evidence-warning">AI hypotheses, not verified causes. Citations identify supporting samples; they do not prove the conclusion.</p>
     <section className="ai-evidence-coverage" aria-label="Evidence coverage"><strong>Evidence coverage</strong>
       {result.sources.some((source) => source.evidence_queries !== undefined) ? <><span>{result.sources.reduce((total, source) => total + source.records_examined, 0).toLocaleString()} sampled records</span><span>{result.sources.reduce((total, source) => total + (source.evidence_queries?.length ?? 0), 0)} bounded evidence queries</span><span>Not an exhaustive or representative scan</span></> : <span>Detailed sampling coverage was not recorded in this saved result.</span>}
     </section>
+    {result.playbook_evidence && result.playbook_evidence.length > 0 && <details className="ai-playbook-evidence"><summary>Investigation playbook queries ({result.playbook_evidence.length})</summary>
+      {result.playbook_evidence.map((evidence, index) => <section className="ai-playbook-query" key={`${evidence.playbook_id}-${evidence.step_name}-${evidence.data_view_id}-${index}`}>
+        <h4>{evidence.step_name} · {evidence.data_view_name}</h4>
+        <span>{evidence.playbook_title} · {evidence.index}</span>
+        <code className="ai-playbook-query-text">{evidence.query || '(empty query; all records)'}</code>
+        {evidence.breakdown_field && <span>Breakdown: {evidence.breakdown_field}</span>}
+        {evidence.error && <p className="ai-caveat">{evidence.error}</p>}
+        {([['Current', evidence.current], ['Baseline', evidence.baseline]] as const).map(([label, window]) => <div className="ai-playbook-window" key={label}>
+          <strong>{label} · {playbookWindowLabel(window, label === 'Baseline')}</strong>
+          {window && <>
+            <span>Matched: {window.matched_records === null ? 'unavailable' : `${window.matched_records.toLocaleString()}${window.total_relation === 'gte' ? '+' : ''}`}</span>
+            <span>Aggregated: {window.aggregate_records === null ? 'unavailable' : window.aggregate_records.toLocaleString()}</span>
+            {window.histogram_unavailable_reason && <span>{window.histogram_unavailable_reason}</span>}
+            {window.aggregations.length > 0 && <pre>{JSON.stringify(window.aggregations, null, 2)}</pre>}
+          </>}
+        </div>)}
+      </section>)}
+    </details>}
     {result.evidence_status === 'insufficient_evidence' && <p className="ai-evidence-warning" role="status">Insufficient evidence for an incident hypothesis. An empty sample does not establish that no incident occurred.</p>}
     <p className="ai-summary">{result.summary}</p>
     <section className="ai-token-usage" aria-label="Token usage">
@@ -180,6 +205,12 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
   const [conversationLoading, setConversationLoading] = useState(false);
   const [conversationBusy, setConversationBusy] = useState(false);
   const [conversationError, setConversationError] = useState('');
+  const [serverSettings, setServerSettings] = useState<ApplicationSettings>({});
+  const [settingsRevision, setSettingsRevision] = useState('');
+  const [retentionDays, setRetentionDays] = useState(String(DEFAULT_HISTORY_RETENTION_DAYS));
+  const [retentionSaving, setRetentionSaving] = useState(false);
+  const [retentionNotice, setRetentionNotice] = useState('');
+  const [retentionError, setRetentionError] = useState('');
   const [submittedQuestion, setSubmittedQuestion] = useState('');
   const [submittedScope, setSubmittedScope] = useState({ dataViewIds: [] as string[], modelId: '' });
   const [starting, setStarting] = useState(false);
@@ -202,6 +233,22 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
       .then((items) => { if (!controller.signal.aborted) setConversations(items); })
       .catch((reason: unknown) => {
         if (!controller.signal.aborted) setConversationError(errorMessage(reason, 'Could not load AI history'));
+      });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    api.settings(controller.signal)
+      .then(({ settings, revision }) => {
+        if (controller.signal.aborted) return;
+        setServerSettings(settings);
+        setSettingsRevision(revision);
+        const days = settings.investigation_history_retention_days;
+        setRetentionDays(String(typeof days === 'number' && Number.isInteger(days) && days >= 1 && days <= 3_650 ? days : DEFAULT_HISTORY_RETENTION_DAYS));
+      })
+      .catch((reason: unknown) => {
+        if (!controller.signal.aborted) setRetentionError(errorMessage(reason, 'Could not load history retention settings'));
       });
     return () => controller.abort();
   }, []);
@@ -320,6 +367,29 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
       setConversationError('');
     } catch (reason) {
       setConversationError(errorMessage(reason, 'Could not refresh AI history'));
+    }
+  }
+
+  async function saveHistoryRetention() {
+    const days = Number(retentionDays);
+    if (!Number.isInteger(days) || days < 1 || days > 3_650 || !settingsRevision || retentionSaving) {
+      setRetentionError('Retention must be a whole number from 1 to 3650 days.');
+      return;
+    }
+    setRetentionSaving(true);
+    setRetentionError('');
+    setRetentionNotice('');
+    try {
+      const updated = await api.updateSettings({ ...serverSettings, investigation_history_retention_days: days }, settingsRevision);
+      setServerSettings(updated.settings);
+      setSettingsRevision(updated.revision);
+      setRetentionDays(String(days));
+      setRetentionNotice('History retention saved.');
+      await refreshConversations();
+    } catch (reason) {
+      setRetentionError(errorMessage(reason, 'Could not save history retention'));
+    } finally {
+      setRetentionSaving(false);
     }
   }
 
@@ -465,10 +535,15 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
           <option value="">New investigation</option>
           {conversations.map((conversation) => <option key={conversation.id} value={conversation.id}>{conversation.title}</option>)}
         </select>
+          <label className="ai-retention-control" htmlFor="ai-history-retention">Retention (days)<input id="ai-history-retention" aria-label="History retention days" type="number" min="1" max="3650" step="1" value={retentionDays} disabled={retentionSaving || !settingsRevision} onChange={(event) => { setRetentionDays(event.target.value); setRetentionNotice(''); }} /></label>
+          <button type="button" className="quiet-button ai-retention-save" aria-label="Save history retention" title="Save history retention" disabled={retentionSaving || !settingsRevision || !Number.isInteger(Number(retentionDays)) || Number(retentionDays) < 1 || Number(retentionDays) > 3_650 || Number(retentionDays) === Number(serverSettings.investigation_history_retention_days ?? DEFAULT_HISTORY_RETENTION_DAYS)} onClick={() => void saveHistoryRetention()}><Save size={14} aria-hidden="true" /></button>
         {activeConversation && <button type="button" className="quiet-button" aria-label="Delete conversation" title="Delete conversation" disabled={busy || conversationBusy} onClick={() => void removeConversation()}><Trash2 size={14} aria-hidden="true" /></button>}
         {conversationLoading && <span role="status">Loading history…</span>}
+          {retentionSaving && <span role="status">Saving retention…</span>}
+          {retentionNotice && <span className="ai-retention-notice" role="status">{retentionNotice}</span>}
       </div>
       {conversationError && <div className="alert" role="alert"><span>{conversationError}</span><button type="button" aria-label="Dismiss history error" onClick={() => setConversationError('')}>×</button></div>}
+        {retentionError && <div className="alert ai-retention-error" role="alert"><span>{retentionError}</span><button type="button" aria-label="Dismiss retention error" onClick={() => setRetentionError('')}>×</button></div>}
       <div className="ai-controls-row">
       <div className="ai-dataview-picker" ref={pickerRef}>
         <button ref={pickerTriggerRef} type="button" className={`ai-dataview-trigger${dataViewPickerOpen ? ' open' : ''}`} aria-label="Choose Data Views" aria-expanded={dataViewPickerOpen} aria-controls="ai-dataview-menu" disabled={dataViews.length === 0 || busy || !!activeConversation} onClick={() => setDataViewPickerOpen((open) => !open)}>

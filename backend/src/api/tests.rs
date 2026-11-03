@@ -6,7 +6,26 @@ use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 #[tokio::test]
 async fn knowledge_routes_manage_entries_and_enforce_revisions() {
     let (_directory, storage) = status_storage().await;
+    let default_playbook = storage
+        .knowledge_entries()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.is_default)
+        .unwrap();
     let app = router("http://localhost".parse().unwrap(), storage);
+    let default_path = format!("/api/knowledge/{}", default_playbook.id);
+    let protected = app
+        .clone()
+        .oneshot(model_request(
+            Method::DELETE,
+            &default_path,
+            None,
+            Some(&default_playbook.revision),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(protected.status(), StatusCode::BAD_REQUEST);
     let body = json!({"title":"Database recovery", "kind":"runbook", "status":"draft", "content":"Check the connection pool"});
     let response = app
         .clone()
@@ -104,6 +123,57 @@ async fn knowledge_routes_manage_entries_and_enforce_revisions() {
             .status(),
         StatusCode::UNPROCESSABLE_ENTITY
     );
+}
+
+#[tokio::test]
+async fn knowledge_playbooks_round_trip_bounded_query_steps() {
+    let (_directory, storage) = status_storage().await;
+    let app = router("http://localhost".parse().unwrap(), storage);
+    let body = json!({
+        "title":"Checkout investigation defaults",
+        "kind":"investigation_playbook",
+        "status":"published",
+        "content":"Compare current activity with the preceding window.",
+        "data_view_ids":["checkout-logs"],
+        "steps":[{
+            "name":"Checkout errors",
+            "data_view_ids":["checkout-logs"],
+            "query":"service=\"checkout\"",
+            "breakdown_field":"service"
+        }]
+    });
+    let response = app
+        .clone()
+        .oneshot(json_request("/api/knowledge", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(response.into_body(), 65_536)
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(created["entry"]["kind"], "investigation_playbook");
+    assert_eq!(
+        created["entry"]["steps"][0]["query"],
+        "service=\"checkout\""
+    );
+    assert_eq!(
+        created["entry"]["steps"][0]["data_view_ids"][0],
+        "checkout-logs"
+    );
+
+    let invalid = json!({
+        "title":"Unscoped query",
+        "kind":"investigation_playbook",
+        "status":"draft",
+        "content":"A query must identify its target Data View.",
+        "steps":[{"name":"Query","query":"service=\"checkout\""}]
+    });
+    let response = app
+        .oneshot(json_request("/api/knowledge", invalid))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 fn headers(revision: &str) -> HeaderMap {
@@ -679,6 +749,30 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
         .await;
     Mock::given(matchers::method("POST"))
         .and(matchers::path("/events/_search"))
+        .and(|request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            body["size"] == 1
+                && body["aggs"].is_object()
+                && body["sort"][0]["@timestamp"]["order"] == "desc"
+                && body["query"]["bool"]["must"][0]["query_string"]["query"]
+                    == "service:\"checkout\""
+                && body["aggs"]["breakdown_values"]["terms"]["field"] == "service"
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "took":2,"timed_out":false,"_shards":{"failed":0},
+            "hits":{"total":{"value":102,"relation":"eq"},"hits":[
+                {"_index":"events","_id":"playbook-record","_source":{"@timestamp":"2026-10-10T11:00:00Z","service":"checkout"}}
+            ]},
+            "aggregations":{"documents_over_time":{"buckets":[
+                {"key":1791630000000i64,"doc_count":60},
+                {"key":1791630300000i64,"doc_count":42}
+            ]}}
+        })))
+        .expect(2)
+        .mount(&source)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/events/_search"))
         .and(matchers::header("content-type", "application/json"))
         .and(|request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
@@ -763,6 +857,12 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
             let input: Value =
                 serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
             !system.contains("Form and update hypotheses")
+                && input["playbook_evidence"][0]["step_name"] == "Checkout errors"
+                && input["playbook_evidence"][0]["current"]["time_range_start_ms"] == 1791630000000i64
+                && input["playbook_evidence"][0]["baseline"]["time_range_end_ms"] == 1791629999999i64
+                && input["playbook_evidence"][0]["current"]["aggregate_records"] == 102
+                && input["playbook_evidence"][0]["query"] == "service:\"checkout\""
+                && input["playbook_evidence"][0]["breakdown_field"] == "service"
                 && input["available_views"][0]["fields"]
                     .as_array()
                     .unwrap()
@@ -822,6 +922,26 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
         )
         .await
         .unwrap();
+    let default_playbook = storage
+        .knowledge_entries()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.is_default)
+        .unwrap();
+    let mut edited_playbook = default_playbook.clone();
+    edited_playbook.steps[0].name = "Checkout errors".to_owned();
+    edited_playbook.steps[0].data_view_ids = vec!["checkout-view".to_owned()];
+    edited_playbook.steps[0].query = "service:\"checkout\"".to_owned();
+    edited_playbook.steps[0].breakdown_field = Some("service".to_owned());
+    storage
+        .update_knowledge(
+            &default_playbook.id,
+            &default_playbook.revision,
+            edited_playbook,
+        )
+        .await
+        .unwrap();
     let saved_model = storage
         .create_ai_model(StoredAiModel {
             id: String::new(),
@@ -858,6 +978,19 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
     );
     assert_eq!(body["sources"][0]["sample_limit"], 8);
     assert_eq!(body["sources"][0]["aggregate_records"], 102);
+    assert_eq!(body["playbook_evidence"][0]["step_name"], "Checkout errors");
+    assert_eq!(
+        body["playbook_evidence"][0]["query"],
+        "service:\"checkout\""
+    );
+    assert_eq!(
+        body["playbook_evidence"][0]["current"]["time_range_start_ms"],
+        1791630000000i64
+    );
+    assert_eq!(
+        body["playbook_evidence"][0]["baseline"]["time_range_end_ms"],
+        1791629999999i64
+    );
     assert_eq!(
         body["sources"][0]["evidence_queries"]
             .as_array()

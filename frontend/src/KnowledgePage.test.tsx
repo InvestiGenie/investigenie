@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import KnowledgePage from './KnowledgePage';
 import { api, type KnowledgeEntry } from './api';
@@ -58,6 +58,36 @@ describe('KnowledgePage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save entry' }));
     await waitFor(() => expect(add).toHaveBeenCalledWith(expect.objectContaining({ status: 'draft', services: ['payments', 'checkout'] })));
     expect(await screen.findByText('Knowledge entry saved.')).toBeInTheDocument();
+  });
+
+  it('creates a published investigation playbook with a targeted query step', async () => {
+    const dataViews = [{ id: 'checkout-logs', revision: 'view-revision', name: 'Checkout logs', connection_id: 'source', index: 'events', time_field: '@timestamp' }];
+    const playbook = {
+      ...entry,
+      kind: 'investigation_playbook' as const,
+      status: 'published' as const,
+      steps: [{ name: 'Checkout errors', data_view_ids: ['checkout-logs'], query: 'service="checkout"', breakdown_field: 'service' }],
+    };
+    const add = vi.spyOn(api, 'addKnowledge').mockResolvedValue(playbook);
+    render(<KnowledgePage dataViews={dataViews} />);
+    await screen.findByText(entry.title);
+    fireEvent.click(screen.getByRole('button', { name: 'New entry' }));
+    fireEvent.change(screen.getByLabelText('Title'), { target: { value: 'Checkout playbook' } });
+    fireEvent.change(screen.getByLabelText('Content'), { target: { value: 'Compare checkout activity across matching windows.' } });
+    fireEvent.change(screen.getByLabelText('Type'), { target: { value: 'investigation_playbook' } });
+    fireEvent.change(screen.getByLabelText('Step name'), { target: { value: 'Checkout errors' } });
+    fireEvent.click(within(screen.getByRole('group', { name: 'Target Data Views' })).getByRole('checkbox', { name: 'Checkout logs' }));
+    fireEvent.change(screen.getByLabelText('Query for step 1'), { target: { value: 'service="checkout"' } });
+    fireEvent.change(screen.getByLabelText('Breakdown field for step 1'), { target: { value: 'service' } });
+    fireEvent.click(screen.getByLabelText('Status'));
+    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'published' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save entry' }));
+    await waitFor(() => expect(add).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'investigation_playbook',
+      status: 'published',
+      steps: [{ name: 'Checkout errors', data_view_ids: ['checkout-logs'], query: 'service="checkout"', breakdown_field: 'service' }],
+    })));
+    expect(await screen.findByRole('region', { name: 'Investigation playbook steps' })).toHaveTextContent('service="checkout"');
   });
 
   it('publishes, archives and restores using each returned revision', async () => {

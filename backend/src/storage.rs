@@ -22,12 +22,14 @@ use uuid::Uuid;
 
 mod filesystem;
 mod knowledge;
-pub use knowledge::{KnowledgeEntry, KnowledgeKind, KnowledgeStatus};
+pub use knowledge::{InvestigationPlaybookStep, KnowledgeEntry, KnowledgeKind, KnowledgeStatus};
 
 /// History keeps at most this many conversations; creating another evicts the least recently updated.
 pub const MAX_AI_CONVERSATIONS: usize = 64;
 pub const MAX_AI_CONVERSATION_MESSAGES: usize = 200;
 pub const MAX_AI_CONVERSATION_BYTES: usize = 128 * 1024;
+pub const DEFAULT_INVESTIGATION_HISTORY_RETENTION_DAYS: u16 = 30;
+pub const MAX_INVESTIGATION_HISTORY_RETENTION_DAYS: u16 = 3_650;
 const AI_CONVERSATIONS_LOCK_NAMESPACE: i32 = 0x4947_454E;
 
 #[derive(Clone)]
@@ -416,6 +418,7 @@ impl From<&StoredAiModel> for AiModelSummary {
 struct SettingsFields {
     theme: Option<String>,
     default_timezone: Option<String>,
+    investigation_history_retention_days: Option<u16>,
 }
 pub fn validate_settings(value: &Value) -> Result<(), StorageError> {
     if !value.is_object()
@@ -436,6 +439,9 @@ pub fn validate_settings(value: &Value) -> Result<(), StorageError> {
             .default_timezone
             .as_ref()
             .is_some_and(|zone| zone.parse::<chrono_tz::Tz>().is_err())
+        || fields
+            .investigation_history_retention_days
+            .is_some_and(|days| !(1..=MAX_INVESTIGATION_HISTORY_RETENTION_DAYS).contains(&days))
         || value.as_object().unwrap().values().any(Value::is_null)
     {
         return Err(StorageError::Invalid);
@@ -662,11 +668,14 @@ impl Storage {
                 .await
                 .map_err(|_| StorageError::Unavailable)??;
                 let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
-                return Ok(Self {
+                let storage = Self {
                     pool,
                     encryption,
                     file: Some(Arc::new(file)),
-                });
+                };
+                storage.ensure_default_investigation_playbook().await?;
+                storage.prune_expired_ai_conversations(true).await?;
+                return Ok(storage);
             }
         };
         let encryption = Encryption::new(&options.encryption_key, &options.key_id)?;
@@ -714,6 +723,14 @@ impl Storage {
         }
         .await;
         if let Err(error) = result {
+            storage.pool.close().await;
+            return Err(error);
+        }
+        if let Err(error) = storage.ensure_default_investigation_playbook().await {
+            storage.pool.close().await;
+            return Err(error);
+        }
+        if let Err(error) = storage.prune_expired_ai_conversations(true).await {
             storage.pool.close().await;
             return Err(error);
         }
@@ -997,7 +1014,9 @@ impl Storage {
         expected: &str,
     ) -> Result<String, StorageError> {
         if let Some(file) = &self.file {
-            return file.save_settings(settings, expected.to_owned()).await;
+            let revision = file.save_settings(settings, expected.to_owned()).await?;
+            self.prune_expired_ai_conversations(false).await?;
+            return Ok(revision);
         }
         validate_settings(&settings)?;
         let mut transaction = self.pool.begin().await?;
@@ -1015,7 +1034,53 @@ impl Storage {
             .execute(&mut *transaction)
             .await?;
         transaction.commit().await?;
+        self.prune_expired_ai_conversations(false).await?;
         Ok(revision)
+    }
+
+    pub async fn prune_expired_ai_conversations(
+        &self,
+        include_incomplete: bool,
+    ) -> Result<(), StorageError> {
+        let settings = self.settings().await?.settings;
+        let retention_days = settings
+            .get("investigation_history_retention_days")
+            .and_then(Value::as_u64)
+            .filter(|days| (1..=MAX_INVESTIGATION_HISTORY_RETENTION_DAYS as u64).contains(days))
+            .unwrap_or(DEFAULT_INVESTIGATION_HISTORY_RETENTION_DAYS as u64);
+        let retention_ms = retention_days.saturating_mul(86_400_000);
+        let now = conversation_timestamp().max(0) as u64;
+        let cutoff = now.saturating_sub(retention_ms).min(i64::MAX as u64) as i64;
+        let conversations = if let Some(file) = &self.file {
+            file.read(|snapshot| Ok(snapshot.ai_conversations.values().cloned().collect()))
+                .await?
+        } else {
+            sqlx::query("SELECT * FROM ai_conversations")
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|row| self.decode_ai_conversation(row))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for conversation in conversations.into_iter().filter(|conversation| {
+            conversation.updated_at_ms < cutoff
+                && (include_incomplete
+                    || conversation
+                        .messages
+                        .last()
+                        .is_some_and(|message| message.role == "assistant"))
+        }) {
+            match self
+                .remove_ai_conversation(&conversation.id, &conversation.revision)
+                .await
+            {
+                Ok(())
+                | Err(StorageError::Conflict)
+                | Err(StorageError::AiConversationNotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     fn decode_ai_model(&self, row: PgRow) -> Result<StoredAiModel, StorageError> {
@@ -1184,6 +1249,7 @@ impl Storage {
     }
 
     pub async fn ai_conversations(&self) -> Result<Vec<AiConversationSummary>, StorageError> {
+        self.prune_expired_ai_conversations(false).await?;
         if let Some(file) = &self.file {
             return file
                 .read(|snapshot| {
@@ -1211,6 +1277,7 @@ impl Storage {
     }
 
     pub async fn ai_conversation(&self, id: &str) -> Result<StoredAiConversation, StorageError> {
+        self.prune_expired_ai_conversations(false).await?;
         if let Some(file) = &self.file {
             let id = id.to_owned();
             return file
@@ -1235,6 +1302,7 @@ impl Storage {
         &self,
         conversation: StoredAiConversation,
     ) -> Result<StoredAiConversation, StorageError> {
+        self.prune_expired_ai_conversations(false).await?;
         validate_ai_conversation(&conversation)?;
         if let Some(file) = &self.file {
             file.create_ai_conversation(conversation.clone()).await?;
@@ -1279,6 +1347,7 @@ impl Storage {
         expected: &str,
         messages: Vec<StoredAiConversationMessage>,
     ) -> Result<StoredAiConversation, StorageError> {
+        self.prune_expired_ai_conversations(false).await?;
         if let Some(file) = &self.file {
             return file
                 .append_ai_conversation_messages(id.to_owned(), expected.to_owned(), messages)

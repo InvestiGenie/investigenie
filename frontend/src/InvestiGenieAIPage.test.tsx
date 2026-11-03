@@ -52,15 +52,44 @@ describe('InvestiGenieAIPage', () => {
     clearPreference('ai-check-in');
     vi.spyOn(api, 'aiConversations').mockResolvedValue([]);
     vi.spyOn(api, 'aiConversation').mockRejectedValue(new Error('Conversation not found'));
+    vi.spyOn(api, 'settings').mockResolvedValue({ settings: { theme: 'system', default_timezone: 'UTC', investigation_history_retention_days: 30 }, revision: 'settings-revision' });
     vi.spyOn(api, 'aiModels').mockResolvedValue([{
       id: 'model-primary', revision: 'rev-1', name: 'Primary', api_url: 'https://provider.example/v1', model: 'model-x', has_api_key: true,
     }]);
   });
   afterEach(() => vi.restoreAllMocks());
 
+  it('saves the configured history retention and refreshes the conversation list', async () => {
+    const updateSettings = vi.spyOn(api, 'updateSettings').mockResolvedValue({
+      settings: { theme: 'system', default_timezone: 'UTC', investigation_history_retention_days: 90 },
+      revision: 'next-settings-revision',
+    });
+    const conversations = vi.spyOn(api, 'aiConversations').mockResolvedValue([]);
+    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    const retention = await screen.findByLabelText('History retention days');
+    expect(retention).toHaveValue(30);
+    fireEvent.change(retention, { target: { value: '90' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save history retention' }));
+    await screen.findByRole('status', { name: '' });
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledWith(
+      { theme: 'system', default_timezone: 'UTC', investigation_history_retention_days: 90 },
+      'settings-revision',
+    ));
+    expect(conversations).toHaveBeenCalledTimes(2);
+    expect(await screen.findByText('History retention saved.')).toBeInTheDocument();
+  });
+
   it('separates deterministic sampling coverage, aggregate totals and cited records', async () => {
     vi.spyOn(api, 'startInvestigation').mockResolvedValue(job({ result: {
       ...result, evidence_status: 'sample_supported', conclusions_verified: false,
+      playbook_evidence: [{
+        playbook_id: 'default-playbook', playbook_title: 'Default investigation playbook', step_name: 'Checkout errors',
+        data_view_id: 'service-one', data_view_name: 'Service 1', index: 'service-one-*', query: 'service="checkout"',
+        breakdown_field: 'service',
+        current: { time_range_start_ms: 10_000, time_range_end_ms: 19_999, matched_records: 12, total_relation: 'eq', aggregate_records: 12, aggregations: [{ timestamp: 10_000, count: 12 }], histogram_unavailable_reason: null },
+        baseline: { time_range_start_ms: 0, time_range_end_ms: 9_999, matched_records: 3, total_relation: 'eq', aggregate_records: 3, aggregations: [{ timestamp: 0, count: 3 }], histogram_unavailable_reason: null },
+        error: null,
+      }],
       sources: [{ ...result.sources[0], records_examined: 3, sample_records_available: 3, sample_limit: 8, aggregate_records: 102,
         evidence_queries: [{ sampling: 'latest', query_summary: 'Filtered checkout events; last 30 minutes', records_returned: 2, aggregate_records: 102 }, { sampling: 'earliest', query_summary: 'Filtered checkout events; last 30 minutes', records_returned: 2, aggregate_records: null }] }],
     } }));
@@ -73,6 +102,10 @@ describe('InvestiGenieAIPage', () => {
     expect(screen.getByText('2 bounded evidence queries')).toBeInTheDocument();
     expect(screen.getByText(/Service 2: 1 cited sample records/)).toBeInTheDocument();
     expect(screen.getByText(/not verified causes/)).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Investigation playbook queries (1)'));
+    expect(screen.getByText('service="checkout"')).toBeInTheDocument();
+    expect(screen.getByText('Current · 10000 to 19999 Unix ms')).toBeInTheDocument();
+    expect(screen.getByText('Baseline · 0 to 9999 Unix ms')).toBeInTheDocument();
     fireEvent.click(screen.getByText('Sources and query scope'));
     expect(screen.getByText('102 records counted by query aggregation (not a finding count)')).toBeInTheDocument();
     expect(screen.getByText(/2\. earliest sample/)).toBeInTheDocument();

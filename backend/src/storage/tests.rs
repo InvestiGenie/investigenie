@@ -183,6 +183,8 @@ fn settings_allow_only_bounded_public_options() {
     for value in [
         json!({}),
         json!({"theme":"dark","default_timezone":"America/New_York"}),
+        json!({"investigation_history_retention_days":1}),
+        json!({"investigation_history_retention_days":3650}),
     ] {
         assert!(validate_settings(&value).is_ok());
     }
@@ -194,6 +196,9 @@ fn settings_allow_only_bounded_public_options() {
         json!({"default_timezone":"unknown"}),
         json!({"theme":"invalid"}),
         json!({"theme":null}),
+        json!({"investigation_history_retention_days":0}),
+        json!({"investigation_history_retention_days":3651}),
+        json!({"investigation_history_retention_days":"30"}),
     ] {
         assert!(validate_settings(&value).is_err());
     }

@@ -35,6 +35,7 @@ describe('Discover', () => {
     document.documentElement.dataset.theme = 'light';
     vi.spyOn(api, 'aiModels').mockResolvedValue([]);
     vi.spyOn(api, 'aiConversations').mockResolvedValue([]);
+    vi.spyOn(api, 'settings').mockResolvedValue({ settings: {}, revision: 'settings-revision' });
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       if (String(input).endsWith('/status')) return jsonResponse({ status: 'connected' });
       throw new Error(`Unexpected request: ${String(input)}`);
