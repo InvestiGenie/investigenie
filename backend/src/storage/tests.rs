@@ -15,7 +15,10 @@ async fn knowledge_postgres_encrypts_entries_and_serializes_concurrent_edits() {
         replica.knowledge_entry(&created.id).await.unwrap().revision,
         created.revision
     );
-    assert_eq!(replica.knowledge_entries().await.unwrap().len(), 1);
+    let entries = replica.knowledge_entries().await.unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.iter().filter(|entry| !entry.is_default).count(), 1);
+    assert_eq!(entries.iter().filter(|entry| entry.is_default).count(), 1);
     let encrypted: Vec<u8> =
         sqlx::query_scalar("SELECT entry_encrypted FROM knowledge_entries WHERE id=$1")
             .bind(&created.id)
@@ -51,12 +54,9 @@ async fn knowledge_postgres_encrypts_entries_and_serializes_concurrent_edits() {
         .remove_knowledge(&created.id, &current.revision)
         .await
         .unwrap();
-    assert!(database
-        .storage
-        .knowledge_entries()
-        .await
-        .unwrap()
-        .is_empty());
+    let remaining = database.storage.knowledge_entries().await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert!(remaining[0].is_default);
     replica.close().await;
     database.finish().await;
 }
