@@ -206,23 +206,19 @@ def run_one(model, scenario, data_views, args, follow_up_mode="baseline"):
     sources = result.get("sources", [])
     source_queries = sum(source.get("batches_processed") or 0 for source in sources)
     adaptive_queries = sum(
-        1
-        for source in sources
-        for query in source.get("evidence_queries", [])
-        if query.get("sampling") == "adaptive_follow_up"
+        1 for source in sources for query in source.get("evidence_queries", []) if query.get("sampling") == "adaptive_follow_up"
     )
     playbook_queries = sum(
-        1
-        for step in result.get("playbook_evidence", [])
-        for window in ("current", "baseline")
-        if step.get(window) is not None
+        1 for step in result.get("playbook_evidence", []) for window in ("current", "baseline") if step.get(window) is not None
     )
-    sample_citations = len({
-        (evidence.get("data_view_id"), record_id)
-        for finding in result.get("findings", [])
-        for evidence in finding.get("evidence", [])
-        for record_id in evidence.get("record_ids") or []
-    })
+    sample_citations = len(
+        {
+            (evidence.get("data_view_id"), record_id)
+            for finding in result.get("findings", [])
+            for evidence in finding.get("evidence", [])
+            for record_id in evidence.get("record_ids") or []
+        }
+    )
     return {
         "model": model["name"],
         "model_id": model["model"],
@@ -255,11 +251,27 @@ def run_one(model, scenario, data_views, args, follow_up_mode="baseline"):
 
 
 def write_markdown_summary(path, truth, models, results):
-    lines = [f"### AI investigation eval (corpus anchored {truth.get('anchor')})", "", "| model | mode | scenario | result | keywords | queries | adaptive | citations | seconds | tokens |"]
+    lines = [
+        f"### AI investigation eval (corpus anchored {truth.get('anchor')})",
+        "",
+        "| model | mode | scenario | result | keywords | queries | adaptive | citations | seconds | tokens |",
+    ]
     lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for row in results:
         verdict = "pass" if row["passed"] else row["outcome"]
-        lines.append(f"| {row['model']} | {row['follow_up_mode']} | {row['scenario']} | {verdict} | {row['score']}/{row['max_score']} | {row.get('total_queries') or 0} | {row.get('adaptive_followup_queries') or 0} | {row.get('sample_citations') or 0} | {row['seconds']} | {row.get('total_tokens') or 0} |")
+        summary_cells = [
+            row["model"],
+            row["follow_up_mode"],
+            row["scenario"],
+            verdict,
+            f"{row['score']}/{row['max_score']}",
+            row.get("total_queries") or 0,
+            row.get("adaptive_followup_queries") or 0,
+            row.get("sample_citations") or 0,
+            row["seconds"],
+            row.get("total_tokens") or 0,
+        ]
+        lines.append(f"| {' | '.join(str(cell) for cell in summary_cells)} |")
     with open(path, "a") as handle:
         handle.write("\n".join(lines) + "\n")
 
@@ -343,8 +355,7 @@ def main():
         for scenario, run in [(s, r) for s in scenarios for r in range(args.repeat)]:
             for follow_up_mode in follow_up_modes:
                 print(
-                    f"   {scenario['id']} [{follow_up_mode}]"
-                    f"{f' (run {run + 1})' if args.repeat > 1 else ''}: {scenario['question']}",
+                    f"   {scenario['id']} [{follow_up_mode}]{f' (run {run + 1})' if args.repeat > 1 else ''}: {scenario['question']}",
                     flush=True,
                 )
                 try:
@@ -379,7 +390,11 @@ def main():
                     print(f"      summary: {outcome['summary'][:300]}", flush=True)
 
     print("\nScorecard")
-    print(f"{'model':<36} {'mode':<9} {'pass':>6} {'keywords':>9} {'queries':>7} {'adapt':>6} {'cites':>6} {'wrong':>6} {'incompl':>8} {'errors':>7} {'avg s':>7} {'tokens':>8}")
+    print(
+        f"{'model':<36} {'mode':<9} {'pass':>6} {'keywords':>9} "
+        f"{'queries':>7} {'adapt':>6} {'cites':>6} {'wrong':>6} "
+        f"{'incompl':>8} {'errors':>7} {'avg s':>7} {'tokens':>8}"
+    )
     for model in models:
         for follow_up_mode in follow_up_modes:
             rows = [r for r in results if r["model"] == model["name"] and r["follow_up_mode"] == follow_up_mode]

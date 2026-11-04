@@ -119,13 +119,15 @@ class FollowUpModeTests(unittest.TestCase):
             "complete": True,
             "summary": "The database connection pool is exhausted.",
             "findings": [{"evidence": [{"record_ids": ["event-1", "event-2"]}]}],
-            "sources": [{
-                "batches_processed": 2,
-                "evidence_queries": [
-                    {"sampling": "latest"},
-                    {"sampling": "adaptive_follow_up"},
-                ],
-            }],
+            "sources": [
+                {
+                    "batches_processed": 2,
+                    "evidence_queries": [
+                        {"sampling": "latest"},
+                        {"sampling": "adaptive_follow_up"},
+                    ],
+                }
+            ],
             "playbook_evidence": [{"current": {}, "baseline": {}}],
             "caveats": [],
             "token_usage": [],
