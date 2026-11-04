@@ -28,8 +28,8 @@ use crate::data_connectors::{
 use crate::search::{SearchRequest, SearchWindow};
 use crate::storage::{
     AiConversationSummary, AiModelSummary, DataView, ExploreMode, ResolvedConnection, Storage,
-    StorageError, StoredAiConversation, StoredAiConversationMessage, StoredAiModel,
-    StoredConnection, MAX_AI_CONVERSATION_MESSAGES,
+    StorageError, StoredAiConversation, StoredAiConversationMessage, StoredAiInvestigationScope,
+    StoredAiModel, StoredConnection, MAX_AI_CONVERSATION_MESSAGES,
 };
 
 const MAX_CONCURRENT_UPSTREAM_REQUESTS: usize = 64;
@@ -185,6 +185,10 @@ pub fn router(web_origin: HeaderValue, storage: Storage, ai_probe_timeout: Durat
             "/api/ai/conversations/{id}/messages",
             post(continue_ai_conversation).layer(DefaultBodyLimit::max(65_536)),
         )
+        .route(
+            "/api/ai/conversations/{id}/investigations",
+            post(continue_ai_investigation).layer(DefaultBodyLimit::max(65_536)),
+        )
         .route("/api/ai/models", get(ai_models).post(create_ai_model))
         .route(
             "/api/ai/models/{model_id}",
@@ -241,6 +245,28 @@ async fn prepare_ai_call(
     Ok((settings, permit))
 }
 
+fn register_investigation_job(
+    state: &AppState,
+    job: &Arc<ai::InvestigationJob>,
+) -> Result<(), ApiError> {
+    let mut jobs = state
+        .investigations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cutoff = Instant::now()
+        .checked_sub(FINISHED_INVESTIGATION_RETENTION)
+        .unwrap_or_else(Instant::now);
+    jobs.retain(|_, job| !job.finished_before(cutoff));
+    if jobs.len() >= MAX_TRACKED_INVESTIGATIONS {
+        jobs.retain(|_, job| !job.finished_before(Instant::now()));
+    }
+    if jobs.len() >= MAX_TRACKED_INVESTIGATIONS {
+        return Err(ApiError::Unavailable);
+    }
+    jobs.insert(job.id.clone(), job.clone());
+    Ok(())
+}
+
 async fn probe_ai_model(model: &StoredAiModel, timeout: Duration) -> Result<(), ApiError> {
     ai::test_model(&model_settings(model, timeout))
         .await
@@ -280,29 +306,16 @@ async fn start_investigation(
     let budget = ai::time_budget(&request).map_err(ApiError::Investigation)?;
     let (settings, permit) = prepare_ai_call(&state, &request.ai_model_id, timeout).await?;
     let job = ai::InvestigationJob::new(uuid::Uuid::new_v4().to_string(), budget);
-    {
-        let mut jobs = state
-            .investigations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let cutoff = Instant::now()
-            .checked_sub(FINISHED_INVESTIGATION_RETENTION)
-            .unwrap_or_else(Instant::now);
-        jobs.retain(|_, job| !job.finished_before(cutoff));
-        if jobs.len() >= MAX_TRACKED_INVESTIGATIONS {
-            jobs.retain(|_, job| !job.finished_before(Instant::now()));
-        }
-        if jobs.len() >= MAX_TRACKED_INVESTIGATIONS {
-            return Err(ApiError::Unavailable);
-        }
-        jobs.insert(job.id.clone(), job.clone());
-    }
-    let conversation = StoredAiConversation::new(
+    register_investigation_job(&state, &job)?;
+    let mut conversation = StoredAiConversation::new(
         job.id.clone(),
         request.ai_model_id.clone(),
         request.data_view_ids.clone(),
         request.question.clone(),
     );
+    conversation.investigation_scope = Some(StoredAiInvestigationScope {
+        time_range: request.time_range,
+    });
     let conversation = match state.storage.create_ai_conversation(conversation).await {
         Ok(conversation) => conversation,
         Err(error) => {
@@ -314,19 +327,47 @@ async fn start_investigation(
             return Err(error.into());
         }
     };
+    spawn_investigation_task(
+        state,
+        request,
+        settings,
+        permit,
+        job.clone(),
+        conversation.revision,
+        None,
+    );
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "investigation": job.snapshot() })),
+    ))
+}
+
+fn spawn_investigation_task(
+    state: AppState,
+    request: InvestigationRequest,
+    settings: AiSettings,
+    permit: OwnedSemaphorePermit,
+    job: Arc<ai::InvestigationJob>,
+    conversation_revision: String,
+    conversation_context: Option<String>,
+) {
     let task_job = job.clone();
     let conversation_storage = state.storage.clone();
-    let conversation_id = conversation.id.clone();
-    let conversation_revision = conversation.revision.clone();
-    let job_span = tracing::error_span!("investigation", job_id = %job.id);
+    let conversation_id = job.conversation_id.clone();
+    let job_span = tracing::error_span!(
+        "investigation",
+        job_id = %job.id,
+        conversation_id = %conversation_id
+    );
     tokio::spawn(
         async move {
             let _permit = permit;
             let control = ai::Control::for_job(task_job.clone());
-            let result = ai::investigate(
+            let result = ai::investigate_with_context(
                 &state.storage,
                 &settings,
                 request,
+                conversation_context,
                 &state.upstream_slots,
                 &control,
             )
@@ -370,10 +411,6 @@ async fn start_investigation(
         }
         .instrument(job_span),
     );
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({ "investigation": job.snapshot() })),
-    ))
 }
 
 fn find_investigation(state: &AppState, id: &str) -> Result<Arc<ai::InvestigationJob>, ApiError> {
@@ -425,6 +462,70 @@ async fn ai_conversation(
     })))
 }
 
+fn investigation_conversation_context(messages: &[StoredAiConversationMessage]) -> Option<String> {
+    const MAX_CONTEXT_BYTES: usize = 12_000;
+    const MAX_CONTEXT_MESSAGES: usize = 12;
+    let mut reversed_sections = Vec::new();
+    let mut remaining = MAX_CONTEXT_BYTES;
+    for message in messages.iter().rev().take(MAX_CONTEXT_MESSAGES) {
+        if remaining == 0 {
+            break;
+        }
+        let section = if message.role == "user" {
+            format!(
+                "Prior user-provided context (unverified):\n{}",
+                message.content
+            )
+        } else if let Some(result) = &message.result {
+            let mut section = format!(
+                "Prior investigation result (hypotheses, not verified):\n{}",
+                result
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&message.content)
+            );
+            if let Some(findings) = result.get("findings").and_then(Value::as_array) {
+                for finding in findings.iter().take(6) {
+                    let title = finding.get("title").and_then(Value::as_str).unwrap_or("");
+                    let detail = finding.get("detail").and_then(Value::as_str).unwrap_or("");
+                    section.push_str(&format!("\n- {title}: {detail}"));
+                }
+            }
+            if let Some(sources) = result.get("sources").and_then(Value::as_array) {
+                for source in sources.iter().take(5) {
+                    let name = source
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Data View");
+                    let summary = source
+                        .get("query_summary")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    section.push_str(&format!("\nPrior scope for {name}: {summary}"));
+                }
+            }
+            section
+        } else {
+            format!("Prior assistant reply (unverified):\n{}", message.content)
+        };
+        let bounded = truncate_context_bytes(&section, remaining);
+        remaining = remaining.saturating_sub(bounded.len());
+        reversed_sections.push(bounded);
+    }
+    reversed_sections.reverse();
+    let context = reversed_sections.join("\n\n");
+    (!context.trim().is_empty()).then_some(context)
+}
+
+fn truncate_context_bytes(text: &str, max_bytes: usize) -> String {
+    let end = text
+        .char_indices()
+        .take_while(|(index, character)| index + character.len_utf8() <= max_bytes)
+        .last()
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    text[..end].to_owned()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ContinueConversationRequest {
@@ -474,6 +575,97 @@ async fn continue_ai_conversation(
         )
         .await?;
     Ok(Json(json!({ "conversation": updated })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContinueInvestigationRequest {
+    message: String,
+    #[serde(default)]
+    adaptive_followup: bool,
+    #[serde(default)]
+    ai_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    time_budget_seconds: Option<u64>,
+}
+
+async fn continue_ai_investigation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<ContinueInvestigationRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let expected = if_match(&headers)?;
+    let message = request.message.trim();
+    if message.is_empty() || message.len() > 8_000 {
+        return Err(ApiError::InvalidConversationMessage);
+    }
+    let conversation = state.storage.ai_conversation(&id).await?;
+    if conversation.revision != expected {
+        return Err(ApiError::Storage(StorageError::Conflict));
+    }
+    if conversation.messages.len() + 2 > MAX_AI_CONVERSATION_MESSAGES {
+        return Err(ApiError::InvalidConversationMessage);
+    }
+    let scope = conversation
+        .investigation_scope
+        .clone()
+        .ok_or(ApiError::ConversationScopeUnavailable)?;
+    let investigation = InvestigationRequest {
+        question: message.to_owned(),
+        data_view_ids: conversation.data_view_ids.clone(),
+        ai_model_id: conversation.model_id.clone(),
+        time_range: scope.time_range,
+        ai_timeout_seconds: request.ai_timeout_seconds,
+        time_budget_seconds: request.time_budget_seconds,
+        adaptive_followup: request.adaptive_followup,
+    };
+    let timeout = ai::provider_timeout(&investigation).map_err(ApiError::Investigation)?;
+    let budget = ai::time_budget(&investigation).map_err(ApiError::Investigation)?;
+    let (settings, permit) = prepare_ai_call(&state, &conversation.model_id, timeout).await?;
+    let job = ai::InvestigationJob::new_for_conversation(
+        uuid::Uuid::new_v4().to_string(),
+        budget,
+        conversation.id.clone(),
+    );
+    register_investigation_job(&state, &job)?;
+    let updated = match state
+        .storage
+        .append_ai_conversation_messages(
+            &conversation.id,
+            &expected,
+            vec![StoredAiConversationMessage {
+                role: "user".to_owned(),
+                content: message.to_owned(),
+                result: None,
+            }],
+        )
+        .await
+    {
+        Ok(conversation) => conversation,
+        Err(error) => {
+            state
+                .investigations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&job.id);
+            return Err(error.into());
+        }
+    };
+    let context = investigation_conversation_context(&conversation.messages);
+    spawn_investigation_task(
+        state,
+        investigation,
+        settings,
+        permit,
+        job.clone(),
+        updated.revision.clone(),
+        context,
+    );
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "investigation": job.snapshot(), "conversation": updated })),
+    ))
 }
 
 async fn remove_ai_conversation(
@@ -781,6 +973,7 @@ enum ApiError {
     Investigation(ai::InvestigationError),
     InvestigationNotFound,
     InvalidConversationMessage,
+    ConversationScopeUnavailable,
     InvalidKnowledge,
     InvestigationDecision(&'static str),
 }
@@ -848,6 +1041,7 @@ impl IntoResponse for ApiError {
             Self::Investigation(error) => (error.status, error.code, error.message),
             Self::InvestigationNotFound => (StatusCode::NOT_FOUND, "investigation_not_found", "The investigation does not exist or has expired".to_owned()),
             Self::InvalidConversationMessage => (StatusCode::BAD_REQUEST, "invalid_ai_message", "A follow-up message must contain 1 to 8000 bytes and the conversation must stay within its message limit".to_owned()),
+            Self::ConversationScopeUnavailable => (StatusCode::BAD_REQUEST, "investigation_scope_unavailable", "This saved conversation has no investigation scope. Start a new investigation to query fresh source data.".to_owned()),
             Self::InvalidKnowledge => (StatusCode::BAD_REQUEST, "invalid_knowledge", "Knowledge fields are invalid or the 128-entry limit has been reached. Content must contain 1 to 32768 bytes; source links must use HTTP or HTTPS without credentials.".to_owned()),
             Self::InvestigationDecision(message) => (StatusCode::CONFLICT, "investigation_not_paused", message.to_owned()),
         };

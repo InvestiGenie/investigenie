@@ -9,6 +9,24 @@ fn knowledge_entry() -> KnowledgeEntry {
     .unwrap()
 }
 
+#[test]
+fn legacy_ai_conversations_without_investigation_scope_remain_readable() {
+    let conversation = StoredAiConversation::new(
+        "legacy-chat".to_owned(),
+        "model".to_owned(),
+        vec!["view".to_owned()],
+        "Investigate errors".to_owned(),
+    );
+    let mut serialized = serde_json::to_value(conversation).unwrap();
+    serialized
+        .as_object_mut()
+        .unwrap()
+        .remove("investigation_scope");
+
+    let reopened: StoredAiConversation = serde_json::from_value(serialized).unwrap();
+    assert!(reopened.investigation_scope.is_none());
+}
+
 #[tokio::test]
 async fn default_investigation_playbook_is_seeded_once_and_remains_editable() {
     let directory = tempfile::tempdir().unwrap();

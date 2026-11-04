@@ -108,6 +108,76 @@ class OutcomeTests(unittest.TestCase):
                 self.assertEqual(row["provider_timeout_exhausted"], timeout_exhausted)
 
 
+class FollowUpModeTests(unittest.TestCase):
+    def test_modes_expand_baseline_adaptive_comparison_in_order(self):
+        self.assertEqual(ai_eval.selected_follow_up_modes("baseline"), ("baseline",))
+        self.assertEqual(ai_eval.selected_follow_up_modes("adaptive"), ("adaptive",))
+        self.assertEqual(ai_eval.selected_follow_up_modes("both"), ("baseline", "adaptive"))
+
+    def test_run_one_sends_and_reports_selected_mode(self):
+        result = {
+            "complete": True,
+            "summary": "The database connection pool is exhausted.",
+            "findings": [{"evidence": [{"record_ids": ["event-1", "event-2"]}]}],
+            "sources": [{
+                "batches_processed": 2,
+                "evidence_queries": [
+                    {"sampling": "latest"},
+                    {"sampling": "adaptive_follow_up"},
+                ],
+            }],
+            "playbook_evidence": [{"current": {}, "baseline": {}}],
+            "caveats": [],
+            "token_usage": [],
+        }
+        args = SimpleNamespace(
+            ai_timeout=300,
+            budget=900,
+            max_minutes=60,
+            max_continues=1,
+            poll=0,
+            verbose=False,
+            keep_history=True,
+        )
+        scenario = {
+            "id": "database-pool",
+            "difficulty": "easy",
+            "question": "Why are requests failing?",
+            "time_range": {"start": 1, "end": 2},
+            "expected_keywords": [["database"], ["connection pool"]],
+        }
+        model = {"id": "model-1", "name": "local", "model": "test-model"}
+        request_payloads = []
+
+        def fake_api(path, method="GET", payload=None):
+            if path == "/api/ai/investigations" and method == "POST":
+                request_payloads.append(payload)
+                return {"investigation": {"id": "job-1", "status": "running"}}
+            return {
+                "investigation": {
+                    "id": "job-1",
+                    "status": "completed",
+                    "result": result,
+                    "progress": {"analysis_cycles": 2, "records_examined": 4},
+                }
+            }
+
+        for mode, expected_flag in (("baseline", False), ("adaptive", True)):
+            with self.subTest(mode=mode):
+                with patch.object(ai_eval, "api", side_effect=fake_api), patch.object(ai_eval.time, "sleep"):
+                    row = ai_eval.run_one(model, scenario, ["view-1"], args, mode)
+
+                self.assertEqual(request_payloads[-1]["adaptive_followup"], expected_flag)
+                self.assertEqual(row["follow_up_mode"], mode)
+                self.assertTrue(row["passed"])
+                self.assertEqual(row["source_queries"], 2)
+                self.assertEqual(row["adaptive_followup_queries"], 1)
+                self.assertEqual(row["playbook_queries"], 2)
+                self.assertEqual(row["total_queries"], 4)
+                self.assertEqual(row["sample_citations"], 2)
+                self.assertEqual(row["analysis_cycles"], 2)
+
+
 class EvaluationInputTests(unittest.TestCase):
     def test_repeat_must_be_positive_before_any_api_request(self):
         for repeat in ("0", "-1", "not-a-number"):

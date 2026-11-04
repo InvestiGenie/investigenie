@@ -30,11 +30,12 @@ function openDataViewPicker() {
   fireEvent.click(screen.getByRole('button', { name: 'Choose Data Views' }));
 }
 
-const defaultControls = { ai_timeout_seconds: 60, time_budget_seconds: 120 };
+const defaultControls = { ai_timeout_seconds: 60, time_budget_seconds: 120, adaptive_followup: false };
 
 function job(overrides: Partial<InvestigationJob> = {}): InvestigationJob {
   return {
     id: 'job-1',
+    conversation_id: 'job-1',
     status: 'completed',
     progress: { stage: 'Done', records_examined: 12, batches_processed: 1, analysis_cycles: 1, elapsed_ms: 4_000 },
     time_budget_seconds: 120,
@@ -42,6 +43,17 @@ function job(overrides: Partial<InvestigationJob> = {}): InvestigationJob {
     result,
     error: null,
     ...overrides,
+  };
+}
+
+function conversationForResult(id: string, title: string, question: string, savedResult: InvestigationResult = result): AIConversation {
+  return {
+    id, revision: 'conversation-revision', title, model_id: 'model-primary', data_view_ids: ['service-one'],
+    investigation_scope: { time_range: null }, created_at_ms: 1, updated_at_ms: 2,
+    messages: [
+      { role: 'user', content: question },
+      { role: 'assistant', content: savedResult.summary, result: savedResult },
+    ],
   };
 }
 
@@ -119,11 +131,13 @@ describe('InvestiGenieAIPage', () => {
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Investigate errors' } });
     fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
     expect(await screen.findByText(/An empty sample does not establish/)).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Save as knowledge draft' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Save full investigation as Knowledge draft' })).not.toBeInTheDocument();
   });
 
   it('explicitly saves completed findings as an unverified scoped knowledge draft', async () => {
-    vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
+    const completed = job();
+    vi.spyOn(api, 'startInvestigation').mockResolvedValue(completed);
+    vi.spyOn(api, 'aiConversation').mockResolvedValue(conversationForResult(completed.id, 'Why did payments fail?', 'Why did payments fail?'));
     const save = vi.spyOn(api, 'addKnowledge').mockImplementation(async (body) => ({ ...body, id: 'draft-1', revision: 'draft-revision', created_at_ms: 1, updated_at_ms: 1 }));
     const open = vi.fn();
     render(<InvestiGenieAIPage dataViews={dataViews} onOpenKnowledge={open} />);
@@ -132,15 +146,15 @@ describe('InvestiGenieAIPage', () => {
     fireEvent.click(screen.getByLabelText(/Service 1/));
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Why did payments fail?' } });
     fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
-    const button = await screen.findByRole('button', { name: 'Save as knowledge draft' });
+    const button = await screen.findByRole('button', { name: 'Save full investigation as Knowledge draft' });
     expect(save).not.toHaveBeenCalled();
     fireEvent.click(button);
-    await screen.findByRole('button', { name: 'Knowledge draft saved' });
+    await screen.findByRole('button', { name: 'Full investigation saved as draft' });
     const input = save.mock.calls[0][0];
     expect(input).toMatchObject({ title: 'Why did payments fail?', status: 'draft', kind: 'resolved_incident', data_view_ids: ['service-one', 'service-two'] });
     for (const text of ['Unverified', 'job-1', 'model-primary', result.summary, result.findings[0].detail, 'event-1', result.sources[0].query_summary, result.caveats[0], 'Not confirmed']) expect(input.content).toContain(text);
-    expect(screen.getByRole('button', { name: 'Knowledge draft saved' })).toBeDisabled();
-    fireEvent.click(screen.getByRole('button', { name: 'Review knowledge draft' }));
+    expect(screen.getByRole('button', { name: 'Full investigation saved as draft' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Review draft' }));
     expect(open).toHaveBeenCalledWith('draft-1');
     expect(save).toHaveBeenCalledOnce();
   });
@@ -152,15 +166,17 @@ describe('InvestiGenieAIPage', () => {
     render(<InvestiGenieAIPage dataViews={dataViews} />);
     await screen.findByRole('option', { name: 'Saved case' });
     fireEvent.change(screen.getByLabelText('AI conversation history'), { target: { value: 'chat-1' } });
-    fireEvent.click(await screen.findByRole('button', { name: 'Save as knowledge draft' }));
-    await screen.findByText('Saved as draft.');
+    fireEvent.click(await screen.findByRole('button', { name: 'Save full investigation as Knowledge draft' }));
+    await screen.findByRole('button', { name: 'Full investigation saved as draft' });
     expect(save.mock.calls[0][0]).toMatchObject({ title: 'Original case question', data_view_ids: ['service-two'], status: 'draft' });
     expect(save.mock.calls[0][0].content).toContain('chat-1');
     expect(save.mock.calls[0][0].content).toContain('original-model');
   });
 
   it('prevents duplicate draft requests while a save is pending', async () => {
-    vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
+    const completed = job();
+    vi.spyOn(api, 'startInvestigation').mockResolvedValue(completed);
+    vi.spyOn(api, 'aiConversation').mockResolvedValue(conversationForResult(completed.id, 'Investigate errors', 'Investigate errors'));
     let finish!: () => void;
     const pending = new Promise<void>((resolve) => { finish = resolve; });
     const save = vi.spyOn(api, 'addKnowledge').mockImplementation(async (body) => { await pending; return { ...body, id: 'draft-pending', revision: 'r1', created_at_ms: 1, updated_at_ms: 1 }; });
@@ -169,12 +185,12 @@ describe('InvestiGenieAIPage', () => {
     openDataViewPicker(); fireEvent.click(screen.getByLabelText(/Service 1/));
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Investigate errors' } });
     fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
-    const button = await screen.findByRole('button', { name: 'Save as knowledge draft' });
+    const button = await screen.findByRole('button', { name: 'Save full investigation as Knowledge draft' });
     fireEvent.click(button); fireEvent.click(button);
-    expect(screen.getByRole('button', { name: 'Saving knowledge draft...' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Saving full investigation…' })).toBeDisabled();
     expect(save).toHaveBeenCalledOnce();
     finish();
-    await screen.findByRole('button', { name: 'Knowledge draft saved' });
+    await screen.findByRole('button', { name: 'Full investigation saved as draft' });
   });
 
   it('does not promote partial findings reopened from history', async () => {
@@ -184,22 +200,24 @@ describe('InvestiGenieAIPage', () => {
     await screen.findByRole('option', { name: 'Partial case' });
     fireEvent.change(screen.getByLabelText('AI conversation history'), { target: { value: 'partial-case' } });
     await screen.findByText(result.summary);
-    expect(screen.queryByRole('button', { name: 'Save as knowledge draft' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Save full investigation as Knowledge draft' })).not.toBeInTheDocument();
   });
 
   it('keeps results visible and allows retry after a draft save fails', async () => {
-    vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
+    const completed = job();
+    vi.spyOn(api, 'startInvestigation').mockResolvedValue(completed);
+    vi.spyOn(api, 'aiConversation').mockResolvedValue(conversationForResult(completed.id, 'Investigate errors', 'Investigate errors'));
     const save = vi.spyOn(api, 'addKnowledge').mockRejectedValueOnce(new Error('Knowledge storage unavailable')).mockImplementationOnce(async (body) => ({ ...body, id: 'draft-3', revision: 'r3', created_at_ms: 1, updated_at_ms: 1 }));
     render(<InvestiGenieAIPage dataViews={dataViews} />);
     await screen.findByRole('combobox', { name: /AI model/ });
     openDataViewPicker(); fireEvent.click(screen.getByLabelText(/Service 1/));
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Investigate errors' } });
     fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
-    fireEvent.click(await screen.findByRole('button', { name: 'Save as knowledge draft' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Save full investigation as Knowledge draft' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('Knowledge storage unavailable');
     expect(screen.getByText(result.summary)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Save as knowledge draft' }));
-    await screen.findByRole('button', { name: 'Knowledge draft saved' });
+    fireEvent.click(screen.getByRole('button', { name: 'Save full investigation as Knowledge draft' }));
+    await screen.findByRole('button', { name: 'Full investigation saved as draft' });
     expect(save).toHaveBeenCalledTimes(2);
   });
 
@@ -211,19 +229,22 @@ describe('InvestiGenieAIPage', () => {
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Investigate errors' } });
     fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
     await screen.findByText(result.summary);
-    expect(screen.queryByRole('button', { name: 'Save as knowledge draft' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Save full investigation as Knowledge draft' })).not.toBeInTheDocument();
   });
 
   it.each(['\u{1f600}', '\u0000'])('bounds Unicode and escaped draft content by UTF-8 and request-body bytes (%j)', async (character) => {
-    vi.spyOn(api, 'startInvestigation').mockResolvedValue(job({ result: { ...result, summary: character.repeat(12_000) } }));
+    const oversizedResult = { ...result, summary: character.repeat(12_000) };
+    const completed = job({ result: oversizedResult });
+    vi.spyOn(api, 'startInvestigation').mockResolvedValue(completed);
+    vi.spyOn(api, 'aiConversation').mockResolvedValue(conversationForResult(completed.id, 'Investigate errors', 'Investigate errors', oversizedResult));
     const save = vi.spyOn(api, 'addKnowledge').mockImplementation(async (body) => ({ ...body, id: 'draft-4', revision: 'r4', created_at_ms: 1, updated_at_ms: 1 }));
     render(<InvestiGenieAIPage dataViews={dataViews} />);
     await screen.findByRole('combobox', { name: /AI model/ });
     openDataViewPicker(); fireEvent.click(screen.getByLabelText(/Service 1/));
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: '\u{1f600}'.repeat(100) } });
     fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
-    fireEvent.click(await screen.findByRole('button', { name: 'Save as knowledge draft' }));
-    await screen.findByRole('button', { name: 'Knowledge draft saved' });
+    fireEvent.click(await screen.findByRole('button', { name: 'Save full investigation as Knowledge draft' }));
+    await screen.findByRole('button', { name: 'Full investigation saved as draft' });
     const input = save.mock.calls[0][0];
     expect(new TextEncoder().encode(input.title).length).toBeLessThanOrEqual(256);
     expect(new TextEncoder().encode(input.content).length).toBeLessThanOrEqual(32_768);
@@ -307,6 +328,7 @@ describe('InvestiGenieAIPage', () => {
     expect(screen.getByText(result.caveats[0])).toBeInTheDocument();
     expect(screen.getByText('Sources and query scope')).toBeInTheDocument();
     expect(screen.getByText('Saved investigation scope')).toBeInTheDocument();
+    expect(screen.getByText(/This saved conversation has no source scope/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Edit time window' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Choose Data Views' })).toBeDisabled();
     expect(screen.getByRole('combobox', { name: 'AI model' })).toBeDisabled();
@@ -320,6 +342,67 @@ describe('InvestiGenieAIPage', () => {
     expect(remove).toHaveBeenCalledWith('chat-1', 'revision-2');
     expect(await screen.findByRole('heading', { name: 'Start a new investigation' })).toBeInTheDocument();
     expect(screen.queryByText('Check the database pool.')).not.toBeInTheDocument();
+  });
+
+  it('continues a scoped conversation with new evidence and saves the whole session', async () => {
+    const firstResult: InvestigationResult = { ...result, summary: 'Initial evidence: checkout returned 503.' };
+    const secondResult: InvestigationResult = { ...result, summary: 'New evidence: level=error records confirm the 503 burst.' };
+    const firstConversation: AIConversation = {
+      id: 'ongoing-case', revision: 'revision-1', title: 'Checkout outage', model_id: 'model-primary',
+      data_view_ids: ['service-one'], investigation_scope: { time_range: { start: 100, end: 200 } },
+      created_at_ms: 1, updated_at_ms: 2,
+      messages: [
+        { role: 'user', content: 'Why did checkout fail?' },
+        { role: 'assistant', content: firstResult.summary, result: firstResult },
+      ],
+    };
+    const followUpMessage = 'I found level=error records; check whether they match the outage.';
+    const continuedConversation: AIConversation = {
+      ...firstConversation,
+      revision: 'revision-3',
+      updated_at_ms: 3,
+      messages: [
+        ...firstConversation.messages,
+        { role: 'user', content: followUpMessage },
+        { role: 'assistant', content: secondResult.summary, result: secondResult },
+      ],
+    };
+    vi.mocked(api.aiConversations).mockResolvedValue([{ id: firstConversation.id, revision: firstConversation.revision, title: firstConversation.title, updated_at_ms: firstConversation.updated_at_ms }]);
+    vi.spyOn(api, 'aiConversation')
+      .mockResolvedValueOnce(firstConversation)
+      .mockResolvedValueOnce(continuedConversation);
+    const continueInvestigation = vi.spyOn(api, 'continueAIInvestigation').mockResolvedValue({
+      conversation: {
+        ...firstConversation,
+        revision: 'revision-2',
+        messages: [...firstConversation.messages, { role: 'user', content: followUpMessage }],
+      },
+      investigation: job({ id: 'turn-job', conversation_id: firstConversation.id, result: secondResult }),
+    });
+    const saveDraft = vi.spyOn(api, 'addKnowledge').mockImplementation(async (input) => ({
+      ...input, id: 'session-draft', revision: 'draft-revision', created_at_ms: 1, updated_at_ms: 1,
+    }));
+
+    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    await screen.findByRole('option', { name: 'Checkout outage' });
+    fireEvent.change(screen.getByLabelText('AI conversation history'), { target: { value: firstConversation.id } });
+    expect(await screen.findByText(firstResult.summary)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: followUpMessage } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send follow-up' }));
+    await waitFor(() => expect(continueInvestigation).toHaveBeenCalledWith(
+      firstConversation.id,
+      followUpMessage,
+      'revision-1',
+      defaultControls,
+    ));
+    expect(await screen.findByText(secondResult.summary)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Save full investigation as Knowledge draft' }));
+    await waitFor(() => expect(saveDraft).toHaveBeenCalledTimes(1));
+    const saved = saveDraft.mock.calls[0][0];
+    expect(saved.content).toContain('Why did checkout fail?');
+    expect(saved.content).toContain(followUpMessage);
+    expect(saved.content).toContain(firstResult.summary);
+    expect(saved.content).toContain(secondResult.summary);
   });
 
   it('renders findings, confidence, evidence and bounded sources', async () => {
@@ -337,6 +420,31 @@ describe('InvestiGenieAIPage', () => {
     fireEvent.click(screen.getByText('Sources and query scope'));
     expect(screen.getAllByText(/Last 30 minutes; error_type EQ/)).toHaveLength(2);
     expect(screen.getByText(/Analysis is limited to the last 30 minutes/)).toBeInTheDocument();
+  });
+
+  it('shows the adaptive follow-up query and its reason in source details', async () => {
+    const adaptiveResult: InvestigationResult = {
+      ...result,
+      sources: result.sources.map((source) => ({
+        ...source,
+        evidence_queries: [...(source.evidence_queries ?? []), {
+          sampling: 'adaptive_follow_up',
+          query_summary: 'Last 30 minutes; level EQ error',
+          records_returned: 1,
+          aggregate_records: null,
+          reason: 'Check whether the errors coincide with error-level records.',
+        }],
+      })),
+    };
+    vi.spyOn(api, 'startInvestigation').mockResolvedValue(job({ result: adaptiveResult }));
+    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    await screen.findByRole('combobox', { name: /AI model/ });
+    openDataViewPicker();
+    fireEvent.click(screen.getByLabelText(/Service 1/));
+    fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Investigate errors' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
+    fireEvent.click(await screen.findByText('Sources and query scope'));
+    expect(screen.getByText(/adaptive follow-up query.*Check whether the errors coincide/)).toBeInTheDocument();
   });
 
   it('shows provider setup errors without losing the question', async () => {
@@ -455,9 +563,29 @@ describe('InvestiGenieAIPage', () => {
     fireEvent.click(screen.getByLabelText(/Service 1/));
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Large index?' } });
     fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
-    await waitFor(() => expect(investigate).toHaveBeenCalledWith('Large index?', ['service-one'], 'model-primary', expect.anything(), { ai_timeout_seconds: 300, time_budget_seconds: 600 }));
+    await waitFor(() => expect(investigate).toHaveBeenCalledWith('Large index?', ['service-one'], 'model-primary', expect.anything(), { ai_timeout_seconds: 300, time_budget_seconds: 600, adaptive_followup: false }));
     expect(getPreference('ai-timeout')).toBe('300');
     expect(getPreference('ai-check-in')).toBe('600');
+  });
+
+  it('keeps adaptive follow-up off by default and sends the opt-in flag', async () => {
+    const investigate = vi.spyOn(api, 'startInvestigation').mockResolvedValue(job());
+    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    await screen.findByRole('combobox', { name: 'AI model' });
+    const adaptive = screen.getByRole('checkbox', { name: 'Allow one adaptive follow-up query' });
+    expect(adaptive).not.toBeChecked();
+    fireEvent.click(adaptive);
+    openDataViewPicker();
+    fireEvent.click(screen.getByLabelText(/Service 1/));
+    fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Why are requests failing?' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
+    await waitFor(() => expect(investigate).toHaveBeenCalledWith(
+      'Why are requests failing?',
+      ['service-one'],
+      'model-primary',
+      expect.anything(),
+      { ...defaultControls, adaptive_followup: true },
+    ));
   });
 
   it('asks whether to continue, shows findings so far, and resumes polling until completion', async () => {

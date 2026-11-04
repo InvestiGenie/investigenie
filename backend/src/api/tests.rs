@@ -231,7 +231,7 @@ async fn filesystem_ai_conversation_routes_read_continue_and_delete_history() {
     let provider = MockServer::start().await;
     Mock::given(matchers::method("POST"))
         .and(matchers::path("/chat/completions"))
-        .and(|request: &wiremock::Request| {
+        .and(move |request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             body.get("response_format").is_none()
                 && body["messages"].as_array().is_some_and(|messages| {
@@ -618,6 +618,7 @@ async fn background_investigations_validate_controls_poll_status_and_reject_unkn
         })
         .await
         .unwrap();
+    let storage_for_assert = storage.clone();
     let app = router("http://localhost:5173".parse().unwrap(), storage);
     let get = |uri: String| {
         axum::http::Request::builder()
@@ -657,7 +658,7 @@ async fn background_investigations_validate_controls_poll_status_and_reject_unkn
         .clone()
         .oneshot(json_request(
             "/api/ai/investigations",
-            json!({"question":"Errors?","data_view_ids":["missing-view"],"ai_model_id":model.id,"ai_timeout_seconds":30,"time_budget_seconds":60}),
+            json!({"question":"Errors?","data_view_ids":["missing-view"],"ai_model_id":model.id,"time_range":{"start":100,"end":200},"ai_timeout_seconds":30,"time_budget_seconds":60}),
         ))
         .await
         .unwrap();
@@ -665,6 +666,16 @@ async fn background_investigations_validate_controls_poll_status_and_reject_unkn
     let started = body(response).await;
     let id = started["investigation"]["id"].as_str().unwrap().to_owned();
     assert_eq!(started["investigation"]["time_budget_seconds"], 60);
+    let conversation = storage_for_assert.ai_conversation(&id).await.unwrap();
+    assert_eq!(
+        conversation
+            .investigation_scope
+            .unwrap()
+            .time_range
+            .unwrap()
+            .start,
+        100
+    );
     let mut snapshot = Value::Null;
     for _ in 0..200 {
         snapshot = body(
@@ -711,21 +722,70 @@ async fn background_investigations_validate_controls_poll_status_and_reject_unkn
 }
 
 #[tokio::test]
+async fn investigative_continuation_rejects_legacy_conversations_without_scope() {
+    let (_directory, storage) = status_storage().await;
+    let conversation = StoredAiConversation::new(
+        "legacy-investigation".to_owned(),
+        "missing-model".to_owned(),
+        vec!["old-view".to_owned()],
+        "Old question".to_owned(),
+    );
+    let conversation = storage.create_ai_conversation(conversation).await.unwrap();
+    let app = router("http://localhost:5173".parse().unwrap(), storage);
+    let response = app
+        .oneshot(model_request(
+            Method::POST,
+            "/api/ai/conversations/legacy-investigation/investigations",
+            Some(json!({"message":"Please query new evidence"})),
+            Some(&conversation.revision),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "investigation_scope_unavailable");
+}
+
+#[tokio::test]
 async fn ai_investigation_gathers_bounded_evidence_and_returns_cited_hypotheses() {
-    assert_bounded_ai_evidence(false, false).await;
+    assert_bounded_ai_evidence(false, false, false, false, false).await;
+}
+
+#[tokio::test]
+async fn ai_investigation_runs_one_validated_adaptive_followup() {
+    assert_bounded_ai_evidence(false, false, true, false, false).await;
+}
+
+#[tokio::test]
+async fn ai_investigation_preserves_initial_findings_when_adaptive_query_fails() {
+    assert_bounded_ai_evidence(false, false, true, true, false).await;
+}
+
+#[tokio::test]
+async fn ai_investigation_continues_saved_scope_with_prior_conversation_context() {
+    assert_bounded_ai_evidence(false, false, false, false, true).await;
 }
 
 #[tokio::test]
 async fn ai_investigation_broadens_empty_filters_within_the_query_budget() {
-    assert_bounded_ai_evidence(true, false).await;
+    assert_bounded_ai_evidence(true, false, false, false, false).await;
 }
 
 #[tokio::test]
 async fn ai_investigation_does_not_treat_timed_out_searches_as_complete_evidence() {
-    assert_bounded_ai_evidence(false, true).await;
+    assert_bounded_ai_evidence(false, true, false, false, false).await;
 }
 
-async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool) {
+async fn assert_bounded_ai_evidence(
+    empty_filters: bool,
+    source_timed_out: bool,
+    adaptive_followup: bool,
+    adaptive_followup_failure: bool,
+    continuation_turn: bool,
+) {
     let (_directory, storage) = status_storage().await;
     let source = MockServer::start().await;
     let provider = MockServer::start().await;
@@ -741,6 +801,7 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
             "fields":{
                 "@timestamp":{"date":{"type":"date","metadata_field":false,"searchable":true,"aggregatable":true}},
                 "service":{"keyword":{"type":"keyword","metadata_field":false,"searchable":true,"aggregatable":true}},
+                "level":{"keyword":{"type":"keyword","metadata_field":false,"searchable":true,"aggregatable":true}},
                 "message":{"text":{"type":"text","metadata_field":false,"searchable":true,"aggregatable":false}}
             }
         })))
@@ -841,6 +902,30 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
         .expect(if source_timed_out {0} else {1})
         .mount(&source).await;
 
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/events/_search"))
+        .and(|request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            body["size"] == 4
+                && body.get("aggs").is_none()
+                && body["sort"][0]["@timestamp"]["order"] == "desc"
+                && body["query"]["bool"]["must"][0]["query_string"]["query"]
+                    == "level:\"error\""
+        })
+        .respond_with(if adaptive_followup_failure {
+            ResponseTemplate::new(502)
+        } else {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "took":4,"timed_out":false,"_shards":{"failed":0},
+                "hits":{"total":{"value":1,"relation":"eq"},"hits":[
+                    {"_index":"events","_id":"follow-up-record","_source":{"@timestamp":"2026-10-10T11:02:00Z","service":"checkout","level":"error","message":"inventory timeout repeated"}}
+                ]}
+            }))
+        })
+        .expect(if adaptive_followup {1} else {0})
+        .mount(&source)
+        .await;
+
     let plan_content = json!({"views":[{"data_view_id":"checkout-view","filters":[{"field":"service","operator":"eq","value":"checkout"}],"sample_fields":["@timestamp","message","service"],"aggregation_field":"service"}]}).to_string();
     Mock::given(matchers::method("POST"))
         .and(matchers::path("/v1/chat/completions"))
@@ -851,12 +936,12 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
         .and(matchers::body_partial_json(
             json!({"model":"test-model","response_format":{"type":"json_object"}}),
         ))
-        .and(|request: &wiremock::Request| {
+        .and(move |request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             let system = body["messages"][0]["content"].as_str().unwrap();
             let input: Value =
                 serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
-            !system.contains("Form and update hypotheses")
+            system.contains("Plan bounded evidence")
                 && input["playbook_evidence"][0]["step_name"] == "Checkout errors"
                 && input["playbook_evidence"][0]["current"]["time_range_start_ms"] == 1791630000000i64
                 && input["playbook_evidence"][0]["baseline"]["time_range_end_ms"] == 1791629999999i64
@@ -868,6 +953,13 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
                     .unwrap()
                     .iter()
                     .any(|field| field["name"] == "service" && field["type"] == "keyword")
+                && (if continuation_turn {
+                    input["prior_conversation_context"]
+                        .as_str()
+                        .is_some_and(|context| context.contains("Previous assistant finding"))
+                } else {
+                    input["prior_conversation_context"].is_null()
+                })
                 && !input.to_string().contains("inventory timeout")
         })
         .respond_with(
@@ -875,6 +967,26 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
                 .set_body_json(json!({"choices":[{"message":{"content":plan_content}}],"usage":{"prompt_tokens":210,"completion_tokens":44,"total_tokens":254}})),
         )
         .expect(1)
+        .mount(&provider)
+        .await;
+    let follow_up_content = json!({
+        "follow_up": {
+            "data_view_id": "checkout-view",
+            "reason": "Check whether the errors coincide with error-level records.",
+            "filters": [{"field":"level","operator":"eq","value":"error"}]
+        }
+    })
+    .to_string();
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_string_contains(
+            "decide whether exactly one additional source query",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices":[{"message":{"content":follow_up_content}}],
+            "usage":{"prompt_tokens":80,"completion_tokens":20,"total_tokens":100}
+        })))
+        .expect(if adaptive_followup { 1 } else { 0 })
         .mount(&provider)
         .await;
     let findings_content = json!({
@@ -888,7 +1000,7 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
         .and(move |request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             let input: Value = serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
-            input["sources"][0]["records_examined"] == 3
+            input["sources"][0]["records_examined"].as_u64().unwrap_or_default() >= 3
                 && input["sources"][0]["aggregation_field"] == "service"
                 && input["sources"][0]["aggregations"].as_array().unwrap().len() == 2
         })
@@ -896,7 +1008,13 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
             ResponseTemplate::new(200)
                 .set_body_json(json!({"choices":[{"message":{"content":findings_content}}],"usage":{"prompt_tokens":420,"completion_tokens":96,"total_tokens":516}})),
         )
-        .expect(if source_timed_out {0} else {1})
+        .expect(if source_timed_out {
+            0
+        } else if adaptive_followup && !adaptive_followup_failure {
+            2
+        } else {
+            1
+        })
         .mount(&provider)
         .await;
 
@@ -953,13 +1071,99 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
         })
         .await
         .unwrap();
+    let storage_for_assert = storage.clone();
     let app = router("http://localhost:5173".parse().unwrap(), storage);
-    let response = app.oneshot(json_request("/api/ai/investigate",json!({"question":"Why are checkouts failing?","data_view_ids":["checkout-view"],"ai_model_id":saved_model.id,"time_range":{"start":1791630000000i64,"end":1791633600000i64}}))).await.unwrap();
-    let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), 32 * 1024)
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_slice(&body).unwrap();
+    let (status, body) = if continuation_turn {
+        let mut conversation = StoredAiConversation::new(
+            "ongoing-checkout".to_owned(),
+            saved_model.id.clone(),
+            vec!["checkout-view".to_owned()],
+            "Original checkout investigation".to_owned(),
+        );
+        conversation.investigation_scope = Some(crate::storage::StoredAiInvestigationScope {
+            time_range: Some(crate::search::TimeRange {
+                start: 1791630000000i64,
+                end: 1791633600000i64,
+            }),
+        });
+        conversation.messages.push(StoredAiConversationMessage {
+            role: "assistant".to_owned(),
+            content: "Previous assistant finding: inspect checkout status records.".to_owned(),
+            result: None,
+        });
+        let conversation = storage_for_assert
+            .create_ai_conversation(conversation)
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(model_request(
+                Method::POST,
+                "/api/ai/conversations/ongoing-checkout/investigations",
+                Some(json!({
+                    "message":"Why are checkouts failing?",
+                    "adaptive_followup":adaptive_followup
+                })),
+                Some(&conversation.revision),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let bytes = axum::body::to_bytes(response.into_body(), 32 * 1024)
+            .await
+            .unwrap();
+        let started: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            started["conversation"]["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            started["conversation"]["investigation_scope"]["time_range"]["start"],
+            1791630000000i64
+        );
+        let job_id = started["investigation"]["id"].as_str().unwrap();
+        let mut completed = None;
+        for _ in 0..100 {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(Method::GET)
+                        .uri(format!("/api/ai/investigations/{job_id}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), 32 * 1024)
+                .await
+                .unwrap();
+            let snapshot: Value = serde_json::from_slice(&bytes).unwrap();
+            if snapshot["investigation"]["status"] == "completed" {
+                completed = Some(snapshot["investigation"].clone());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let completed = completed.expect("continued investigation should complete");
+        let persisted = storage_for_assert
+            .ai_conversation("ongoing-checkout")
+            .await
+            .unwrap();
+        assert_eq!(persisted.messages.len(), 4);
+        assert_eq!(persisted.messages[2].content, "Why are checkouts failing?");
+        (StatusCode::OK, completed["result"].clone())
+    } else {
+        let response = app.oneshot(json_request("/api/ai/investigate",json!({"question":"Why are checkouts failing?","data_view_ids":["checkout-view"],"ai_model_id":saved_model.id,"time_range":{"start":1791630000000i64,"end":1791633600000i64},"adaptive_followup":adaptive_followup}))).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 32 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    };
     if source_timed_out {
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
         assert_eq!(body["error"]["code"], "source_query_failed");
@@ -971,12 +1175,30 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
         json!(["event-1", "event-2"])
     );
     assert_eq!(body["findings"][0]["evidence"][0]["count"], 2);
-    assert_eq!(body["sources"][0]["records_examined"], 3);
+    assert_eq!(
+        body["sources"][0]["records_examined"],
+        if adaptive_followup && !adaptive_followup_failure {
+            4
+        } else {
+            3
+        }
+    );
     assert_eq!(
         body["sources"][0]["batches_processed"],
-        if empty_filters { 3 } else { 2 }
+        if adaptive_followup || empty_filters {
+            3
+        } else {
+            2
+        }
     );
-    assert_eq!(body["sources"][0]["sample_limit"], 8);
+    assert_eq!(
+        body["sources"][0]["sample_limit"],
+        if adaptive_followup && !adaptive_followup_failure {
+            12
+        } else {
+            8
+        }
+    );
     assert_eq!(body["sources"][0]["aggregate_records"], 102);
     assert_eq!(body["playbook_evidence"][0]["step_name"], "Checkout errors");
     assert_eq!(
@@ -996,7 +1218,11 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
             .as_array()
             .unwrap()
             .len(),
-        if empty_filters { 3 } else { 2 }
+        if adaptive_followup || empty_filters {
+            3
+        } else {
+            2
+        }
     );
     assert_eq!(
         body["sources"][0]["evidence_queries"][0]["sampling"],
@@ -1006,6 +1232,30 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
         body["sources"][0]["evidence_queries"][1]["sampling"],
         if empty_filters { "latest" } else { "earliest" }
     );
+    if adaptive_followup {
+        assert_eq!(
+            body["sources"][0]["evidence_queries"][2]["sampling"],
+            "adaptive_follow_up"
+        );
+        if adaptive_followup_failure {
+            assert!(body["sources"][0]["evidence_queries"][2]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Query failed"));
+            assert!(body["caveats"].as_array().unwrap().iter().any(|caveat| {
+                caveat
+                    .as_str()
+                    .unwrap()
+                    .contains("earlier evidence was retained")
+            }));
+        } else {
+            assert_eq!(
+                body["sources"][0]["evidence_queries"][2]["reason"],
+                "Check whether the errors coincide with error-level records."
+            );
+        }
+        assert_eq!(body["token_usage"][2]["stage"], "adaptive_follow_up");
+    }
     if empty_filters {
         assert_eq!(
             body["sources"][0]["evidence_queries"][2]["sampling"],
@@ -1034,8 +1284,15 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
         body["token_usage"][0],
         json!({"stage":"planning","prompt_tokens":210,"completion_tokens":44,"total_tokens":254})
     );
-    let analysis_calls = 1;
-    assert_eq!(body["token_usage"].as_array().unwrap().len(), 2);
+    let analysis_calls = if adaptive_followup && !adaptive_followup_failure {
+        2
+    } else {
+        1
+    };
+    assert_eq!(
+        body["token_usage"].as_array().unwrap().len(),
+        if adaptive_followup { 3 } else { 2 }
+    );
     assert_eq!(
         body["token_usage"][1],
         json!({"stage":"hypothesis","prompt_tokens":420 * analysis_calls,"completion_tokens":96 * analysis_calls,"total_tokens":516 * analysis_calls})
@@ -1048,7 +1305,10 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
         assert!(!body.to_string().contains(secret));
     }
     let provider_requests = provider.received_requests().await.unwrap();
-    assert_eq!(provider_requests.len(), 1 + analysis_calls as usize);
+    assert_eq!(
+        provider_requests.len(),
+        1 + analysis_calls as usize + usize::from(adaptive_followup)
+    );
     let analysis_inputs = provider_requests
         .iter()
         .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
@@ -1080,6 +1340,17 @@ async fn assert_bounded_ai_evidence(empty_filters: bool, source_timed_out: bool)
             && example["record"].get("message").is_some()
             && example["record"].get("service").is_some()
     }));
+    if adaptive_followup && !adaptive_followup_failure {
+        assert!(analysis_inputs[1]["sources"][0]["examples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|example| example["record_id"] == "follow-up-record"));
+        assert_eq!(
+            analysis_inputs[1]["sources"][0]["evidence_queries"][2]["sampling"],
+            "adaptive_follow_up"
+        );
+    }
     assert_eq!(
         analysis_inputs[0]["sources"][0]["aggregations"][0]["count"],
         60

@@ -59,8 +59,8 @@ describe('Discover', () => {
     render(<App />);
     await screen.findByRole('option', { name: conversation.title });
     fireEvent.change(screen.getByLabelText('AI conversation history'), { target: { value: conversation.id } });
-    fireEvent.click(await screen.findByRole('button', { name: 'Save as knowledge draft' }));
-    fireEvent.click(await screen.findByRole('button', { name: 'Review knowledge draft' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Save full investigation as Knowledge draft' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Review draft' }));
     expect(await screen.findByLabelText('Title', {}, { timeout: 5000 })).toHaveValue('Why did payments fail?');
     expect(screen.getByLabelText('Status')).toHaveValue('draft');
     expect((screen.getByLabelText('Content') as HTMLTextAreaElement).value).toContain('case-1');
@@ -370,6 +370,7 @@ describe('Discover', () => {
     vi.mocked(api.aiModels).mockResolvedValue([{ id: 'model-primary', revision: 'r1', name: 'Primary', api_url: 'https://provider.example/v1', model: 'model-x', has_api_key: true }]);
     const startInvestigation = vi.spyOn(api, 'startInvestigation').mockResolvedValue({
       id: 'document-job',
+      conversation_id: 'document-job',
       status: 'completed',
       progress: { stage: 'Done', records_examined: 1, batches_processed: 1, analysis_cycles: 1, elapsed_ms: 1 },
       time_budget_seconds: 120,

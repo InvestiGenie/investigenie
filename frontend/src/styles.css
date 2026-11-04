@@ -422,6 +422,9 @@ th[aria-sort="ascending"] .column-sort-button, th[aria-sort="descending"] .colum
 .ai-retention-error { margin-top: 8px; }
 .ai-history-row > span[role="status"] { color: var(--muted); font-size: 10px; }
 .ai-history-row > .quiet-button { width: 30px; height: 30px; display: grid; place-items: center; padding: 0; }
+.ai-session-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 2px 0 7px; border-bottom: 1px solid var(--line); }
+.ai-session-save-error { color: var(--red-dark); font-size: 10px; }
+.ai-legacy-conversation-note { margin: 0; color: var(--muted); font-size: 10px; }
 .ai-controls-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--line); }
 .ai-controls-row .time-window { margin-left: auto; min-width: 0; }
 .ai-controls-row .time-range-trigger { min-width: 0; }
@@ -527,6 +530,8 @@ th[aria-sort="ascending"] .column-sort-button, th[aria-sort="descending"] .colum
 .ai-composer-footer .ai-model-compact select { width: 100%; max-width: 100%; min-width: 0; }
 .ai-composer-footer .ai-run-setting { flex: 0 0 auto; flex-wrap: nowrap; white-space: nowrap; }
 .ai-composer-footer .ai-run-setting select { width: 76px; min-width: 76px; }
+.ai-composer-footer .ai-follow-up-setting { gap: 5px; }
+.ai-composer-footer .ai-follow-up-setting input { width: 14px; height: 14px; margin: 0; accent-color: var(--green); }
 .ai-composer-footer .ai-send { flex-shrink: 0; }
 .ai-composer-footer > span { color: var(--muted); font-size: 9px; }
 .ai-send { width: 30px; height: 30px; display: grid; place-items: center; color: white; background: var(--green); border: 0; border-radius: 5px; }
@@ -562,6 +567,7 @@ th[aria-sort="ascending"] .column-sort-button, th[aria-sort="descending"] .colum
   .ai-workspace { min-height: calc(100vh - 90px); }
   .ai-history-row { flex-wrap: wrap; }
   .ai-history-row > select { flex: 1; width: auto; }
+  .ai-session-actions > button { max-width: 100%; white-space: normal; }
   .ai-controls-row { align-items: stretch; flex-direction: column; }
   .ai-controls-row .time-window { margin-left: 0; justify-content: flex-end; }
   .ai-composer-footer .ai-model-picker { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
@@ -569,6 +575,7 @@ th[aria-sort="ascending"] .column-sort-button, th[aria-sort="descending"] .colum
   .ai-composer-footer .ai-model-compact select { width: 100%; }
   .ai-composer-footer .ai-run-setting { min-width: 0; flex-direction: column; align-items: flex-start; gap: 4px; }
   .ai-composer-footer .ai-run-setting select { width: 100%; min-width: 0; }
+  .ai-composer-footer .ai-follow-up-setting { grid-column: 1 / -1; flex-direction: row; align-items: center; }
   .ai-model-picker .alert { width: 100%; }
   .ai-dataview-picker { width: 100%; }
   .ai-dataview-trigger { width: 100%; justify-content: flex-start; }

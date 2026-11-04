@@ -343,6 +343,12 @@ pub struct StoredAiConversationMessage {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct StoredAiInvestigationScope {
+    pub time_range: Option<crate::search::TimeRange>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoredAiConversation {
     pub id: String,
     pub revision: String,
@@ -352,6 +358,8 @@ pub struct StoredAiConversation {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub messages: Vec<StoredAiConversationMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation_scope: Option<StoredAiInvestigationScope>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -378,6 +386,7 @@ impl StoredAiConversation {
                 content: question,
                 result: None,
             }],
+            investigation_scope: None,
         }
     }
 

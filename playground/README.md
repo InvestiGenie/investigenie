@@ -114,6 +114,7 @@ PLAYGROUND_AI_MODELS=qwen2.5-7b-instruct
 ./playground/playground.sh eval --model all                       # compare every registered model
 ./playground/playground.sh eval --model 3b --scenario checkout-bad-deploy -v
 ./playground/playground.sh eval --model all --repeat 3                 # local models vary run to run
+./playground/playground.sh eval --model 3b --follow-up-mode both   # paired baseline/adaptive comparison
 ```
 
 For each model and scenario, the harness does the following:
@@ -124,17 +125,19 @@ For each model and scenario, the harness does the following:
 4. Scores the final summary and findings against the scenario's keyword groups. A scenario passes when every group matches. The keywords are evidence only the data contains (the IP, the version, the replica name), never words from the question, so an answer that just restates the question scores zero. The `control-quiet-window` scenario passes only if no finding is rated high or critical, which catches models that invent incidents.
 5. Deletes the investigation from the AI history. InvestiGenie keeps the 64 most recently updated conversations, so eval runs would otherwise push your own investigations out. Pass `--keep-history` to inspect runs in the UI.
 
+`--follow-up-mode baseline` is the current default bounded flow. `adaptive` opts into at most one metadata-validated follow-up query per investigation. `both` runs each selected model/scenario twice in a stable baseline-then-adaptive order and labels every JSON/Markdown report row; expect roughly twice the model calls and cost. Use the same seeded corpus, Data Views, models, and repeated runs when comparing modes.
+
 Each failure is classified as a `wrong-answer` (completed but missed the root cause), `incomplete` (stopped or partial) or `pipeline-error` (timeout, unparseable model output, provider error). This separates "the model reasoned badly" from "the model or the flow broke".
 
 `--fail-on pipeline-error` makes the exit code depend only on the flow breaking, not on wrong answers. The nightly `playground-eval.yml` workflow uses that with `qwen2.5:1.5b` as a CPU-friendly flow smoke test, not an answer-quality gate. The 0.5B model triggered Ollama HTTP 500 errors during structured generation in repeated runs; the 1.5B comparison completed without pipeline errors. In GitHub Actions the scorecard is also written to the job summary.
 
 The workflow uploads the JSON reports as the `playground-ai-evaluation` artifact. On failure, it also includes `services.log` with the last 200 log lines from each of InvestiGenie and Ollama, captured before teardown.
 
-It prints a scorecard (passes, keywords, failure kinds, average time, tokens) and writes the full results, including summaries and findings, to `playground/reports/ai-eval-<timestamp>.json`. Without Docker, run `python3 playground/ai_eval.py --help` directly against the published ports. It uses only the standard library.
+It prints a scorecard (passes, keywords, source/playbook queries, adaptive query count, sample citations, failure kinds, average time, tokens) and writes the full results, including summaries and findings, to `playground/reports/ai-eval-<timestamp>.json`. Without Docker, run `python3 playground/ai_eval.py --help` directly against the published ports. It uses only the standard library.
 
 ### Reviewing investigation knowledge
 
-The evaluation harness does not create knowledge entries. By default it deletes its investigation history after scoring; pass `--keep-history` to inspect completed cases in the UI. To retain a case as knowledge, reopen it from AI history, click **Save as knowledge draft**, then **Review knowledge draft**. Confirm the findings and fill in the cause/resolution before publishing; a completed evaluation can still contain wrong answers. Published entries are not yet retrieved by investigations and do not improve subsequent evaluations automatically.
+The evaluation harness does not create knowledge entries. By default it deletes its investigation history after scoring; pass `--keep-history` to inspect completed cases in the UI. To retain a case as knowledge, reopen it from AI history, click **Save as knowledge draft**, then **Review knowledge draft**. Confirm the findings and fill in the cause/resolution before publishing; a completed evaluation can still contain wrong answers. Only published Investigation Playbooks run during investigations; other published Knowledge kinds are not yet retrieved automatically.
 
 ## Configuration
 

@@ -163,7 +163,7 @@ export type InvestigationResult = {
     sample_records_available?: number;
     sample_limit?: number;
     aggregate_records?: number | null;
-    evidence_queries?: Array<{ sampling: string; query_summary: string; records_returned: number; aggregate_records: number | null }>;
+    evidence_queries?: Array<{ sampling: string; query_summary: string; records_returned: number; aggregate_records: number | null; reason?: string | null }>;
   }>;
   caveats: string[];
   token_usage: Array<{
@@ -190,12 +190,14 @@ export type PlaybookWindowEvidence = {
 export type InvestigationControls = {
   ai_timeout_seconds: number;
   time_budget_seconds: number;
+  adaptive_followup: boolean;
 };
 
 export type InvestigationJobStatus = 'running' | 'stopping' | 'awaiting_decision' | 'completed' | 'terminated' | 'failed';
 
 export type InvestigationJob = {
   id: string;
+  conversation_id: string;
   status: InvestigationJobStatus;
   progress: {
     stage: string;
@@ -222,6 +224,7 @@ export type AIConversation = {
   title: string;
   model_id: string;
   data_view_ids: string[];
+  investigation_scope?: { time_range: SearchRequest['time_range'] | null } | null;
   created_at_ms: number;
   updated_at_ms: number;
   messages: AIConversationMessage[];
@@ -440,6 +443,9 @@ export const api = {
   async continueAIConversation(id: string, message: string, revision: string): Promise<AIConversation> {
     const response = await request<{ conversation: AIConversation }>(`/api/ai/conversations/${encodeURIComponent(id)}/messages`, jsonMutation('POST', { message }, revision));
     return response.conversation;
+  },
+  async continueAIInvestigation(id: string, message: string, revision: string, controls: InvestigationControls): Promise<{ investigation: InvestigationJob; conversation: AIConversation }> {
+    return request<{ investigation: InvestigationJob; conversation: AIConversation }>(`/api/ai/conversations/${encodeURIComponent(id)}/investigations`, jsonMutation('POST', { message, ...controls }, revision));
   },
   async removeAIConversation(id: string, revision: string): Promise<void> {
     await request(`/api/ai/conversations/${encodeURIComponent(id)}`, jsonMutation('DELETE', undefined, revision));

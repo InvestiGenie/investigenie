@@ -152,7 +152,7 @@ def check_history_capacity(planned, keep_history):
         )
 
 
-def run_one(model, scenario, data_views, args):
+def run_one(model, scenario, data_views, args, follow_up_mode="baseline"):
     payload = {
         "question": scenario["question"],
         "data_view_ids": data_views,
@@ -160,6 +160,7 @@ def run_one(model, scenario, data_views, args):
         "time_range": scenario["time_range"],
         "ai_timeout_seconds": args.ai_timeout,
         "time_budget_seconds": args.budget,
+        "adaptive_followup": follow_up_mode == "adaptive",
     }
     started = time.monotonic()
     job = api("/api/ai/investigations", "POST", payload)["investigation"]
@@ -202,10 +203,31 @@ def run_one(model, scenario, data_views, args):
         matched, total, groups = score(result, scenario["expected_keywords"]) if result else (0, len(scenario["expected_keywords"]), [])
     passed = investigation_passed(job["status"], result, matched, total)
     tokens = sum((usage.get("total_tokens") or 0) for usage in result.get("token_usage", []))
+    sources = result.get("sources", [])
+    source_queries = sum(source.get("batches_processed") or 0 for source in sources)
+    adaptive_queries = sum(
+        1
+        for source in sources
+        for query in source.get("evidence_queries", [])
+        if query.get("sampling") == "adaptive_follow_up"
+    )
+    playbook_queries = sum(
+        1
+        for step in result.get("playbook_evidence", [])
+        for window in ("current", "baseline")
+        if step.get(window) is not None
+    )
+    sample_citations = len({
+        (evidence.get("data_view_id"), record_id)
+        for finding in result.get("findings", [])
+        for evidence in finding.get("evidence", [])
+        for record_id in evidence.get("record_ids") or []
+    })
     return {
         "model": model["name"],
         "model_id": model["model"],
         "scenario": scenario["id"],
+        "follow_up_mode": follow_up_mode,
         "difficulty": scenario["difficulty"],
         "status": job["status"],
         "error": job.get("error"),
@@ -218,6 +240,12 @@ def run_one(model, scenario, data_views, args):
         "keyword_groups": groups,
         "seconds": round(elapsed, 1),
         "records_examined": job.get("progress", {}).get("records_examined"),
+        "analysis_cycles": job.get("progress", {}).get("analysis_cycles"),
+        "source_queries": source_queries,
+        "adaptive_followup_queries": adaptive_queries,
+        "playbook_queries": playbook_queries,
+        "total_queries": source_queries + playbook_queries,
+        "sample_citations": sample_citations,
         "total_tokens": tokens,
         "continues": continues,
         "summary": result.get("summary"),
@@ -227,19 +255,29 @@ def run_one(model, scenario, data_views, args):
 
 
 def write_markdown_summary(path, truth, models, results):
-    lines = [f"### AI investigation eval (corpus anchored {truth.get('anchor')})", "", "| model | scenario | result | keywords | seconds |"]
-    lines.append("| --- | --- | --- | --- | --- |")
+    lines = [f"### AI investigation eval (corpus anchored {truth.get('anchor')})", "", "| model | mode | scenario | result | keywords | queries | adaptive | citations | seconds | tokens |"]
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for row in results:
         verdict = "pass" if row["passed"] else row["outcome"]
-        lines.append(f"| {row['model']} | {row['scenario']} | {verdict} | {row['score']}/{row['max_score']} | {row['seconds']} |")
+        lines.append(f"| {row['model']} | {row['follow_up_mode']} | {row['scenario']} | {verdict} | {row['score']}/{row['max_score']} | {row.get('total_queries') or 0} | {row.get('adaptive_followup_queries') or 0} | {row.get('sample_citations') or 0} | {row['seconds']} | {row.get('total_tokens') or 0} |")
     with open(path, "a") as handle:
         handle.write("\n".join(lines) + "\n")
+
+
+def selected_follow_up_modes(mode):
+    return ("baseline", "adaptive") if mode == "both" else (mode,)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Score InvestiGenie AI investigations on the playground scenarios")
     parser.add_argument("--model", action="append", default=[], help="model name/id substring; repeat, or 'all'")
     parser.add_argument("--scenario", action="append", default=[], help="scenario id; repeat for several (default: all)")
+    parser.add_argument(
+        "--follow-up-mode",
+        choices=("baseline", "adaptive", "both"),
+        default="baseline",
+        help="run the current bounded flow, enable one bounded adaptive follow-up, or compare both",
+    )
     parser.add_argument("--data-view", action="append", default=[], help="data view id (default: playground-logs)")
     parser.add_argument(
         "--ai-timeout",
@@ -290,61 +328,75 @@ def main():
     models = pick_models(args.model)
     if not models:
         raise SystemExit("No AI models selected; register a model or choose a registered model.")
+    follow_up_modes = selected_follow_up_modes(args.follow_up_mode)
     data_views = args.data_view or ["playground-logs"]
 
-    check_history_capacity(len(scenarios) * len(models) * args.repeat, args.keep_history)
+    check_history_capacity(len(scenarios) * len(models) * args.repeat * len(follow_up_modes), args.keep_history)
     print(
         f"Corpus anchored at {truth['anchor']}; {len(scenarios)} scenario(s) x {len(models)} model(s)"
-        f"{f' x {args.repeat} runs' if args.repeat > 1 else ''}",
+        f"{f' x {args.repeat} runs' if args.repeat > 1 else ''} x {len(follow_up_modes)} follow-up mode(s)",
         flush=True,
     )
     results = []
     for model in models:
         print(f"\n== {model['name']}  ({model['model']})", flush=True)
         for scenario, run in [(s, r) for s in scenarios for r in range(args.repeat)]:
-            print(f"   {scenario['id']}{f' (run {run + 1})' if args.repeat > 1 else ''}: {scenario['question']}", flush=True)
-            try:
-                outcome = run_one(model, scenario, data_views, args)
-            except (RuntimeError, OSError) as error:  # keep going and still write the report
-                outcome = {
-                    "model": model["name"],
-                    "model_id": model["model"],
-                    "scenario": scenario["id"],
-                    "difficulty": scenario["difficulty"],
-                    "status": "error",
-                    "error": str(error),
-                    "outcome": "pipeline-error",
-                    "score": 0,
-                    "passed": False,
-                    "seconds": 0,
-                    "max_score": 1 if scenario.get("expect_quiet") else len(scenario["expected_keywords"]),
-                }
-            outcome["run"] = run + 1
-            results.append(outcome)
-            verdict = "PASS" if outcome["passed"] else f"FAIL ({outcome['outcome']})"
-            detail = f" error={outcome['error']}" if outcome.get("error") else ""
-            print(
-                f"      {verdict} {outcome['score']}/{outcome['max_score']} keywords, {outcome['status']}, "
-                f"{outcome['seconds']}s, {outcome.get('total_tokens') or 0} tokens{detail}",
-                flush=True,
-            )
-            if outcome.get("summary"):
-                print(f"      summary: {outcome['summary'][:300]}", flush=True)
+            for follow_up_mode in follow_up_modes:
+                print(
+                    f"   {scenario['id']} [{follow_up_mode}]"
+                    f"{f' (run {run + 1})' if args.repeat > 1 else ''}: {scenario['question']}",
+                    flush=True,
+                )
+                try:
+                    outcome = run_one(model, scenario, data_views, args, follow_up_mode)
+                except (RuntimeError, OSError) as error:  # keep going and still write the report
+                    outcome = {
+                        "model": model["name"],
+                        "model_id": model["model"],
+                        "scenario": scenario["id"],
+                        "follow_up_mode": follow_up_mode,
+                        "difficulty": scenario["difficulty"],
+                        "status": "error",
+                        "error": str(error),
+                        "outcome": "pipeline-error",
+                        "score": 0,
+                        "passed": False,
+                        "seconds": 0,
+                        "max_score": 1 if scenario.get("expect_quiet") else len(scenario["expected_keywords"]),
+                    }
+                outcome["run"] = run + 1
+                results.append(outcome)
+                verdict = "PASS" if outcome["passed"] else f"FAIL ({outcome['outcome']})"
+                detail = f" error={outcome['error']}" if outcome.get("error") else ""
+                print(
+                    f"      {verdict} {outcome['score']}/{outcome['max_score']} keywords, {outcome['status']}, "
+                    f"{outcome.get('total_queries') or 0} queries ({outcome.get('adaptive_followup_queries') or 0} adaptive), "
+                    f"{outcome.get('sample_citations') or 0} citations, {outcome['seconds']}s, "
+                    f"{outcome.get('total_tokens') or 0} tokens{detail}",
+                    flush=True,
+                )
+                if outcome.get("summary"):
+                    print(f"      summary: {outcome['summary'][:300]}", flush=True)
 
     print("\nScorecard")
-    print(f"{'model':<36} {'pass':>6} {'keywords':>9} {'wrong':>6} {'incompl':>8} {'errors':>7} {'avg s':>7} {'tokens':>8}")
+    print(f"{'model':<36} {'mode':<9} {'pass':>6} {'keywords':>9} {'queries':>7} {'adapt':>6} {'cites':>6} {'wrong':>6} {'incompl':>8} {'errors':>7} {'avg s':>7} {'tokens':>8}")
     for model in models:
-        rows = [r for r in results if r["model"] == model["name"]]
-        passed = sum(r["passed"] for r in rows)
-        keywords = sum(r["score"] for r in rows)
-        possible = sum(r["max_score"] for r in rows)
-        seconds = sum(r["seconds"] for r in rows) / max(1, len(rows))
-        tokens = sum(r.get("total_tokens") or 0 for r in rows)
-        kinds = Counter(r["outcome"] for r in rows)
-        print(
-            f"{model['name'][:36]:<36} {passed:>3}/{len(rows):<2} {keywords:>4}/{possible:<4} {kinds['wrong-answer']:>6} "
-            f"{kinds['incomplete']:>8} {kinds['pipeline-error']:>7} {seconds:>7.0f} {tokens:>8}"
-        )
+        for follow_up_mode in follow_up_modes:
+            rows = [r for r in results if r["model"] == model["name"] and r["follow_up_mode"] == follow_up_mode]
+            passed = sum(r["passed"] for r in rows)
+            keywords = sum(r["score"] for r in rows)
+            possible = sum(r["max_score"] for r in rows)
+            seconds = sum(r["seconds"] for r in rows) / max(1, len(rows))
+            tokens = sum(r.get("total_tokens") or 0 for r in rows)
+            queries = sum(r.get("total_queries") or 0 for r in rows)
+            adaptive_queries = sum(r.get("adaptive_followup_queries") or 0 for r in rows)
+            citations = sum(r.get("sample_citations") or 0 for r in rows)
+            kinds = Counter(r["outcome"] for r in rows)
+            print(
+                f"{model['name'][:36]:<36} {follow_up_mode:<9} {passed:>3}/{len(rows):<2} {keywords:>4}/{possible:<4} "
+                f"{queries:>7} {adaptive_queries:>6} {citations:>6} {kinds['wrong-answer']:>6} {kinds['incomplete']:>8} "
+                f"{kinds['pipeline-error']:>7} {seconds:>7.0f} {tokens:>8}"
+            )
 
     os.makedirs(args.report_dir, exist_ok=True)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -356,6 +408,7 @@ def main():
                 "corpus": truth.get("corpus"),
                 "anchor": truth.get("anchor"),
                 "data_views": data_views,
+                "follow_up_modes": follow_up_modes,
                 "results": results,
             },
             handle,
