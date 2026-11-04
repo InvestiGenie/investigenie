@@ -1,14 +1,15 @@
 # AI Investigation Pipeline
 
-The investigation planner receives Data View metadata, not a dump of source records. A bounded evidence engine validates the plan, runs datasource queries, and sends only compact samples and aggregations to hypothesis generation. Connection credentials stay on the server. An optional adaptive follow-up can request one more metadata-validated query after the initial evidence pass.
+The request router uses the latest user message to choose between a direct conversational reply and a data investigation. Conversational replies skip playbook and evidence queries. For data requests, the planner receives the latest request and Data View metadata, not a dump of source records; the bounded evidence engine validates its plan and sends only compact samples and aggregations to analysis. The response answers the latest request directly before explaining supporting evidence and limits. A requested query is only suggested from the validated plan and source metadata; it is not model-authored execution input. Connection credentials stay on the server. An optional adaptive follow-up can request one more metadata-validated query after the initial evidence pass.
 
 ```mermaid
 flowchart TD
-    Q[Question and selected Data Views] --> M[Metadata collection<br/>field names and types]
-    M --> PB[Published playbook steps<br/>per selected Data View]
+    Q[Latest request and selected Data Views] --> M[Metadata collection<br/>field names and types]
+    M --> R[Route request and plan task]
+    R -->|conversation| CR[Direct reply<br/>no playbook or evidence queries]
+    R -->|data request| PB[Published playbook steps<br/>per selected Data View]
     PB -->|current + prior equal-duration window| PA[Bounded preflight aggregations]
-    PA --> P[Evidence plan<br/>filters, sample fields, aggregation field]
-    P --> V[Validate plan against metadata]
+    PA --> V[Validate planned filters against metadata]
     V --> E[Evidence gathering engine]
     E -->|latest · max 4 rows| L[Newest sample]
     L -->|more matches indicated| EARLY[Earlier sample · max 4 rows]
@@ -30,6 +31,7 @@ flowchart TD
     H2 --> RESULT
     Q2 -. on query failure .-> RESULT
     RESULT --> UI[Investigation result]
+    CR --> UI
     UI -->|New user turn<br/>same saved Data Views and time scope| C[Append turn to conversation]
     C --> M
     UI -->|Save full conversation as draft<br/>when no job is running| D[Unverified draft<br/>all turns, results, evidence, scope, caveats]
@@ -42,12 +44,12 @@ Solid arrows show implemented flows. Only published Investigation Playbooks exec
 
 ## Boundaries
 
-- Planning uses Data View names, indices, field names, and field types. It returns candidate filters, a bounded list of sample fields, and an optional aggregation field.
+- Request routing treats greetings and other non-data conversation as direct replies; these skip playbook and evidence searches. Data requests continue to planning, which treats the latest user turn as the task and uses prior conversation only to resolve references and maintain continuity. Planning prioritizes explicit entities, timestamps, fields, and comparisons over generic aggregation. It uses Data View names, indices, field names, and field types; it returns candidate filters, a bounded list of sample fields, and an optional aggregation field.
 - Before planning, each applicable published playbook step runs against selected Data Views through the existing read-only connector search. A step specifies an optional connector-native query and breakdown field; the backend bounds execution and checks breakdown fields against live metadata. For a bounded window, the same step runs over the immediately preceding equal-duration inclusive window; All time has no baseline. The result exposes the query, both scopes, aggregate counts/buckets, and failures. Query text and labels are untrusted evidence, never model instructions.
 - The evidence engine validates those choices and runs at most three bounded sample queries per Data View: latest rows, earliest rows if additional matches are indicated, and a broader query within the same time range if filters return no rows. Each query returns at most four records; at most eight unique sample rows per Data View are retained. The first query may also request a source-side histogram and top-value breakdown (up to three values plus `__other__` per bucket), which can cover more records than the sample. AI Elasticsearch requests disable exact hit counting. Sample records include at most four selected fields, values are capped at 256 bytes, and the hypothesis payload keeps at most 16 aggregate buckets. Timed-out source searches fail the investigation. The result reports sampled rows, compact records actually supplied to the model, aggregation totals, and each query scope separately. It does not page through every matching record.
 - Optional `adaptive_followup` is false by default. When enabled, the final initial hypothesis pass may request one structured follow-up for one selected Data View with 1-3 filters. Every filter must validate against live metadata and connector rules; if any filter is invalid, the whole proposal is discarded. The one query uses the original time range, returns at most four records, and raises that view's retained-sample cap from 8 to 12. Query failures preserve earlier findings. The model cannot issue connector-native query text or request another follow-up.
 - A scoped conversation follow-up starts a new background investigation turn in the same encrypted conversation. It reuses the saved model, selected Data Views, and original time range, and gives the planner a compact, bounded summary of prior user turns and results as untrusted context. Each turn performs fresh bounded evidence searches; only current-turn sample IDs can support current findings. Each turn can independently opt into one adaptive follow-up.
-- Hypothesis generation receives the question, validated scope, per-query coverage, aggregate summaries, and compact sample evidence. Findings without valid sample citations are removed; finding counts are derived from distinct cited sample IDs, never copied from a whole-query aggregate. Empty results are reported as insufficient sampled evidence, not an all-clear. Confidence remains model judgment and conclusions are never marked verified automatically. Valid citations establish traceability only; they do not establish that an inferred cause is correct or immune to misleading source text.
+- Analysis receives the latest user request, prior context, validated scope, per-query coverage, connector/field metadata, the planned query, aggregate summaries, and compact sample evidence. The summary answers the latest request directly; a query-syntax request may receive a clearly labeled, read-only suggestion derived from the validated plan, explicitly not executed. Conversational-only results use `response_mode: conversation` and do not claim evidence coverage. Findings without valid sample citations are removed; finding counts are derived from distinct cited sample IDs, never copied from a whole-query aggregate. Empty results are reported as insufficient sampled evidence, not an all-clear. Confidence remains model judgment and conclusions are never marked verified automatically. Valid citations establish traceability only; they do not establish that an inferred cause is correct or immune to misleading source text.
 - Knowledge storage contains manual reference entries and structured Investigation Playbooks. A published, editable default playbook is seeded once; user playbooks use revision-checked edits and archive/restore. Only published playbooks feed preflight; other Knowledge entries are not retrieved. Completed live/history results can be explicitly copied into unverified drafts. Publishing remains an editorial decision, not proof of correctness.
 - AI conversation history is separate from Knowledge, encrypted in either storage mode, and retained for 30 days by default (configurable from 1 to 3650). Expired completed records are pruned on startup, history list/read, create/append, and retention changes. Active conversations are preserved at runtime; stale interrupted jobs are pruned after restart. Saving a result to Knowledge preserves it beyond history expiry.
 

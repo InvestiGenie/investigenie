@@ -134,6 +134,31 @@ describe('InvestiGenieAIPage', () => {
     expect(screen.queryByRole('button', { name: 'Save full investigation as Knowledge draft' })).not.toBeInTheDocument();
   });
 
+  it('renders chat-only replies without investigation evidence panels', async () => {
+    const reply = 'I am here to help. What would you like to investigate?';
+    vi.spyOn(api, 'startInvestigation').mockResolvedValue(job({ result: {
+      ...result,
+      response_mode: 'conversation',
+      summary: reply,
+      findings: [],
+      sources: [],
+      playbook_evidence: [],
+      caveats: [],
+      token_usage: [],
+      evidence_status: 'not_required',
+    } }));
+    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    await screen.findByRole('combobox', { name: /AI model/ });
+    openDataViewPicker(); fireEvent.click(screen.getByLabelText(/Service 1/));
+    fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'fuck you' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
+    expect(await screen.findByText(reply)).toBeInTheDocument();
+    expect(screen.getByText('Response')).toBeInTheDocument();
+    expect(screen.queryByText('Evidence coverage')).not.toBeInTheDocument();
+    expect(screen.queryByText(/AI hypotheses, not verified causes/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Findings' })).not.toBeInTheDocument();
+  });
+
   it('explicitly saves completed findings as an unverified scoped knowledge draft', async () => {
     const completed = job();
     vi.spyOn(api, 'startInvestigation').mockResolvedValue(completed);

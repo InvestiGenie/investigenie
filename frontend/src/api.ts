@@ -138,6 +138,7 @@ export type InvestigationFinding = {
 };
 
 export type InvestigationResult = {
+  response_mode?: 'investigation' | 'conversation';
   summary: string;
   findings: InvestigationFinding[];
   playbook_evidence?: Array<{
@@ -173,7 +174,7 @@ export type InvestigationResult = {
     total_tokens: number | null;
   }>;
   complete?: boolean;
-  evidence_status?: 'sample_supported' | 'insufficient_evidence';
+  evidence_status?: 'sample_supported' | 'insufficient_evidence' | 'not_required';
   conclusions_verified?: boolean;
 };
 

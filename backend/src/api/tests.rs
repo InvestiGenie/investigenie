@@ -751,32 +751,37 @@ async fn investigative_continuation_rejects_legacy_conversations_without_scope()
 
 #[tokio::test]
 async fn ai_investigation_gathers_bounded_evidence_and_returns_cited_hypotheses() {
-    assert_bounded_ai_evidence(false, false, false, false, false).await;
+    assert_bounded_ai_evidence(false, false, false, false, false, false).await;
 }
 
 #[tokio::test]
 async fn ai_investigation_runs_one_validated_adaptive_followup() {
-    assert_bounded_ai_evidence(false, false, true, false, false).await;
+    assert_bounded_ai_evidence(false, false, true, false, false, false).await;
 }
 
 #[tokio::test]
 async fn ai_investigation_preserves_initial_findings_when_adaptive_query_fails() {
-    assert_bounded_ai_evidence(false, false, true, true, false).await;
+    assert_bounded_ai_evidence(false, false, true, true, false, false).await;
 }
 
 #[tokio::test]
 async fn ai_investigation_continues_saved_scope_with_prior_conversation_context() {
-    assert_bounded_ai_evidence(false, false, false, false, true).await;
+    assert_bounded_ai_evidence(false, false, false, false, true, false).await;
+}
+
+#[tokio::test]
+async fn ai_investigation_answers_social_messages_without_source_queries() {
+    assert_bounded_ai_evidence(false, false, false, false, false, true).await;
 }
 
 #[tokio::test]
 async fn ai_investigation_broadens_empty_filters_within_the_query_budget() {
-    assert_bounded_ai_evidence(true, false, false, false, false).await;
+    assert_bounded_ai_evidence(true, false, false, false, false, false).await;
 }
 
 #[tokio::test]
 async fn ai_investigation_does_not_treat_timed_out_searches_as_complete_evidence() {
-    assert_bounded_ai_evidence(false, true, false, false, false).await;
+    assert_bounded_ai_evidence(false, true, false, false, false, false).await;
 }
 
 async fn assert_bounded_ai_evidence(
@@ -785,8 +790,14 @@ async fn assert_bounded_ai_evidence(
     adaptive_followup: bool,
     adaptive_followup_failure: bool,
     continuation_turn: bool,
+    conversation_only: bool,
 ) {
     let (_directory, storage) = status_storage().await;
+    let question = if conversation_only {
+        "fuck you"
+    } else {
+        "Why are checkouts failing?"
+    };
     let source = MockServer::start().await;
     let provider = MockServer::start().await;
     let sample_hits = json!([
@@ -829,7 +840,7 @@ async fn assert_bounded_ai_evidence(
                 {"key":1791630300000i64,"doc_count":42}
             ]}}
         })))
-        .expect(2)
+        .expect(if conversation_only { 0 } else { 2 })
         .mount(&source)
         .await;
     Mock::given(matchers::method("POST"))
@@ -864,7 +875,7 @@ async fn assert_bounded_ai_evidence(
                 ]}
             }
         })))
-        .expect(1)
+        .expect(if conversation_only { 0 } else { 1 })
         .mount(&source)
         .await;
 
@@ -881,7 +892,11 @@ async fn assert_bounded_ai_evidence(
             "hits":{"total":{"value":102,"relation":"eq"},"hits":sample_hits},
             "aggregations":{"documents_over_time":{"buckets":[{"key":1791630000000i64,"doc_count":60},{"key":1791630300000i64,"doc_count":42}]}}
         })))
-        .expect(if empty_filters && !source_timed_out {1} else {0})
+        .expect(if empty_filters && !source_timed_out && !conversation_only {
+            1
+        } else {
+            0
+        })
         .mount(&source).await;
 
     Mock::given(matchers::method("POST"))
@@ -899,7 +914,11 @@ async fn assert_bounded_ai_evidence(
                 {"_index":"events","_id":"event-1","_source":{"@timestamp":"2026-10-10T11:00:00Z","service":"checkout","message":"inventory timeout"}}
             ]}
         })))
-        .expect(if source_timed_out {0} else {1})
+        .expect(if source_timed_out || conversation_only {
+            0
+        } else {
+            1
+        })
         .mount(&source).await;
 
     Mock::given(matchers::method("POST"))
@@ -922,11 +941,20 @@ async fn assert_bounded_ai_evidence(
                 ]}
             }))
         })
-        .expect(if adaptive_followup {1} else {0})
+        .expect(if adaptive_followup && !conversation_only {
+            1
+        } else {
+            0
+        })
         .mount(&source)
         .await;
 
-    let plan_content = json!({"views":[{"data_view_id":"checkout-view","filters":[{"field":"service","operator":"eq","value":"checkout"}],"sample_fields":["@timestamp","message","service"],"aggregation_field":"service"}]}).to_string();
+    let plan_content = if conversation_only {
+        json!({"mode":"conversation","reply":"I am here to help. What would you like to investigate?","views":[]}).to_string()
+    } else {
+        json!({"mode":"investigation","views":[{"data_view_id":"checkout-view","filters":[{"field":"service","operator":"eq","value":"checkout"}],"sample_fields":["@timestamp","message","service"],"aggregation_field":"service"}]}).to_string()
+    };
+    let expected_question = question.to_owned();
     Mock::given(matchers::method("POST"))
         .and(matchers::path("/v1/chat/completions"))
         .and(matchers::header(
@@ -941,13 +969,11 @@ async fn assert_bounded_ai_evidence(
             let system = body["messages"][0]["content"].as_str().unwrap();
             let input: Value =
                 serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
-            system.contains("Plan bounded evidence")
-                && input["playbook_evidence"][0]["step_name"] == "Checkout errors"
-                && input["playbook_evidence"][0]["current"]["time_range_start_ms"] == 1791630000000i64
-                && input["playbook_evidence"][0]["baseline"]["time_range_end_ms"] == 1791629999999i64
-                && input["playbook_evidence"][0]["current"]["aggregate_records"] == 102
-                && input["playbook_evidence"][0]["query"] == "service:\"checkout\""
-                && input["playbook_evidence"][0]["breakdown_field"] == "service"
+            system.contains("Route the latest user request")
+                && system.contains("social conversation")
+                && system.contains("Prioritize explicit entities, timestamps, fields")
+                && input["latest_user_request"] == expected_question
+                && input.get("playbook_evidence").is_none()
                 && input["available_views"][0]["fields"]
                     .as_array()
                     .unwrap()
@@ -996,11 +1022,21 @@ async fn assert_bounded_ai_evidence(
     }).to_string();
     Mock::given(matchers::method("POST"))
         .and(matchers::path("/v1/chat/completions"))
-        .and(matchers::body_string_contains("Form and update hypotheses"))
+        .and(matchers::body_string_contains("Answer the latest user request directly"))
         .and(move |request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let system = body["messages"][0]["content"].as_str().unwrap();
             let input: Value = serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
-            input["sources"][0]["records_examined"].as_u64().unwrap_or_default() >= 3
+            system.contains("clearly labeled read-only suggestion")
+                && input["latest_user_request"] == "Why are checkouts failing?"
+                && input["sources"][0]["integration"] == "elasticsearch"
+                && input["sources"][0]["planned_query"]
+                    == if empty_filters {
+                        ""
+                    } else {
+                        "service:\"checkout\""
+                    }
+                && input["sources"][0]["records_examined"].as_u64().unwrap_or_default() >= 3
                 && input["sources"][0]["aggregation_field"] == "service"
                 && input["sources"][0]["aggregations"].as_array().unwrap().len() == 2
         })
@@ -1008,7 +1044,7 @@ async fn assert_bounded_ai_evidence(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"choices":[{"message":{"content":findings_content}}],"usage":{"prompt_tokens":420,"completion_tokens":96,"total_tokens":516}})),
         )
-        .expect(if source_timed_out {
+        .expect(if conversation_only || source_timed_out {
             0
         } else if adaptive_followup && !adaptive_followup_failure {
             2
@@ -1101,7 +1137,7 @@ async fn assert_bounded_ai_evidence(
                 Method::POST,
                 "/api/ai/conversations/ongoing-checkout/investigations",
                 Some(json!({
-                    "message":"Why are checkouts failing?",
+                    "message":question,
                     "adaptive_followup":adaptive_followup
                 })),
                 Some(&conversation.revision),
@@ -1154,10 +1190,10 @@ async fn assert_bounded_ai_evidence(
             .await
             .unwrap();
         assert_eq!(persisted.messages.len(), 4);
-        assert_eq!(persisted.messages[2].content, "Why are checkouts failing?");
+        assert_eq!(persisted.messages[2].content, question);
         (StatusCode::OK, completed["result"].clone())
     } else {
-        let response = app.oneshot(json_request("/api/ai/investigate",json!({"question":"Why are checkouts failing?","data_view_ids":["checkout-view"],"ai_model_id":saved_model.id,"time_range":{"start":1791630000000i64,"end":1791633600000i64},"adaptive_followup":adaptive_followup}))).await.unwrap();
+        let response = app.oneshot(json_request("/api/ai/investigate",json!({"question":question,"data_view_ids":["checkout-view"],"ai_model_id":saved_model.id,"time_range":{"start":1791630000000i64,"end":1791633600000i64},"adaptive_followup":adaptive_followup}))).await.unwrap();
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 32 * 1024)
             .await
@@ -1170,6 +1206,23 @@ async fn assert_bounded_ai_evidence(
         return;
     }
     assert_eq!(status, StatusCode::OK, "{body}");
+    if conversation_only {
+        assert_eq!(body["response_mode"], "conversation");
+        assert_eq!(body["evidence_status"], "not_required");
+        assert_eq!(
+            body["summary"],
+            "I am here to help. What would you like to investigate?"
+        );
+        assert!(body["findings"].as_array().unwrap().is_empty());
+        assert!(body["sources"].as_array().unwrap().is_empty());
+        assert!(body["playbook_evidence"].as_array().unwrap().is_empty());
+        assert_eq!(provider.received_requests().await.unwrap().len(), 1);
+        let source_requests = source.received_requests().await.unwrap();
+        assert!(!source_requests
+            .iter()
+            .any(|request| request.url.path() == "/events/_search"));
+        return;
+    }
     assert_eq!(
         body["findings"][0]["evidence"][0]["record_ids"],
         json!(["event-1", "event-2"])
@@ -1316,7 +1369,7 @@ async fn assert_bounded_ai_evidence(
             request["messages"][0]["content"]
                 .as_str()
                 .unwrap()
-                .contains("Form and update hypotheses")
+                .contains("Answer the latest user request directly")
         })
         .map(|request| {
             serde_json::from_str::<Value>(request["messages"][1]["content"].as_str().unwrap())
