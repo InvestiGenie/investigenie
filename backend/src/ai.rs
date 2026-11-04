@@ -110,6 +110,85 @@ fn time_scope(time_range: Option<TimeRange>) -> Result<String, InvestigationErro
     }
 }
 
+fn is_explicit_source_request(question: &str) -> bool {
+    let normalized = question.to_ascii_lowercase();
+    if normalized.starts_with("how do i ") || normalized.starts_with("how can i ") {
+        return false;
+    }
+    contains_intent(
+        &normalized,
+        &[
+            "search",
+            "query",
+            "find",
+            "look up",
+            "look for",
+            "inspect",
+            "investigate",
+            "analyze",
+            "analyse",
+            "scan",
+            "check",
+            "retrieve",
+            "fetch",
+            "filter",
+            "generate a query",
+            "give me the query",
+        ],
+    )
+}
+
+fn requests_aggregates(question: &str) -> bool {
+    contains_intent(
+        &question.to_ascii_lowercase(),
+        &[
+            "aggregate",
+            "aggregation",
+            "histogram",
+            "trend",
+            "over time",
+            "distribution",
+            "breakdown",
+            "count",
+            "frequency",
+            "top",
+            "compare totals",
+            "rate",
+            "how many",
+            "number of",
+            "total",
+            "average",
+        ],
+    )
+}
+
+fn requests_all_records(question: &str) -> bool {
+    contains_intent(
+        &question.to_ascii_lowercase(),
+        &[
+            "all records",
+            "all data",
+            "all events",
+            "all logs",
+            "entire dataset",
+            "everything",
+        ],
+    )
+}
+
+fn contains_intent(question: &str, intents: &[&str]) -> bool {
+    let words = question
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    intents.iter().any(|intent| {
+        let intent_words = intent.split_whitespace().collect::<Vec<_>>();
+        words
+            .windows(intent_words.len())
+            .any(|window| window == intent_words)
+    })
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct InvestigationResponse {
     response_mode: &'static str,
@@ -562,6 +641,8 @@ pub async fn investigate_with_context(
     let time_range = request.time_range;
     let scope = time_scope(time_range)?;
     let question = request.question.trim();
+    let explicit_source_request = is_explicit_source_request(question);
+    let aggregate_request = requests_aggregates(question);
     if question.is_empty() || question.chars().count() > 8_000 {
         return Err(InvestigationError::invalid(
             "Question must contain 1 to 8000 non-whitespace characters",
@@ -634,7 +715,9 @@ pub async fn investigate_with_context(
         "latest_user_request":question,
         "prior_conversation_context":conversation_context,
         "time_scope":scope,
-        "available_views":field_catalog,
+        "available_views":field_catalog.clone(),
+        "explicit_source_request":explicit_source_request,
+        "aggregations_requested":aggregate_request,
     });
     control.report(|progress| progress.stage = "Understanding the request".to_owned());
     let plan_completion: ModelCompletion<RawPlan> = match control
@@ -647,15 +730,61 @@ pub async fn investigate_with_context(
         Step::Done(completion) => completion,
         Step::Stopped => return Err(InvestigationError::terminated()),
     };
-    let plan_usage = plan_completion.usage;
-    let plan = plan_completion.value;
+    let mut plan = plan_completion.value;
+    let mut plan_usage = Some(plan_completion.usage);
+    if explicit_source_request && plan.mode == RawPlanMode::Conversation {
+        let retry: ModelCompletion<RawPlan> = match control
+            .call(
+                || call_model(settings, "The latest user request explicitly asks to search, query, or inspect source data. The previous conversational classification was incorrect. Return only an investigation plan in JSON shaped as {\"views\":[{\"data_view_id\":string,\"filters\":[{\"field\":string,\"operator\":\"eq|contains|gt|gte|lt|lte\",\"value\":string|number|boolean}],\"sample_fields\":[string],\"aggregation_field\":string|null}]}. Use prior_conversation_context to resolve references and reuse any timestamp, field, or entity already supplied. Do not ask for details already present in context. Prioritize the requested record-level search; do not propose broad aggregations unless aggregations_requested is true. Use only supplied Data View IDs, fields, and operators. If no safe plan is possible, return an empty views array; do not invent fields or return native query text.", &plan_input),
+                || None,
+            )
+            .await?
+        {
+            Step::Done(completion) => completion,
+            Step::Stopped => return Err(InvestigationError::terminated()),
+        };
+        plan = retry.value;
+        merge_usage(&mut plan_usage, retry.usage);
+        if !plan.views.is_empty() {
+            plan.mode = RawPlanMode::Investigation;
+        }
+    }
+    let plan_usage = plan_usage.unwrap_or_default();
     let planning_usage = ProviderCallUsage {
         stage: "planning".to_owned(),
         prompt_tokens: plan_usage.prompt_tokens,
         completion_tokens: plan_usage.completion_tokens,
         total_tokens: plan_usage.total_tokens,
     };
-    if plan.mode == RawPlanMode::Conversation {
+    let clarification_response = || {
+        let fields = field_catalog
+            .iter()
+            .flat_map(|view| {
+                view["fields"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|field| field["name"].as_str())
+            })
+            .take(24)
+            .collect::<Vec<_>>();
+        InvestigationResponse {
+            response_mode: "conversation",
+            summary: format!(
+                "I couldn't map that request to safe filters, so I did not search broadly. Available fields include: {}. Which field or value should narrow the search?",
+                fields.join(", ")
+            ),
+            findings: Vec::new(),
+            sources: Vec::new(),
+            playbook_evidence: Vec::new(),
+            caveats: Vec::new(),
+            token_usage: vec![planning_usage.clone()],
+            complete: true,
+            evidence_status: "not_required",
+            conclusions_verified: false,
+        }
+    };
+    if plan.mode == RawPlanMode::Conversation && !explicit_source_request {
         let summary = plan.reply.trim();
         return Ok(InvestigationResponse {
             response_mode: "conversation",
@@ -674,18 +803,38 @@ pub async fn investigate_with_context(
             conclusions_verified: false,
         });
     }
-    let (playbook_evidence, mut playbook_notes) = collect_playbook_evidence(
-        storage,
-        &selected,
-        &view_fields,
-        time_range,
-        upstream_slots,
-        control,
-    )
-    .await?;
+    if explicit_source_request && plan.views.is_empty() {
+        return Ok(clarification_response());
+    }
+    let (playbook_evidence, mut playbook_notes) = if explicit_source_request && !aggregate_request {
+        (Vec::new(), Vec::new())
+    } else {
+        collect_playbook_evidence(
+            storage,
+            &selected,
+            &view_fields,
+            time_range,
+            upstream_slots,
+            control,
+        )
+        .await?
+    };
     control.report(|progress| progress.stage = "Planning source queries".to_owned());
-    let (planned_views, mut notes) = sanitize_plan(plan, &selected, &view_fields);
+    let (mut planned_views, mut notes) = sanitize_plan(plan, &selected, &view_fields);
     notes.append(&mut playbook_notes);
+    if explicit_source_request
+        && !requests_all_records(question)
+        && planned_views
+            .iter()
+            .all(|planned| planned.filters.is_empty())
+    {
+        return Ok(clarification_response());
+    }
+    if explicit_source_request && !aggregate_request {
+        for planned in &mut planned_views {
+            planned.aggregation_field = None;
+        }
+    }
     let mut dropped_references = 0usize;
     let mut sources = Vec::with_capacity(planned_views.len());
     for planned in planned_views {
@@ -767,7 +916,8 @@ pub async fn investigate_with_context(
                     query_index + 1
                 )
             });
-            let include_histogram = order == "desc";
+            let include_histogram =
+                order == "desc" && (!explicit_source_request || aggregate_request);
             let result = query_evidence(
                 &sources[source_index],
                 connection.connector.as_ref(),
@@ -795,6 +945,7 @@ pub async fn investigate_with_context(
             let sampled_query_summary = query_summary(
                 &sources[source_index].filters,
                 &scope,
+                include_histogram,
                 sources[source_index].aggregation_field.as_deref(),
             );
             sources[source_index]
@@ -1440,6 +1591,7 @@ async fn run_adaptive_follow_up(
     let follow_up_summary = query_summary(
         &query_source.filters,
         execution.scope,
+        false,
         query_source.aggregation_field.as_deref(),
     );
     let result = match query_evidence(
@@ -1556,6 +1708,7 @@ fn assemble_response(
             query_summary: query_summary(
                 &source.filters,
                 scope,
+                source.aggregate_total.is_some(),
                 source.aggregation_field.as_deref(),
             ),
             data_view_id: source.view.id.clone(),
@@ -2444,6 +2597,7 @@ fn compact_value(value: &Value, depth: usize) -> Value {
 fn query_summary(
     filters: &[PlannedFilter],
     scope: &str,
+    include_histogram: bool,
     aggregation_field: Option<&str>,
 ) -> String {
     let details = filters
@@ -2455,11 +2609,12 @@ fn query_summary(
     } else {
         details.join(", ")
     };
-    match aggregation_field {
-        Some(field) => format!(
+    match (include_histogram, aggregation_field) {
+        (true, Some(field)) => format!(
             "{scope}; {filter_summary}; bounded sample plus histogram and top values for {field}"
         ),
-        None => format!("{scope}; {filter_summary}; bounded sample plus time histogram"),
+        (true, None) => format!("{scope}; {filter_summary}; bounded sample plus time histogram"),
+        (false, _) => format!("{scope}; {filter_summary}; bounded sample"),
     }
 }
 
@@ -2784,6 +2939,31 @@ impl Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_source_requests_cannot_be_routed_as_chat() {
+        assert!(is_explicit_source_request(
+            "Search the data in the timestamp of the same request and tell me what the issues are"
+        ));
+        assert!(is_explicit_source_request(
+            "Check all samples at this timestamp and generate a query to find duplicate logins"
+        ));
+        assert!(!is_explicit_source_request("fuck you"));
+        assert!(!is_explicit_source_request("Why are checkouts failing?"));
+        assert!(!is_explicit_source_request(
+            "How do I search logs in Explore?"
+        ));
+        assert!(requests_all_records("Search all records in the login logs"));
+        assert!(!requests_all_records("Check all samples at this timestamp"));
+    }
+
+    #[test]
+    fn targeted_searches_only_request_aggregates_when_explicit() {
+        assert!(!requests_aggregates(
+            "Search duplicate logins at the request timestamp"
+        ));
+        assert!(requests_aggregates("Show login counts by user over time"));
+    }
 
     fn view(id: &str, name: &str) -> DataView {
         DataView {

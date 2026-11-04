@@ -775,6 +775,174 @@ async fn ai_investigation_answers_social_messages_without_source_queries() {
 }
 
 #[tokio::test]
+async fn explicit_timestamp_search_is_replanned_after_a_chat_misclassification() {
+    let (_directory, storage) = status_storage().await;
+    let source = MockServer::start().await;
+    let provider = MockServer::start().await;
+    let question = "Search all records at 2019-02-24 02:31:21 and identify duplicate logins";
+    let expected_query = "@timestamp:[1550975481000 TO *] AND @timestamp:[* TO 1550975481999]";
+
+    Mock::given(matchers::method("GET"))
+        .and(matchers::path("/events/_field_caps"))
+        .and(matchers::query_param("fields", "*"))
+        .and(matchers::query_param("include_unmapped", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "fields": {
+                "@timestamp": {"date": {"type":"date","metadata_field":false,"searchable":true,"aggregatable":true}},
+                "username": {"keyword": {"type":"keyword","metadata_field":false,"searchable":true,"aggregatable":true}},
+                "login": {"keyword": {"type":"keyword","metadata_field":false,"searchable":true,"aggregatable":true}}
+            }
+        })))
+        .expect(1)
+        .mount(&source)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/events/_search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "took": 2,
+            "timed_out": false,
+            "_shards": {"failed": 0},
+            "hits": {"total": {"value": 1, "relation": "eq"}, "hits": [
+                {"_index":"events","_id":"login-event-1","_source":{"@timestamp":"2019-02-24T02:31:21Z","username":"RohanChhetry","login":"0000Blaze"}}
+            ]}
+        })))
+        .expect(1)
+        .mount(&source)
+        .await;
+
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_string_contains("Route the latest user request"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "{\"mode\":\"conversation\",\"reply\":\"Which timestamp?\",\"views\":[]}"}}],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 8, "total_tokens": 38}
+        })))
+        .expect(1)
+        .mount(&provider)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_string_contains("previous conversational classification was incorrect"))
+        .and(move |request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let input: Value = serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+            input["latest_user_request"] == question && input["explicit_source_request"] == true
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "{\"views\":[{\"data_view_id\":\"login-view\",\"filters\":[{\"field\":\"@timestamp\",\"operator\":\"gte\",\"value\":1550975481000},{\"field\":\"@timestamp\",\"operator\":\"lte\",\"value\":1550975481999}],\"sample_fields\":[\"@timestamp\",\"username\",\"login\"],\"aggregation_field\":null}]}"}}],
+            "usage": {"prompt_tokens": 40, "completion_tokens": 20, "total_tokens": 60}
+        })))
+        .expect(1)
+        .mount(&provider)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_string_contains("Answer the latest user request directly"))
+        .and(move |request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let input: Value = serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+            input["latest_user_request"] == question
+                && input["sources"][0]["planned_query"] == expected_query
+                && input["sources"][0]["aggregations"].as_array().unwrap().is_empty()
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "{\"summary\":\"I found one login record at the requested timestamp. The sample does not establish a duplicate by itself.\",\"findings\":[{\"title\":\"Login record at requested timestamp\",\"detail\":\"The sampled record belongs to RohanChhetry and has login 0000Blaze. One record is not enough to confirm a duplicate.\",\"severity\":\"low\",\"confidence\":\"low\",\"evidence\":[{\"data_view_id\":\"login-view\",\"data_view_name\":\"Login events\",\"record_ids\":[\"login-event-1\"],\"count\":1}]}],\"caveats\":[]}"}}],
+            "usage": {"prompt_tokens": 60, "completion_tokens": 30, "total_tokens": 90}
+        })))
+        .expect(1)
+        .mount(&provider)
+        .await;
+
+    storage.create_connection(StoredConnection {
+        id: "login-source".to_owned(),
+        name: "Login source".to_owned(),
+        integration_id: "elasticsearch".to_owned(),
+        config: serde_json::from_value(json!({"url":source.uri(),"username":"user","password":"password","auth_type":"basic"})).unwrap(),
+        revision: String::new(),
+    }).await.unwrap();
+    let connection = storage.connection("login-source").await.unwrap();
+    storage
+        .save_view(
+            DataView {
+                id: "login-view".to_owned(),
+                name: "Login events".to_owned(),
+                connection_id: "login-source".to_owned(),
+                index: "events".to_owned(),
+                time_field: "@timestamp".to_owned(),
+                explore_mode: crate::storage::ExploreMode::Logs,
+                revision: String::new(),
+            },
+            &connection.record.revision,
+            None,
+        )
+        .await
+        .unwrap();
+    let model = storage
+        .create_ai_model(StoredAiModel {
+            id: String::new(),
+            revision: String::new(),
+            name: "Test model".to_owned(),
+            api_url: provider.uri() + "/v1",
+            api_key: "provider-secret".to_owned(),
+            model: "test-model".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    let response = router("http://localhost:5173".parse().unwrap(), storage)
+        .oneshot(json_request(
+            "/api/ai/investigate",
+            json!({
+                "question": question,
+                "data_view_ids": ["login-view"],
+                "ai_model_id": model.id,
+                "time_range": null
+            }),
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 32 * 1024)
+        .await
+        .unwrap();
+    let result: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let search_request = source
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|request| request.url.path() == "/events/_search")
+        .expect("targeted evidence search");
+    let search_body: Value = serde_json::from_slice(&search_request.body).unwrap();
+    assert_eq!(
+        search_body["query"]["query_string"]["query"], expected_query,
+        "{search_body}"
+    );
+    assert!(search_body.get("aggs").is_none());
+    assert_eq!(result["response_mode"], "investigation");
+    assert!(result["summary"]
+        .as_str()
+        .unwrap()
+        .contains("requested timestamp"));
+    assert_eq!(
+        result["sources"][0]["evidence_queries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(result["playbook_evidence"].as_array().unwrap().is_empty());
+    assert_eq!(result["sources"][0]["aggregate_records"], Value::Null);
+    let query_summary = result["sources"][0]["evidence_queries"][0]["query_summary"]
+        .as_str()
+        .unwrap();
+    assert!(query_summary.contains("@timestamp Gte"));
+    assert!(query_summary.contains("@timestamp Lte"));
+    assert!(!query_summary.contains("histogram"));
+}
+
+#[tokio::test]
 async fn ai_investigation_broadens_empty_filters_within_the_query_budget() {
     assert_bounded_ai_evidence(true, false, false, false, false, false).await;
 }
