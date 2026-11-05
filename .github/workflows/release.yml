@@ -87,7 +87,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             binary_name: investigenie-api
             ext: ""
-          - os: macos-14
+          - os: macos-15
             platform: darwin
             arch: arm64
             target: aarch64-apple-darwin
