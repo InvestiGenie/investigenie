@@ -177,6 +177,10 @@ pub(crate) fn requests_duplicate_groups(question: &str) -> bool {
             "group by",
             "grouped by",
             "group count",
+            "grouped count",
+            "grouped counts",
+            "count of",
+            "counts of",
         ],
     )
 }
@@ -3205,6 +3209,16 @@ mod tests {
         assert!(!requests_all_records("Check all samples at this timestamp"));
         assert!(requests_duplicate_groups(
             "Find all duplicated logins and give me the SQL query"
+        ));
+    }
+
+    #[test]
+    fn grouped_query_followups_recognize_count_threshold_wording() {
+        assert!(requests_duplicate_groups(
+            "Are there any login values with counts of 3 or more?"
+        ));
+        assert!(requests_duplicate_groups(
+            "Use an exact grouped-count query on actors and group by login"
         ));
     }
 

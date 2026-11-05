@@ -1207,6 +1207,203 @@ async fn scoped_duplicate_query_clarification_executes_all_time_sql_and_returns_
 }
 
 #[tokio::test]
+async fn scoped_grouped_query_count_followup_uses_typed_all_time_query() {
+    let (_directory, storage) = status_storage().await;
+    let source = MockServer::start().await;
+    let provider = MockServer::start().await;
+    let question =
+        "Are there any login values with counts of 3 or more? Use the same All time scope and give the exact counts.";
+    let expected_sql = "SELECT `login`, count() AS `_ig_duplicate_count` FROM `actors` GROUP BY `login` HAVING count() >= 3 ORDER BY `_ig_duplicate_count` DESC LIMIT 50";
+
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/"))
+        .and(matchers::body_string(
+            "DESCRIBE TABLE `analytics`.`actors` FORMAT JSON",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [{"name":"name","type":"String"},{"name":"type","type":"String"}],
+            "data": [
+                {"name":"created_at","type":"DateTime64(3)"},
+                {"name":"login","type":"String"}
+            ],
+            "rows":2
+        })))
+        .expect(2)
+        .mount(&source)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/"))
+        .and(move |request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body);
+            body.contains(expected_sql) && !body.contains("created_at")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [
+                {"name":"login","type":"String"},
+                {"name":"_ig_duplicate_count","type":"UInt64"}
+            ],
+            "data": [],
+            "rows":0
+        })))
+        .expect(1)
+        .mount(&source)
+        .await;
+
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_string_contains("Route it as mode data_query"))
+        .and(move |request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let input: Value =
+                serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+            input["latest_user_request"] == question
+                && input["duplicate_query_requested"] == true
+                && input["all_records_requested"] == true
+                && input["prior_conversation_context"]
+                    .as_str()
+                    .is_some_and(|context| context.contains("Prior grouped data-query output"))
+                && input["available_views"][0]["supports_group_count"] == true
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "{\"mode\":\"data_query\",\"data_query\":{\"data_view_id\":\"actors-view\",\"group_by\":[\"login\"],\"filters\":[],\"minimum_count\":3,\"limit\":50}}"}}],
+            "usage": {"prompt_tokens": 60, "completion_tokens": 35, "total_tokens": 95}
+        })))
+        .expect(1)
+        .mount(&provider)
+        .await;
+
+    storage
+        .create_connection(StoredConnection {
+            id: "actors-source".to_owned(),
+            name: "Actors source".to_owned(),
+            integration_id: "clickhouse".to_owned(),
+            config: serde_json::from_value(json!({"url":source.uri(),"database":"analytics"}))
+                .unwrap(),
+            revision: String::new(),
+        })
+        .await
+        .unwrap();
+    let connection = storage.connection("actors-source").await.unwrap();
+    storage
+        .save_view(
+            DataView {
+                id: "actors-view".to_owned(),
+                name: "Actors".to_owned(),
+                connection_id: "actors-source".to_owned(),
+                index: "actors".to_owned(),
+                time_field: "created_at".to_owned(),
+                explore_mode: crate::storage::ExploreMode::Logs,
+                revision: String::new(),
+            },
+            &connection.record.revision,
+            None,
+        )
+        .await
+        .unwrap();
+    let model = storage
+        .create_ai_model(StoredAiModel {
+            id: String::new(),
+            revision: String::new(),
+            name: "Test model".to_owned(),
+            api_url: provider.uri() + "/v1",
+            api_key: "provider-secret".to_owned(),
+            model: "test-model".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    let mut conversation = StoredAiConversation::new(
+        "grouped-followup".to_owned(),
+        model.id,
+        vec!["actors-view".to_owned()],
+        "Find duplicate logins across all time".to_owned(),
+    );
+    conversation.investigation_scope = Some(StoredAiInvestigationScope { time_range: None });
+    let conversation = storage.create_ai_conversation(conversation).await.unwrap();
+    let conversation = storage
+        .append_ai_conversation_messages(
+            &conversation.id,
+            &conversation.revision,
+            vec![StoredAiConversationMessage {
+                role: "assistant".to_owned(),
+                content: "Found 16 duplicate groups.".to_owned(),
+                result: Some(json!({
+                    "response_mode":"data_query",
+                    "summary":"Found 16 duplicate groups.",
+                    "query_result": {
+                        "data_view_id":"actors-view",
+                        "data_view_name":"Actors",
+                        "group_by":["login"],
+                        "query_language":"SQL",
+                        "query":"SELECT `login`, count() FROM `actors` GROUP BY `login` HAVING count() >= 2",
+                        "columns":["login", "_ig_duplicate_count"],
+                        "rows":[{"login":"Yukang-Lian", "_ig_duplicate_count":2}],
+                        "row_count":16,
+                        "truncated":false
+                    }
+                })),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let app = router("http://localhost:5173".parse().unwrap(), storage);
+    let response = app
+        .clone()
+        .oneshot(model_request(
+            Method::POST,
+            "/api/ai/conversations/grouped-followup/investigations",
+            Some(json!({"message":question})),
+            Some(&conversation.revision),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let bytes = axum::body::to_bytes(response.into_body(), 32 * 1024)
+        .await
+        .unwrap();
+    let started: Value = serde_json::from_slice(&bytes).unwrap();
+    let job_id = started["investigation"]["id"].as_str().unwrap();
+    let mut outcome = None;
+    for _ in 0..100 {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/ai/investigations/{job_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 32 * 1024)
+            .await
+            .unwrap();
+        let snapshot: Value = serde_json::from_slice(&bytes).unwrap();
+        if ["completed", "failed", "terminated"]
+            .contains(&snapshot["investigation"]["status"].as_str().unwrap_or(""))
+        {
+            outcome = Some(snapshot["investigation"].clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let outcome = outcome.expect("grouped-count follow-up should finish");
+    assert_eq!(
+        outcome["status"], "completed",
+        "grouped-count follow-up outcome: {outcome}"
+    );
+    let result = outcome["result"].clone();
+    assert_eq!(result["response_mode"], "data_query");
+    assert_eq!(result["query_result"]["query"], expected_sql);
+    assert_eq!(result["query_result"]["row_count"], 0);
+    assert_eq!(result["query_result"]["truncated"], false);
+    assert!(result["findings"].as_array().unwrap().is_empty());
+    assert!(result["sources"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn unsupported_grouped_query_does_not_fall_back_to_sample_evidence() {
     let (_directory, storage) = status_storage().await;
     let source = MockServer::start().await;
