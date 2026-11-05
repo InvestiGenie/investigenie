@@ -1,7 +1,7 @@
 {
   "name": "investigenie-web",
   "private": true,
-  "version": "0.6.5-rc",
+  "version": "0.6.5",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
