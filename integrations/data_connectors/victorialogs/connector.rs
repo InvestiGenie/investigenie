@@ -275,44 +275,6 @@ fn invalid_investigation_filter() -> ConnectorError {
     }
 }
 
-#[cfg(test)]
-mod investigation_tests {
-    use super::*;
-
-    #[test]
-    fn investigation_filters_use_exact_logs_lql_syntax_and_escape_strings() {
-        let exact = InvestigationFilter {
-            field: "login".to_owned(),
-            field_type: "keyword".to_owned(),
-            operator: InvestigationFilterOperator::Eq,
-            value: json!("user\"name"),
-        };
-        assert_eq!(victorialogs_filter(&exact).unwrap(), "login:=\"user\\\"name\"");
-        let contains = InvestigationFilter {
-            field_type: "text".to_owned(),
-            operator: InvestigationFilterOperator::Contains,
-            value: json!("two words"),
-            ..exact
-        };
-        assert_eq!(victorialogs_filter(&contains).unwrap(), "login:\"two words\"");
-    }
-
-    #[test]
-    fn grouped_query_uses_bounded_logs_aggregate_pipeline() {
-        let query = victorialogs_group_count_query(
-            "status:=500",
-            &["login".to_owned()],
-            2,
-            50,
-        )
-        .unwrap();
-        assert_eq!(
-            query,
-            "status:=500 | stats by (login) count() as _ig_duplicate_count | filter _ig_duplicate_count:>=2 | sort by (_ig_duplicate_count desc) | limit 50"
-        );
-    }
-}
-
 impl From<VictoriaLogsError> for ConnectorError {
     fn from(error: VictoriaLogsError) -> Self {
         let (status, code, message) = match error {
@@ -357,5 +319,38 @@ impl From<VictoriaLogsError> for ConnectorError {
             code,
             message: message.to_owned(),
         }
+    }
+}
+
+#[cfg(test)]
+mod investigation_tests {
+    use super::*;
+
+    #[test]
+    fn investigation_filters_use_exact_logs_lql_syntax_and_escape_strings() {
+        let exact = InvestigationFilter {
+            field: "login".to_owned(),
+            field_type: "keyword".to_owned(),
+            operator: InvestigationFilterOperator::Eq,
+            value: json!("user\"name"),
+        };
+        assert_eq!(victorialogs_filter(&exact).unwrap(), "login:=\"user\\\"name\"");
+        let contains = InvestigationFilter {
+            field_type: "text".to_owned(),
+            operator: InvestigationFilterOperator::Contains,
+            value: json!("two words"),
+            ..exact
+        };
+        assert_eq!(victorialogs_filter(&contains).unwrap(), "login:\"two words\"");
+    }
+
+    #[test]
+    fn grouped_query_uses_bounded_logs_aggregate_pipeline() {
+        let query =
+            victorialogs_group_count_query("status:=500", &["login".to_owned()], 2, 50).unwrap();
+        assert_eq!(
+            query,
+            "status:=500 | stats by (login) count() as _ig_duplicate_count | filter _ig_duplicate_count:>=2 | sort by (_ig_duplicate_count desc) | limit 50"
+        );
     }
 }

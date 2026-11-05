@@ -156,48 +156,6 @@ fn invalid_investigation_filter() -> ConnectorError {
     }
 }
 
-#[cfg(test)]
-mod investigation_tests {
-    use super::*;
-
-    #[test]
-    fn investigation_query_uses_only_validated_logql_filter_shapes() {
-        let config = serde_json::from_value(json!({"url":"http://localhost:3100"})).unwrap();
-        let connector = connect(&config).unwrap();
-        let query = connector
-            .build_investigation_query(
-                "logs",
-                &[
-                    InvestigationFilter {
-                        field: "app".to_owned(),
-                        field_type: "label".to_owned(),
-                        operator: InvestigationFilterOperator::Eq,
-                        value: json!("api"),
-                    },
-                    InvestigationFilter {
-                        field: "_msg".to_owned(),
-                        field_type: "text".to_owned(),
-                        operator: InvestigationFilterOperator::Contains,
-                        value: json!("database \"timeout\""),
-                    },
-                ],
-            )
-            .unwrap();
-        assert_eq!(query, "{app=\"api\"} |= \"database \\\"timeout\\\"\"");
-        assert!(connector
-            .build_investigation_query(
-                "logs",
-                &[InvestigationFilter {
-                    field: "app".to_owned(),
-                    field_type: "label".to_owned(),
-                    operator: InvestigationFilterOperator::Gt,
-                    value: json!(1),
-                }]
-            )
-            .is_err());
-    }
-}
-
 impl From<LokiError> for ConnectorError {
     fn from(error: LokiError) -> Self {
         let (status, code, message) = match error {
@@ -248,5 +206,47 @@ impl From<LokiError> for ConnectorError {
             code,
             message: message.to_owned(),
         }
+    }
+}
+
+#[cfg(test)]
+mod investigation_tests {
+    use super::*;
+
+    #[test]
+    fn investigation_query_uses_only_validated_logql_filter_shapes() {
+        let config = serde_json::from_value(json!({"url":"http://localhost:3100"})).unwrap();
+        let connector = connect(&config).unwrap();
+        let query = connector
+            .build_investigation_query(
+                "logs",
+                &[
+                    InvestigationFilter {
+                        field: "app".to_owned(),
+                        field_type: "label".to_owned(),
+                        operator: InvestigationFilterOperator::Eq,
+                        value: json!("api"),
+                    },
+                    InvestigationFilter {
+                        field: "_msg".to_owned(),
+                        field_type: "text".to_owned(),
+                        operator: InvestigationFilterOperator::Contains,
+                        value: json!("database \"timeout\""),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(query, "{app=\"api\"} |= \"database \\\"timeout\\\"\"");
+        assert!(connector
+            .build_investigation_query(
+                "logs",
+                &[InvestigationFilter {
+                    field: "app".to_owned(),
+                    field_type: "label".to_owned(),
+                    operator: InvestigationFilterOperator::Gt,
+                    value: json!(1),
+                }]
+            )
+            .is_err());
     }
 }

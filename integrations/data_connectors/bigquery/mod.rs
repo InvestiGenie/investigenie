@@ -1242,31 +1242,31 @@ impl Connector for BigQueryClient {
         request: InvestigationGroupCountRequest,
     ) -> ConnectorFuture<'_, InvestigationGroupCountResult> {
         Box::pin(async move {
-            let result: Result<InvestigationGroupCountResult, BigQueryError> = async move {
+            let result: Result<InvestigationGroupCountResult, BigQueryError> = async {
                 self.table_name(&request.index)?;
-            if request.group_by.is_empty()
-                || request.group_by.len() > 3
-                || !(2..=1_000_000_000).contains(&request.minimum_count)
-                || !(1..=100).contains(&request.limit)
-            {
-                return Err(BigQueryError::InvalidQuery.into());
-            }
-            let fields = <Self as Connector>::fields(self, &request.index)
-                .await
-                .map_err(|_| BigQueryError::InvalidQuery)?;
-            let field_types = fields
-                .iter()
-                .map(|field| (field.name.as_str(), field.field_type.as_str()))
-                .collect::<std::collections::BTreeMap<_, _>>();
-            for field in &request.group_by {
-                let Some(field_type) = field_types.get(field.as_str()) else {
-                    return Err(BigQueryError::InvalidQuery.into());
-                };
-                if !self.investigation_supports_aggregation_field(field_type) {
-                    return Err(BigQueryError::InvalidQuery.into());
+                if request.group_by.is_empty()
+                    || request.group_by.len() > 3
+                    || !(2..=1_000_000_000).contains(&request.minimum_count)
+                    || !(1..=100).contains(&request.limit)
+                {
+                    return Err(BigQueryError::InvalidQuery);
                 }
-            }
-            for filter in &request.filters {
+                let fields = <Self as Connector>::fields(self, &request.index)
+                    .await
+                    .map_err(|_| BigQueryError::InvalidQuery)?;
+                let field_types = fields
+                    .iter()
+                    .map(|field| (field.name.as_str(), field.field_type.as_str()))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                for field in &request.group_by {
+                    let Some(field_type) = field_types.get(field.as_str()) else {
+                        return Err(BigQueryError::InvalidQuery);
+                    };
+                    if !self.investigation_supports_aggregation_field(field_type) {
+                        return Err(BigQueryError::InvalidQuery);
+                    }
+                }
+                for filter in &request.filters {
                     let Some(field_type) = field_types.get(filter.field.as_str()) else {
                         return Err(BigQueryError::InvalidQuery);
                     };
@@ -1277,61 +1277,64 @@ impl Connector for BigQueryClient {
                     {
                         return Err(BigQueryError::InvalidQuery);
                     }
-            }
-            if request.time_range.is_some_and(|range| {
-                !range.is_valid()
-                    || !fields.iter().any(|field| {
-                        field.name == request.time_field && is_time_type(&field.field_type)
-                    })
-            }) {
-                return Err(BigQueryError::InvalidQuery.into());
-            }
-            let query = bigquery_group_count_query(
-                &request.index,
-                &request.time_field,
-                &request.filters,
-                &request.group_by,
-                request.minimum_count,
-                request.limit,
-                request.time_range,
-            )?;
-            let response = <Self as Connector>::search(
-                self,
-                SearchRequest {
-                    index: request.index,
-                    query: query.clone(),
-                    size: request.limit,
-                    include_histogram: Some(false),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|_| BigQueryError::InvalidQuery)?;
-            let columns = response
-                .get("columns")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect();
-            let hits = response
-                .get("hits")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let rows = hits
-                .iter()
-                .filter_map(|hit| hit.get("source").cloned())
-                .collect::<Vec<_>>();
-            let truncated = response.get("total_relation").and_then(Value::as_str) == Some("gte")
-                || rows.len() >= request.limit;
+                }
+                if request.time_range.is_some_and(|range| {
+                    !range.is_valid()
+                        || !fields.iter().any(|field| {
+                            field.name == request.time_field && is_time_type(&field.field_type)
+                        })
+                }) {
+                    return Err(BigQueryError::InvalidQuery);
+                }
+                let query = bigquery_group_count_query(
+                    &request.index,
+                    &request.time_field,
+                    &request.filters,
+                    &request.group_by,
+                    request.minimum_count,
+                    request.limit,
+                    request.time_range,
+                )?;
+                let response = <Self as Connector>::search(
+                    self,
+                    SearchRequest {
+                        index: request.index,
+                        query: query.clone(),
+                        size: request.limit,
+                        include_histogram: Some(false),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|_| BigQueryError::InvalidQuery)?;
+                let columns = response
+                    .get("columns")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                let hits = response
+                    .get("hits")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let rows = hits
+                    .iter()
+                    .filter_map(|hit| hit.get("source").cloned())
+                    .collect::<Vec<_>>();
+                let truncated = response
+                    .get("total_relation")
+                    .and_then(Value::as_str)
+                    == Some("gte")
+                    || rows.len() >= request.limit;
                 Ok(InvestigationGroupCountResult {
-                query_language: "Standard SQL".to_owned(),
-                query,
-                columns,
-                rows,
-                truncated,
+                    query_language: "Standard SQL".to_owned(),
+                    query,
+                    columns,
+                    rows,
+                    truncated,
                 })
             }
             .await;

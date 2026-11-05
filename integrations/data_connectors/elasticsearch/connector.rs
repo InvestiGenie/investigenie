@@ -195,12 +195,12 @@ impl Connector for ElasticsearchClient {
                     return Err(ElasticsearchError::InvalidIndex.into());
                 }
             }
-            if request.time_range.is_some() {
-                if !fields.iter().any(|field| {
+            if request.time_range.is_some()
+                && !fields.iter().any(|field| {
                     field.name == request.time_field && field.is_time_field
-                }) {
-                    return Err(ElasticsearchError::InvalidIndex.into());
-                }
+                })
+            {
+                return Err(ElasticsearchError::InvalidIndex.into());
             }
             let mut filters = request
                 .filters

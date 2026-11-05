@@ -144,39 +144,6 @@ fn invalid_investigation_filter() -> ConnectorError {
     }
 }
 
-#[cfg(test)]
-mod investigation_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn investigation_filters_compile_to_escaped_metricsql_label_matchers() {
-        let query = label_selector(&[
-            InvestigationFilter {
-                field: "job".to_owned(),
-                field_type: "label".to_owned(),
-                operator: InvestigationFilterOperator::Eq,
-                value: json!("api"),
-            },
-            InvestigationFilter {
-                field: "instance".to_owned(),
-                field_type: "label".to_owned(),
-                operator: InvestigationFilterOperator::Contains,
-                value: json!("api.1"),
-            },
-        ])
-        .unwrap();
-        assert_eq!(query, "{job=\"api\",instance=~\".*api\\\\.1.*\"}");
-        assert!(label_selector(&[InvestigationFilter {
-            field: "instance".to_owned(),
-            field_type: "label".to_owned(),
-            operator: InvestigationFilterOperator::Lt,
-            value: json!("api"),
-        }])
-        .is_err());
-    }
-}
-
 impl From<VictoriaMetricsError> for ConnectorError {
     fn from(error: VictoriaMetricsError) -> Self {
         let (status, code, message) = match error {
@@ -251,5 +218,38 @@ impl From<VictoriaMetricsError> for ConnectorError {
             code,
             message: message.to_owned(),
         }
+    }
+}
+
+#[cfg(test)]
+mod investigation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn investigation_filters_compile_to_escaped_metricsql_label_matchers() {
+        let query = label_selector(&[
+            InvestigationFilter {
+                field: "job".to_owned(),
+                field_type: "label".to_owned(),
+                operator: InvestigationFilterOperator::Eq,
+                value: json!("api"),
+            },
+            InvestigationFilter {
+                field: "instance".to_owned(),
+                field_type: "label".to_owned(),
+                operator: InvestigationFilterOperator::Contains,
+                value: json!("api.1"),
+            },
+        ])
+        .unwrap();
+        assert_eq!(query, "{job=\"api\",instance=~\".*api\\\\.1.*\"}");
+        assert!(label_selector(&[InvestigationFilter {
+            field: "instance".to_owned(),
+            field_type: "label".to_owned(),
+            operator: InvestigationFilterOperator::Lt,
+            value: json!("api"),
+        }])
+        .is_err());
     }
 }

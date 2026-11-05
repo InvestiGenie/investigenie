@@ -142,39 +142,6 @@ fn invalid_investigation_filter() -> ConnectorError {
     }
 }
 
-#[cfg(test)]
-mod investigation_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn investigation_filters_compile_to_escaped_promql_label_matchers() {
-        let query = label_selector(&[
-            InvestigationFilter {
-                field: "job".to_owned(),
-                field_type: "label".to_owned(),
-                operator: InvestigationFilterOperator::Eq,
-                value: json!("api"),
-            },
-            InvestigationFilter {
-                field: "instance".to_owned(),
-                field_type: "label".to_owned(),
-                operator: InvestigationFilterOperator::Contains,
-                value: json!("api.1"),
-            },
-        ])
-        .unwrap();
-        assert_eq!(query, "{job=\"api\",instance=~\".*api\\\\.1.*\"}");
-        assert!(label_selector(&[InvestigationFilter {
-            field: "__name__".to_owned(),
-            field_type: "label".to_owned(),
-            operator: InvestigationFilterOperator::Gt,
-            value: json!(1),
-        }])
-        .is_err());
-    }
-}
-
 impl From<PrometheusError> for ConnectorError {
     fn from(error: PrometheusError) -> Self {
         let (status, code, message) = match error {
@@ -259,5 +226,38 @@ fn rejected_message(status: u16, error_type: &str) -> (StatusCode, &'static str)
             "Prometheus is rate limiting requests; retry shortly",
         ),
         _ => (StatusCode::BAD_GATEWAY, "Prometheus rejected the request"),
+    }
+}
+
+#[cfg(test)]
+mod investigation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn investigation_filters_compile_to_escaped_promql_label_matchers() {
+        let query = label_selector(&[
+            InvestigationFilter {
+                field: "job".to_owned(),
+                field_type: "label".to_owned(),
+                operator: InvestigationFilterOperator::Eq,
+                value: json!("api"),
+            },
+            InvestigationFilter {
+                field: "instance".to_owned(),
+                field_type: "label".to_owned(),
+                operator: InvestigationFilterOperator::Contains,
+                value: json!("api.1"),
+            },
+        ])
+        .unwrap();
+        assert_eq!(query, "{job=\"api\",instance=~\".*api\\\\.1.*\"}");
+        assert!(label_selector(&[InvestigationFilter {
+            field: "__name__".to_owned(),
+            field_type: "label".to_owned(),
+            operator: InvestigationFilterOperator::Gt,
+            value: json!(1),
+        }])
+        .is_err());
     }
 }
