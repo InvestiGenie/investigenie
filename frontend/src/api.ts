@@ -144,7 +144,8 @@ export type InvestigationResult = {
     data_view_id: string;
     data_view_name: string;
     group_by: string[];
-    sql: string;
+    query_language: string;
+    query: string;
     columns: string[];
     rows: Array<Record<string, unknown>>;
     row_count: number;

@@ -45,6 +45,69 @@ pub struct MetricQueryResult {
     pub truncated: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvestigationFilterOperator {
+    Eq,
+    Contains,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+}
+
+impl InvestigationFilterOperator {
+    pub fn from_label(label: &str) -> Option<Self> {
+        Some(match label.trim().to_ascii_lowercase().as_str() {
+            "eq" | "=" | "==" | "equals" | "equal" | "is" | "term" | "match" => Self::Eq,
+            "contains" | "like" | "includes" | "substring" => Self::Contains,
+            "gt" | ">" | "greater_than" | "after" => Self::Gt,
+            "gte" | ">=" | "greater_than_or_equal" | "at_least" => Self::Gte,
+            "lt" | "<" | "less_than" | "before" => Self::Lt,
+            "lte" | "<=" | "less_than_or_equal" | "at_most" => Self::Lte,
+            _ => return None,
+        })
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Eq => "eq",
+            Self::Contains => "contains",
+            Self::Gt => "gt",
+            Self::Gte => "gte",
+            Self::Lt => "lt",
+            Self::Lte => "lte",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InvestigationFilter {
+    pub field: String,
+    pub field_type: String,
+    pub operator: InvestigationFilterOperator,
+    pub value: Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct InvestigationGroupCountRequest {
+    pub index: String,
+    pub time_field: String,
+    pub filters: Vec<InvestigationFilter>,
+    pub group_by: Vec<String>,
+    pub minimum_count: u64,
+    pub limit: usize,
+    pub time_range: Option<TimeRange>,
+}
+
+#[derive(Clone, Debug)]
+pub struct InvestigationGroupCountResult {
+    pub query_language: String,
+    pub query: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Value>,
+    pub truncated: bool,
+}
+
 pub fn metric_result_from_matrix(
     request: &MetricQueryRequest,
     matrix: &[Value],
@@ -103,6 +166,31 @@ pub trait Connector: Send + Sync {
     fn indices(&self) -> ConnectorFuture<'_, Vec<IndexSummary>>;
     fn fields<'a>(&'a self, index: &'a str) -> ConnectorFuture<'a, Vec<FieldSummary>>;
     fn search(&self, request: crate::search::SearchRequest) -> ConnectorFuture<'_, Value>;
+    fn investigation_filter_operators(
+        &self,
+        _field_type: &str,
+    ) -> Vec<InvestigationFilterOperator> {
+        Vec::new()
+    }
+    fn investigation_supports_aggregation_field(&self, _field_type: &str) -> bool {
+        false
+    }
+    fn investigation_supports_group_count(&self) -> bool {
+        false
+    }
+    fn investigation_group_count(
+        &self,
+        _request: InvestigationGroupCountRequest,
+    ) -> ConnectorFuture<'_, InvestigationGroupCountResult> {
+        Box::pin(async { Err(ConnectorError::unsupported_investigation_query()) })
+    }
+    fn build_investigation_query(
+        &self,
+        _index: &str,
+        _filters: &[InvestigationFilter],
+    ) -> Result<String, ConnectorError> {
+        Err(ConnectorError::unsupported_investigation_query())
+    }
     fn metric_names<'a>(&'a self, _index: &'a str) -> ConnectorFuture<'a, MetricNames> {
         Box::pin(async { Err(ConnectorError::unsupported_metrics()) })
     }
@@ -133,6 +221,15 @@ impl ConnectorError {
             status: StatusCode::BAD_REQUEST,
             code: "metrics_query_unsupported",
             message: "This data source does not support metric exploration".to_owned(),
+        }
+    }
+
+    pub fn unsupported_investigation_query() -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "investigation_query_unsupported",
+            message: "This data source does not support the requested investigation query"
+                .to_owned(),
         }
     }
 }
@@ -237,6 +334,38 @@ impl Connector for LoggedConnector {
             );
             value.get("hits").and_then(Value::as_array).map(Vec::len)
         })
+    }
+
+    fn investigation_filter_operators(&self, field_type: &str) -> Vec<InvestigationFilterOperator> {
+        self.inner.investigation_filter_operators(field_type)
+    }
+
+    fn investigation_supports_aggregation_field(&self, field_type: &str) -> bool {
+        self.inner
+            .investigation_supports_aggregation_field(field_type)
+    }
+
+    fn build_investigation_query(
+        &self,
+        index: &str,
+        filters: &[InvestigationFilter],
+    ) -> Result<String, ConnectorError> {
+        self.inner.build_investigation_query(index, filters)
+    }
+
+    fn investigation_supports_group_count(&self) -> bool {
+        self.inner.investigation_supports_group_count()
+    }
+
+    fn investigation_group_count(
+        &self,
+        request: InvestigationGroupCountRequest,
+    ) -> ConnectorFuture<'_, InvestigationGroupCountResult> {
+        self.observe(
+            "investigation_group_count",
+            self.inner.investigation_group_count(request),
+            |result| Some(result.rows.len()),
+        )
     }
 
     fn metric_names<'a>(&'a self, index: &'a str) -> ConnectorFuture<'a, MetricNames> {

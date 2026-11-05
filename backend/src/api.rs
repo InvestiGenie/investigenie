@@ -349,7 +349,7 @@ fn spawn_investigation_task(
     permit: OwnedSemaphorePermit,
     job: Arc<ai::InvestigationJob>,
     conversation_revision: String,
-    conversation_context: Option<String>,
+    conversation_context: Option<ai::InvestigationConversationContext>,
 ) {
     let task_job = job.clone();
     let conversation_storage = state.storage.clone();
@@ -462,7 +462,9 @@ async fn ai_conversation(
     })))
 }
 
-fn investigation_conversation_context(messages: &[StoredAiConversationMessage]) -> Option<String> {
+fn investigation_conversation_context(
+    messages: &[StoredAiConversationMessage],
+) -> Option<ai::InvestigationConversationContext> {
     const MAX_CONTEXT_BYTES: usize = 12_000;
     const MAX_CONTEXT_MESSAGES: usize = 12;
     let mut reversed_sections = Vec::new();
@@ -520,7 +522,35 @@ fn investigation_conversation_context(messages: &[StoredAiConversationMessage]) 
     }
     reversed_sections.reverse();
     let context = reversed_sections.join("\n\n");
-    (!context.trim().is_empty()).then_some(context)
+    if context.trim().is_empty() {
+        return None;
+    }
+    let clarification_pending = messages.last().is_some_and(|message| {
+        message.role == "assistant"
+            && message.result.as_ref().is_some_and(|result| {
+                result.get("response_mode").and_then(Value::as_str) == Some("conversation")
+                    && result
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| {
+                            summary.starts_with("I couldn't map that request to safe filters,")
+                        })
+            })
+    });
+    let previous_user = messages
+        .iter()
+        .rev()
+        .skip(1)
+        .find(|message| message.role == "user");
+    let pending_duplicate_query = clarification_pending
+        && previous_user.is_some_and(|message| ai::requests_duplicate_groups(&message.content));
+    let pending_all_records = pending_duplicate_query
+        && previous_user.is_some_and(|message| ai::requests_all_records(&message.content));
+    Some(ai::InvestigationConversationContext {
+        text: context,
+        pending_duplicate_query,
+        pending_all_records,
+    })
 }
 
 fn truncate_context_bytes(text: &str, max_bytes: usize) -> String {

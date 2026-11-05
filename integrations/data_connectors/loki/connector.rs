@@ -1,7 +1,8 @@
 use super::{LokiClient, LokiError, LokiSettings};
 use crate::data_connectors::{
     credential_setting, string_setting, ConnectionConfig, Connector, ConnectorError,
-    ConnectorFuture, FieldSummary, IndexSummary,
+    ConnectorFuture, FieldSummary, IndexSummary, InvestigationFilter,
+    InvestigationFilterOperator,
 };
 use crate::search::SearchRequest;
 use axum::http::StatusCode;
@@ -72,8 +73,128 @@ impl Connector for LokiClient {
         Box::pin(async move { Ok(LokiClient::search(self, request).await?) })
     }
 
+    fn investigation_filter_operators(
+        &self,
+        field_type: &str,
+    ) -> Vec<InvestigationFilterOperator> {
+        match field_type {
+            "label" => vec![InvestigationFilterOperator::Eq],
+            "text" => vec![InvestigationFilterOperator::Contains],
+            _ => Vec::new(),
+        }
+    }
+
+    fn investigation_supports_aggregation_field(&self, field_type: &str) -> bool {
+        field_type == "label"
+    }
+
+    fn build_investigation_query(
+        &self,
+        index: &str,
+        filters: &[InvestigationFilter],
+    ) -> Result<String, ConnectorError> {
+        super::validate_index(index)?;
+        let mut labels = Vec::new();
+        let mut line_filters = Vec::new();
+        for filter in filters {
+            if !crate::search::safe_field_name(&filter.field) {
+                return Err(invalid_investigation_filter());
+            }
+            match (&*filter.field_type, filter.operator, &filter.value) {
+                ("label", InvestigationFilterOperator::Eq, value) => {
+                    labels.push(format!(
+                        "{}=\"{}\"",
+                        filter.field,
+                        escape_logql_string(&investigation_value(value)?)
+                    ));
+                }
+                ("text", InvestigationFilterOperator::Contains, Value::String(value)) => {
+                    line_filters.push(format!(" |= \"{}\"", escape_logql_string(value)));
+                }
+                _ => return Err(invalid_investigation_filter()),
+            }
+        }
+        let selector = if labels.is_empty() {
+            "{}".to_owned()
+        } else {
+            format!("{{{}}}", labels.join(","))
+        };
+        let query = format!("{selector}{}", line_filters.join(""));
+        if query.len() > super::MAX_QUERY_BYTES {
+            return Err(invalid_investigation_filter());
+        }
+        Ok(query)
+    }
+
     fn document<'a>(&'a self, _index: &'a str, _id: &'a str) -> ConnectorFuture<'a, Value> {
         Box::pin(async { Err(ConnectorError::invalid_connection()) })
+    }
+}
+
+fn investigation_value(value: &Value) -> Result<String, ConnectorError> {
+    match value {
+        Value::String(value) => Ok(value.clone()),
+        Value::Number(value) => Ok(value.to_string()),
+        Value::Bool(value) => Ok(value.to_string()),
+        _ => Err(invalid_investigation_filter()),
+    }
+}
+
+fn escape_logql_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn invalid_investigation_filter() -> ConnectorError {
+    ConnectorError {
+        status: StatusCode::BAD_REQUEST,
+        code: "invalid_investigation_filter",
+        message: "The investigation filter is not supported by this data source".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod investigation_tests {
+    use super::*;
+
+    #[test]
+    fn investigation_query_uses_only_validated_logql_filter_shapes() {
+        let config = serde_json::from_value(json!({"url":"http://localhost:3100"})).unwrap();
+        let connector = connect(&config).unwrap();
+        let query = connector
+            .build_investigation_query(
+                "logs",
+                &[
+                    InvestigationFilter {
+                        field: "app".to_owned(),
+                        field_type: "label".to_owned(),
+                        operator: InvestigationFilterOperator::Eq,
+                        value: json!("api"),
+                    },
+                    InvestigationFilter {
+                        field: "_msg".to_owned(),
+                        field_type: "text".to_owned(),
+                        operator: InvestigationFilterOperator::Contains,
+                        value: json!("database \"timeout\""),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(query, "{app=\"api\"} |= \"database \\\"timeout\\\"\"");
+        assert!(connector
+            .build_investigation_query(
+                "logs",
+                &[InvestigationFilter {
+                    field: "app".to_owned(),
+                    field_type: "label".to_owned(),
+                    operator: InvestigationFilterOperator::Gt,
+                    value: json!(1),
+                }]
+            )
+            .is_err());
     }
 }
 

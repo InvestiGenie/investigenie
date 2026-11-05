@@ -1,7 +1,8 @@
 use super::{ClickHouseClient, ClickHouseError, ClickHouseTimeField};
 use crate::data_connectors::{
     string_setting, ConnectionConfig, Connector, ConnectorError, ConnectorFuture, FieldSummary,
-    IndexSummary,
+    IndexSummary, InvestigationFilter, InvestigationFilterOperator,
+    InvestigationGroupCountRequest, InvestigationGroupCountResult,
 };
 use crate::search::SearchRequest;
 use axum::http::StatusCode;
@@ -104,9 +105,239 @@ impl Connector for ClickHouseClient {
             Ok(response)
         })
     }
+    fn investigation_filter_operators(
+        &self,
+        field_type: &str,
+    ) -> Vec<InvestigationFilterOperator> {
+        let normalized = base_clickhouse_type(field_type);
+        let string_field = normalized.starts_with("string");
+        if !is_investigation_scalar_type(&normalized) {
+            return Vec::new();
+        }
+        let mut operators = vec![InvestigationFilterOperator::Eq];
+        if string_field {
+            operators.push(InvestigationFilterOperator::Contains);
+        }
+        operators.extend([
+            InvestigationFilterOperator::Gt,
+            InvestigationFilterOperator::Gte,
+            InvestigationFilterOperator::Lt,
+            InvestigationFilterOperator::Lte,
+        ]);
+        operators
+    }
+    fn investigation_supports_aggregation_field(&self, field_type: &str) -> bool {
+        is_investigation_scalar_type(field_type)
+    }
+    fn investigation_supports_group_count(&self) -> bool {
+        true
+    }
+    fn build_investigation_query(
+        &self,
+        index: &str,
+        filters: &[InvestigationFilter],
+    ) -> Result<String, ConnectorError> {
+        let table = quote_table(index)?;
+        let clauses = filters
+            .iter()
+            .map(|filter| {
+                if !self
+                    .investigation_filter_operators(&filter.field_type)
+                    .contains(&filter.operator)
+                {
+                    return Err(ClickHouseError::InvalidQuery.into());
+                }
+                clickhouse_filter(filter)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let where_clause = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        Ok(format!("SELECT * FROM {table}{where_clause}"))
+    }
+    fn investigation_group_count(
+        &self,
+        request: InvestigationGroupCountRequest,
+    ) -> ConnectorFuture<'_, InvestigationGroupCountResult> {
+        Box::pin(async move {
+            let available_fields = self.fields(&request.index).await?;
+            let field_types = available_fields
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            if request.group_by.is_empty()
+                || request.group_by.len() > 3
+                || !(2..=1_000_000_000).contains(&request.minimum_count)
+                || !(1..=100).contains(&request.limit)
+            {
+                return Err(ClickHouseError::InvalidQuery.into());
+            }
+            for field in &request.group_by {
+                let Some(field_type) = field_types.get(field) else {
+                    return Err(ClickHouseError::InvalidIdentifier.into());
+                };
+                if !is_investigation_scalar_type(field_type) {
+                    return Err(ClickHouseError::InvalidQuery.into());
+                }
+            }
+            let mut clauses = request
+                .filters
+                .iter()
+                .map(|filter| {
+                    let Some(field_type) = field_types.get(&filter.field) else {
+                        return Err(ClickHouseError::InvalidIdentifier);
+                    };
+                    if field_type != &filter.field_type
+                        || !self
+                        .investigation_filter_operators(field_type)
+                        .contains(&filter.operator)
+                    {
+                        return Err(ClickHouseError::InvalidQuery);
+                    }
+                    clickhouse_filter(filter).map_err(|_| ClickHouseError::InvalidQuery)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if let Some(range) = request.time_range {
+                if !range.is_valid()
+                    || !available_fields.iter().any(|(name, field_type)| {
+                        name == &request.time_field && is_time_field(field_type)
+                    })
+                {
+                    return Err(ClickHouseError::InvalidQuery.into());
+                }
+                clauses.push(format!(
+                    "toUnixTimestamp64Milli(toDateTime64({}, 3, 'UTC')) BETWEEN {} AND {}",
+                    super::quote_identifier(&request.time_field),
+                    range.start,
+                    range.end
+                ));
+            }
+            let where_clause = if clauses.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", clauses.join(" AND "))
+            };
+            let group_fields = request
+                .group_by
+                .iter()
+                .map(|field| super::quote_identifier(field))
+                .collect::<Vec<_>>();
+            let query = format!(
+                "SELECT {}, count() AS `_ig_duplicate_count` FROM {}{where_clause} GROUP BY {} HAVING count() >= {} ORDER BY `_ig_duplicate_count` DESC LIMIT {}",
+                group_fields.join(", "),
+                quote_table(&request.index)?,
+                group_fields.join(", "),
+                request.minimum_count,
+                request.limit
+            );
+            super::validate_read_query(&query)?;
+            let response = self.execute(&query).await?;
+            let columns = response
+                .get("meta")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|column| column.get("name").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect();
+            let mut rows = response
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or(ClickHouseError::InvalidResponse)?;
+            let truncated = rows.len() >= request.limit;
+            rows.truncate(request.limit);
+            Ok(InvestigationGroupCountResult {
+                query_language: "SQL".to_owned(),
+                query,
+                columns,
+                rows,
+                truncated,
+            })
+        })
+    }
     fn document<'a>(&'a self, _index: &'a str, _id: &'a str) -> ConnectorFuture<'a, Value> {
         Box::pin(async { Err(ConnectorError::invalid_connection()) })
     }
+}
+
+fn is_investigation_scalar_type(field_type: &str) -> bool {
+    let normalized = base_clickhouse_type(field_type);
+    ![
+        "array(",
+        "map(",
+        "tuple(",
+        "nested",
+        "object",
+        "aggregatefunction",
+        "json",
+    ]
+    .iter()
+    .any(|unsupported| normalized.contains(unsupported))
+}
+
+fn base_clickhouse_type(field_type: &str) -> String {
+    let mut normalized = field_type.trim().to_ascii_lowercase();
+    loop {
+        let Some(inner) = ["nullable(", "lowcardinality("]
+            .iter()
+            .find_map(|wrapper| normalized.strip_prefix(wrapper))
+            .and_then(|inner| inner.strip_suffix(')'))
+        else {
+            return normalized;
+        };
+        normalized = inner.to_owned();
+    }
+}
+
+fn quote_table(table: &str) -> Result<String, ConnectorError> {
+    if table.is_empty()
+        || !table
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.".contains(&byte))
+        || table.split('.').any(str::is_empty)
+    {
+        return Err(ClickHouseError::InvalidIdentifier.into());
+    }
+    Ok(table
+        .split('.')
+        .map(super::quote_identifier)
+        .collect::<Vec<_>>()
+        .join("."))
+}
+
+fn clickhouse_filter(filter: &InvestigationFilter) -> Result<String, ConnectorError> {
+    if !super::valid_identifier(&filter.field) {
+        return Err(ClickHouseError::InvalidIdentifier.into());
+    }
+    let field = super::quote_identifier(&filter.field);
+    let value = match &filter.value {
+        Value::String(value) => format!("'{}'", value.replace('\'', "''")),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        _ => return Err(ClickHouseError::InvalidQuery.into()),
+    };
+    Ok(match filter.operator {
+        InvestigationFilterOperator::Eq => format!("{field} = {value}"),
+        InvestigationFilterOperator::Contains => {
+            let Some(text) = filter.value.as_str() else {
+                return Err(ClickHouseError::InvalidQuery.into());
+            };
+            format!(
+                "{field} LIKE '%{}%'",
+                text.replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+                    .replace('\'', "''")
+            )
+        }
+        InvestigationFilterOperator::Gt => format!("{field} > {value}"),
+        InvestigationFilterOperator::Gte => format!("{field} >= {value}"),
+        InvestigationFilterOperator::Lt => format!("{field} < {value}"),
+        InvestigationFilterOperator::Lte => format!("{field} <= {value}"),
+    })
 }
 
 fn rejected_limit_setting(detail: &str) -> Option<&'static str> {
@@ -218,6 +449,35 @@ impl From<ClickHouseError> for ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn investigation_filters_use_connector_capabilities_and_escape_sql_values() {
+        let config = serde_json::from_value(json!({
+            "url":"http://localhost:8123",
+            "database":"analytics"
+        }))
+        .unwrap();
+        let connector = connect(&config).unwrap();
+        assert!(connector.investigation_supports_group_count());
+        assert!(connector
+            .investigation_filter_operators("LowCardinality(Nullable(String))")
+            .contains(&InvestigationFilterOperator::Contains));
+        let query = connector
+            .build_investigation_query(
+                "events",
+                &[InvestigationFilter {
+                    field: "message".to_owned(),
+                    field_type: "String".to_owned(),
+                    operator: InvestigationFilterOperator::Contains,
+                    value: json!("error%' OR 1=1 --"),
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            query,
+            "SELECT * FROM `events` WHERE `message` LIKE '%error\\%'' OR 1=1 --%'"
+        );
+    }
 
     #[test]
     fn descriptor_exposes_optional_execution_time_setting() {

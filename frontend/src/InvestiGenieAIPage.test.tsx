@@ -159,8 +159,8 @@ describe('InvestiGenieAIPage', () => {
     expect(screen.queryByRole('region', { name: 'Findings' })).not.toBeInTheDocument();
   });
 
-  it('renders grouped query results and the executed SQL without hypothesis panels', async () => {
-    const sql = "SELECT `login`, count() AS `_ig_duplicate_count` FROM `events` GROUP BY `login` HAVING count() >= 2 ORDER BY `_ig_duplicate_count` DESC LIMIT 51";
+  it('renders grouped query results and the executed connector query without hypothesis panels', async () => {
+    const query = "SELECT `login`, count() AS `_ig_duplicate_count` FROM `events` GROUP BY `login` HAVING count() >= 2 ORDER BY `_ig_duplicate_count` DESC LIMIT 51";
     vi.spyOn(api, 'startInvestigation').mockResolvedValue(job({ result: {
       ...result,
       response_mode: 'data_query',
@@ -175,7 +175,8 @@ describe('InvestiGenieAIPage', () => {
         data_view_id: 'login-view',
         data_view_name: 'Login events',
         group_by: ['login'],
-        sql,
+        query_language: 'SQL',
+        query,
         columns: ['login', '_ig_duplicate_count'],
         rows: [{ login: '0000Blaze', _ig_duplicate_count: 2 }],
         row_count: 1,
@@ -189,7 +190,8 @@ describe('InvestiGenieAIPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
     expect(await screen.findByText('Found 1 duplicate group for login in the requested scope.')).toBeInTheDocument();
     expect(screen.getByRole('region', { name: 'Executed data query' })).toBeInTheDocument();
-    expect(screen.getByText(sql)).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Executed SQL query · Login events' })).toBeInTheDocument();
+    expect(screen.getByText(query)).toBeInTheDocument();
     expect(screen.getByText('0000Blaze')).toBeInTheDocument();
     expect(screen.getByText('2', { selector: 'td' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Save full investigation as Knowledge draft' })).not.toBeInTheDocument();

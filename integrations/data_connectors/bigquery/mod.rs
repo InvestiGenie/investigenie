@@ -1,6 +1,7 @@
 use crate::data_connectors::{
     string_setting, ConnectionConfig, Connector, ConnectorError, ConnectorFuture, FieldSummary,
-    IndexSummary, IntegrationDescriptor,
+    IndexSummary, IntegrationDescriptor, InvestigationFilter, InvestigationFilterOperator,
+    InvestigationGroupCountRequest, InvestigationGroupCountResult,
 };
 use crate::search::SearchRequest;
 use crate::search::{
@@ -322,10 +323,7 @@ impl BigQueryClient {
         token: &str,
     ) -> Result<Vec<FieldSchema>, BigQueryError> {
         let table_id = self.table_name(index)?;
-        let path = format!(
-            "bigquery/v2/projects/{}/datasets/{}/tables/{}",
-            self.project_id, self.dataset_id, table_id
-        );
+        let path = format!("bigquery/v2/projects/{}/datasets/{}/tables/{}", self.project_id, self.dataset_id, table_id);
         let table: TableResponse = self
             .json_request(Method::GET, self.api_url(&path)?, token, None)
             .await?;
@@ -349,13 +347,7 @@ impl BigQueryClient {
         if let Some(location) = &self.location {
             url.query_pairs_mut().append_pair("location", location);
         }
-        let body = json!({
-            "query": sql,
-            "useLegacySql": false,
-            "maximumBytesBilled": MAX_BYTES_BILLED.to_string(),
-            "maxResults": page_size,
-            "timeoutMs": 10_000,
-        });
+        let body = json!({"query": sql, "useLegacySql": false, "maximumBytesBilled": MAX_BYTES_BILLED.to_string(), "maxResults": page_size, "timeoutMs": 10_000});
         let mut page: QueryPage = self
             .json_request(Method::POST, url, token, Some(body))
             .await?;
@@ -727,6 +719,120 @@ fn quote_field_path(value: &str) -> Result<String, BigQueryError> {
         .join("."))
 }
 
+fn bigquery_filter(filter: &InvestigationFilter) -> Result<String, BigQueryError> {
+    let field = quote_field_path(&filter.field)?;
+    let field_type = filter.field_type.trim().to_ascii_uppercase();
+    let value = match (&filter.value, field_type.as_str()) {
+        (Value::String(value), "STRING") => format!("'{}'", escape_bigquery_string(value)),
+        (Value::String(value), "DATE") => {
+            format!("DATE '{}'", escape_bigquery_string(value))
+        }
+        (Value::String(value), "DATETIME") => {
+            format!("DATETIME '{}'", escape_bigquery_string(value))
+        }
+        (Value::String(value), "TIMESTAMP") => {
+            format!("TIMESTAMP '{}'", escape_bigquery_string(value))
+        }
+        (Value::Number(value), "INT64" | "INTEGER" | "FLOAT64" | "FLOAT" | "NUMERIC" | "BIGNUMERIC") => value.to_string(),
+        (Value::Bool(value), "BOOL" | "BOOLEAN") => value.to_string().to_ascii_uppercase(),
+        _ => return Err(BigQueryError::InvalidQuery),
+    };
+    Ok(match filter.operator {
+        InvestigationFilterOperator::Eq => format!("{field} = {value}"),
+        InvestigationFilterOperator::Contains => {
+            let Value::String(needle) = &filter.value else {
+                return Err(BigQueryError::InvalidQuery);
+            };
+            let needle = escape_bigquery_string(needle);
+            format!("STRPOS(CAST({field} AS STRING), '{needle}') > 0")
+        }
+        InvestigationFilterOperator::Gt => format!("{field} > {value}"),
+        InvestigationFilterOperator::Gte => format!("{field} >= {value}"),
+        InvestigationFilterOperator::Lt => format!("{field} < {value}"),
+        InvestigationFilterOperator::Lte => format!("{field} <= {value}"),
+    })
+}
+
+fn bigquery_filter_operators(field_type: &str) -> Vec<InvestigationFilterOperator> {
+    match field_type.trim().to_ascii_uppercase().as_str() {
+        "STRING" => vec![
+            InvestigationFilterOperator::Eq,
+            InvestigationFilterOperator::Contains,
+        ],
+        "INT64" | "INTEGER" | "FLOAT64" | "FLOAT" | "NUMERIC" | "BIGNUMERIC" | "DATE"
+        | "DATETIME" | "TIMESTAMP" => vec![
+            InvestigationFilterOperator::Eq,
+            InvestigationFilterOperator::Gt,
+            InvestigationFilterOperator::Gte,
+            InvestigationFilterOperator::Lt,
+            InvestigationFilterOperator::Lte,
+        ],
+        "BOOL" | "BOOLEAN" => vec![InvestigationFilterOperator::Eq],
+        _ => Vec::new(),
+    }
+}
+
+fn escape_bigquery_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn bigquery_group_count_query(
+    index: &str,
+    time_field: &str,
+    filters: &[InvestigationFilter],
+    group_by: &[String],
+    minimum_count: u64,
+    limit: usize,
+    time_range: Option<crate::search::TimeRange>,
+) -> Result<String, BigQueryError> {
+    if index.is_empty()
+        || !index
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        || index.split('.').any(str::is_empty)
+        || group_by.is_empty()
+        || group_by.len() > 3
+        || !(2..=1_000_000_000).contains(&minimum_count)
+        || !(1..=100).contains(&limit)
+    {
+        return Err(BigQueryError::InvalidQuery);
+    }
+    let mut clauses = filters
+        .iter()
+        .map(bigquery_filter)
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(range) = time_range {
+        if !range.is_valid() {
+            return Err(BigQueryError::InvalidQuery);
+        }
+        let time_field = quote_field_path(time_field)?;
+        clauses.push(format!(
+            "TIMESTAMP({time_field}) BETWEEN TIMESTAMP_MILLIS({}) AND TIMESTAMP_MILLIS({})",
+            range.start, range.end
+        ));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    let group_fields = group_by
+        .iter()
+        .map(|field| quote_field_path(field))
+        .collect::<Result<Vec<_>, _>>()?;
+    let query = format!(
+        "SELECT {}, COUNT(*) AS `_ig_duplicate_count` FROM `{index}`{where_clause} GROUP BY {} HAVING COUNT(*) >= {minimum_count} ORDER BY `_ig_duplicate_count` DESC LIMIT {limit}",
+        group_fields.join(", "),
+        group_fields.join(", ")
+    );
+    validate_query(&query)?;
+    Ok(query)
+}
+
 fn decode_rows(rows: &[Value], fields: &[FieldSchema]) -> Result<Vec<Value>, BigQueryError> {
     rows.iter()
         .map(|row| {
@@ -1096,6 +1202,143 @@ impl Connector for BigQueryClient {
         })
     }
 
+    fn investigation_filter_operators(
+        &self,
+        field_type: &str,
+    ) -> Vec<InvestigationFilterOperator> {
+        bigquery_filter_operators(field_type)
+    }
+
+    fn investigation_supports_aggregation_field(&self, field_type: &str) -> bool {
+        !self.investigation_filter_operators(field_type).is_empty()
+    }
+
+    fn investigation_supports_group_count(&self) -> bool {
+        true
+    }
+
+    fn build_investigation_query(
+        &self,
+        index: &str,
+        filters: &[InvestigationFilter],
+    ) -> Result<String, ConnectorError> {
+        self.table_name(index)?;
+        let clauses = filters
+            .iter()
+            .map(bigquery_filter)
+            .collect::<Result<Vec<_>, _>>()?;
+        let suffix = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        let query = format!("SELECT * FROM `{index}`{suffix}");
+        validate_query(&query)?;
+        Ok(query)
+    }
+
+    fn investigation_group_count(
+        &self,
+        request: InvestigationGroupCountRequest,
+    ) -> ConnectorFuture<'_, InvestigationGroupCountResult> {
+        Box::pin(async move {
+            let result: Result<InvestigationGroupCountResult, BigQueryError> = async move {
+                self.table_name(&request.index)?;
+            if request.group_by.is_empty()
+                || request.group_by.len() > 3
+                || !(2..=1_000_000_000).contains(&request.minimum_count)
+                || !(1..=100).contains(&request.limit)
+            {
+                return Err(BigQueryError::InvalidQuery.into());
+            }
+            let fields = <Self as Connector>::fields(self, &request.index)
+                .await
+                .map_err(|_| BigQueryError::InvalidQuery)?;
+            let field_types = fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.field_type.as_str()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            for field in &request.group_by {
+                let Some(field_type) = field_types.get(field.as_str()) else {
+                    return Err(BigQueryError::InvalidQuery.into());
+                };
+                if !self.investigation_supports_aggregation_field(field_type) {
+                    return Err(BigQueryError::InvalidQuery.into());
+                }
+            }
+            for filter in &request.filters {
+                    let Some(field_type) = field_types.get(filter.field.as_str()) else {
+                        return Err(BigQueryError::InvalidQuery);
+                    };
+                    if *field_type != filter.field_type
+                        || !self
+                            .investigation_filter_operators(field_type)
+                            .contains(&filter.operator)
+                    {
+                        return Err(BigQueryError::InvalidQuery);
+                    }
+            }
+            if request.time_range.is_some_and(|range| {
+                !range.is_valid()
+                    || !fields.iter().any(|field| {
+                        field.name == request.time_field && is_time_type(&field.field_type)
+                    })
+            }) {
+                return Err(BigQueryError::InvalidQuery.into());
+            }
+            let query = bigquery_group_count_query(
+                &request.index,
+                &request.time_field,
+                &request.filters,
+                &request.group_by,
+                request.minimum_count,
+                request.limit,
+                request.time_range,
+            )?;
+            let response = <Self as Connector>::search(
+                self,
+                SearchRequest {
+                    index: request.index,
+                    query: query.clone(),
+                    size: request.limit,
+                    include_histogram: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|_| BigQueryError::InvalidQuery)?;
+            let columns = response
+                .get("columns")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            let hits = response
+                .get("hits")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let rows = hits
+                .iter()
+                .filter_map(|hit| hit.get("source").cloned())
+                .collect::<Vec<_>>();
+            let truncated = response.get("total_relation").and_then(Value::as_str) == Some("gte")
+                || rows.len() >= request.limit;
+                Ok(InvestigationGroupCountResult {
+                query_language: "Standard SQL".to_owned(),
+                query,
+                columns,
+                rows,
+                truncated,
+                })
+            }
+            .await;
+            result.map_err(ConnectorError::from)
+        })
+    }
+
     fn document<'a>(&'a self, _index: &'a str, _id: &'a str) -> ConnectorFuture<'a, Value> {
         Box::pin(async { Err(ConnectorError::invalid_connection()) })
     }
@@ -1252,6 +1495,63 @@ fn valid_job_id(value: &str) -> bool {
 mod tests {
     use super::*;
     use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn investigation_filters_use_typed_fields_and_escape_sql_literals() {
+        assert!(bigquery_filter_operators("STRING")
+            .contains(&InvestigationFilterOperator::Contains));
+        assert!(!bigquery_filter_operators("STRUCT")
+            .contains(&InvestigationFilterOperator::Eq));
+        let filter = InvestigationFilter {
+            field: "login".to_owned(),
+            field_type: "STRING".to_owned(),
+            operator: InvestigationFilterOperator::Eq,
+            value: json!("user' OR 1=1 --"),
+        };
+        assert_eq!(
+            bigquery_filter(&filter).unwrap(),
+            "`login` = 'user\\' OR 1=1 --'"
+        );
+        let wrong_type = InvestigationFilter {
+            field_type: "INT64".to_owned(),
+            ..filter
+        };
+        assert!(bigquery_filter(&wrong_type).is_err());
+    }
+
+    #[test]
+    fn grouped_query_is_bounded_and_parsed_as_one_read_only_statement() {
+        let query = bigquery_group_count_query(
+            "project.dataset.events",
+            "created_at",
+            &[InvestigationFilter {
+                field: "login".to_owned(),
+                field_type: "STRING".to_owned(),
+                operator: InvestigationFilterOperator::Eq,
+                value: json!("alice"),
+            }],
+            &["login".to_owned()],
+            2,
+            50,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            query,
+            "SELECT `login`, COUNT(*) AS `_ig_duplicate_count` FROM `project.dataset.events` WHERE `login` = 'alice' GROUP BY `login` HAVING COUNT(*) >= 2 ORDER BY `_ig_duplicate_count` DESC LIMIT 50"
+        );
+        assert!(validate_query(&query).is_ok());
+        assert!(bigquery_group_count_query(
+            "project.dataset.events",
+            "created_at",
+            &[],
+            &["login` DROP TABLE events --".to_owned()],
+            2,
+            50,
+            None,
+        )
+        .is_err());
+    }
 
     #[test]
     fn read_only_query_validation_accepts_bigquery_queries_only() {

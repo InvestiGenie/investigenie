@@ -80,10 +80,10 @@ function investigationConversationKnowledgeDraft(conversation: AIConversation): 
       `Current: ${JSON.stringify(evidence.current)}; baseline: ${JSON.stringify(evidence.baseline)}; error: ${evidence.error ?? 'none'}`,
     ].join('\n'));
     const dataQuery = result.query_result ? [
-      `#### Executed grouped query: ${result.query_result.data_view_name}`,
+      `#### Executed ${result.query_result.query_language} grouped query: ${result.query_result.data_view_name}`,
       `Group by: ${result.query_result.group_by.join(', ')}`,
       `Rows returned: ${result.query_result.row_count}; truncated: ${result.query_result.truncated}`,
-      '```sql', result.query_result.sql, '```',
+      '```', result.query_result.query, '```',
       JSON.stringify(result.query_result.rows),
     ].join('\n') : '';
     return [
@@ -182,8 +182,8 @@ function InvestigationResultView({ result, label }: { result: InvestigationResul
     {!nonInvestigationReply && result.evidence_status === 'insufficient_evidence' && <p className="ai-evidence-warning" role="status">Insufficient evidence for an incident hypothesis. An empty sample does not establish that no incident occurred.</p>}
     <p className="ai-summary">{result.summary}</p>
     {dataQueryReply && dataQuery && <section className="ai-data-query-result" aria-label="Executed data query">
-      <h3>Executed SQL · {dataQuery.data_view_name}</h3>
-      <pre className="ai-executed-sql"><code>{dataQuery.sql}</code></pre>
+      <h3>Executed {dataQuery.query_language} query · {dataQuery.data_view_name}</h3>
+      <pre className="ai-executed-sql"><code>{dataQuery.query}</code></pre>
       <div className="ai-query-result-count" role="status">
         {dataQuery.truncated
           ? `Showing ${dataQuery.row_count} groups; more may match.`
