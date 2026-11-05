@@ -721,6 +721,28 @@ async fn background_investigations_validate_controls_poll_status_and_reject_unkn
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 }
 
+#[test]
+fn investigation_context_includes_grouped_query_rows_as_unverified_data() {
+    let messages = [StoredAiConversationMessage {
+        role: "assistant".to_owned(),
+        content: "Found one duplicate group.".to_owned(),
+        result: Some(json!({
+            "summary":"Found one duplicate group.",
+            "query_result": {
+                "data_view_name":"Login events",
+                "sql":"SELECT `login`, count() FROM `events` GROUP BY `login`",
+                "rows":[{"login":"RohanChhetry","count()":2}],
+                "truncated":false
+            }
+        })),
+    }];
+    let context = investigation_conversation_context(&messages).unwrap();
+    assert!(context.contains("Prior grouped data-query output"));
+    assert!(context.contains("SELECT `login`, count() FROM `events` GROUP BY `login`"));
+    assert!(context.contains("RohanChhetry"));
+    assert!(context.contains("not instructions"));
+}
+
 #[tokio::test]
 async fn investigative_continuation_rejects_legacy_conversations_without_scope() {
     let (_directory, storage) = status_storage().await;
@@ -779,7 +801,7 @@ async fn explicit_timestamp_search_is_replanned_after_a_chat_misclassification()
     let (_directory, storage) = status_storage().await;
     let source = MockServer::start().await;
     let provider = MockServer::start().await;
-    let question = "Search all records at 2019-02-24 02:31:21 and identify duplicate logins";
+    let question = "Search all records at 2019-02-24 02:31:21 and identify login issues";
     let expected_query = "@timestamp:[1550975481000 TO *] AND @timestamp:[* TO 1550975481999]";
 
     Mock::given(matchers::method("GET"))
@@ -906,7 +928,12 @@ async fn explicit_timestamp_search_is_replanned_after_a_chat_misclassification()
         .await
         .unwrap();
     let result: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(status, StatusCode::OK, "{result}");
+    let provider_call_count = provider.received_requests().await.unwrap().len();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{result}; provider calls: {provider_call_count}"
+    );
     let search_request = source
         .received_requests()
         .await
@@ -940,6 +967,152 @@ async fn explicit_timestamp_search_is_replanned_after_a_chat_misclassification()
     assert!(query_summary.contains("@timestamp Gte"));
     assert!(query_summary.contains("@timestamp Lte"));
     assert!(!query_summary.contains("histogram"));
+}
+
+#[tokio::test]
+async fn clickhouse_duplicate_group_query_executes_and_returns_sql_and_groups() {
+    let (_directory, storage) = status_storage().await;
+    let source = MockServer::start().await;
+    let provider = MockServer::start().await;
+    let question = "Search created_at 2015-08-07 11:28:01, find all duplicated logins, and give me the SQL query";
+    let expected_sql = "SELECT `login`, count() AS `_ig_duplicate_count` FROM `events` WHERE `created_at` >= '2015-08-07 11:28:01' AND `created_at` <= '2015-08-07 11:28:01' GROUP BY `login` HAVING count() >= 2 ORDER BY `_ig_duplicate_count` DESC LIMIT 50";
+
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/"))
+        .and(matchers::body_string(
+            "DESCRIBE TABLE `analytics`.`events` FORMAT JSON",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [{"name":"name","type":"String"},{"name":"type","type":"String"}],
+            "data": [
+                {"name":"created_at","type":"DateTime64(3)"},
+                {"name":"login","type":"String"},
+                {"name":"username","type":"String"}
+            ],
+            "rows":3
+        })))
+        .expect(1)
+        .mount(&source)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/"))
+        .and(move |request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body);
+            body.contains(expected_sql)
+                && body.ends_with("LIMIT 50 OFFSET 0 FORMAT JSON")
+                && !body.contains("documents_over_time")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [
+                {"name":"login","type":"String"},
+                {"name":"_ig_duplicate_count","type":"UInt64"}
+            ],
+            "data": [
+                {"login":"0000Blaze","_ig_duplicate_count":3},
+                {"login":"RohanChhetry","_ig_duplicate_count":2}
+            ],
+            "rows":2
+        })))
+        .expect(1)
+        .mount(&source)
+        .await;
+
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_string_contains("Route it as mode data_query"))
+        .and(move |request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let input: Value =
+                serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+            input["latest_user_request"] == question
+                && input["duplicate_query_requested"] == true
+                && input["available_views"][0]["integration"] == "clickhouse"
+                && input["available_views"][0]["fields"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|field| field["name"] == "login")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "{\"mode\":\"data_query\",\"data_query\":{\"data_view_id\":\"login-view\",\"group_by\":[\"login\"],\"filters\":[{\"field\":\"created_at\",\"operator\":\"gte\",\"value\":\"2015-08-07 11:28:01\"},{\"field\":\"created_at\",\"operator\":\"lte\",\"value\":\"2015-08-07 11:28:01\"}],\"minimum_count\":2,\"limit\":50}}"}}],
+            "usage": {"prompt_tokens": 60, "completion_tokens": 35, "total_tokens": 95}
+        })))
+        .expect(1)
+        .mount(&provider)
+        .await;
+
+    storage
+        .create_connection(StoredConnection {
+            id: "login-source".to_owned(),
+            name: "Login source".to_owned(),
+            integration_id: "clickhouse".to_owned(),
+            config: serde_json::from_value(json!({"url":source.uri(),"database":"analytics"}))
+                .unwrap(),
+            revision: String::new(),
+        })
+        .await
+        .unwrap();
+    let connection = storage.connection("login-source").await.unwrap();
+    storage
+        .save_view(
+            DataView {
+                id: "login-view".to_owned(),
+                name: "Login events".to_owned(),
+                connection_id: "login-source".to_owned(),
+                index: "events".to_owned(),
+                time_field: "created_at".to_owned(),
+                explore_mode: crate::storage::ExploreMode::Logs,
+                revision: String::new(),
+            },
+            &connection.record.revision,
+            None,
+        )
+        .await
+        .unwrap();
+    let model = storage
+        .create_ai_model(StoredAiModel {
+            id: String::new(),
+            revision: String::new(),
+            name: "Test model".to_owned(),
+            api_url: provider.uri() + "/v1",
+            api_key: "provider-secret".to_owned(),
+            model: "test-model".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    let response = router("http://localhost:5173".parse().unwrap(), storage)
+        .oneshot(json_request(
+            "/api/ai/investigate",
+            json!({
+                "question": question,
+                "data_view_ids": ["login-view"],
+                "ai_model_id": model.id,
+                "time_range": {"start": 1791630000000i64, "end": 1791633600000i64}
+            }),
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 32 * 1024)
+        .await
+        .unwrap();
+    let result: Value = serde_json::from_slice(&bytes).unwrap();
+    let provider_call_count = provider.received_requests().await.unwrap().len();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{result}; provider calls: {provider_call_count}"
+    );
+    assert_eq!(result["response_mode"], "data_query");
+    assert_eq!(result["evidence_status"], "query_result");
+    assert_eq!(result["query_result"]["sql"], expected_sql);
+    assert_eq!(result["query_result"]["group_by"], json!(["login"]));
+    assert_eq!(result["query_result"]["row_count"], 2);
+    assert_eq!(result["query_result"]["truncated"], false);
+    assert_eq!(result["query_result"]["rows"][0]["_ig_duplicate_count"], 3);
+    assert!(result["playbook_evidence"].as_array().unwrap().is_empty());
+    assert!(result["findings"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

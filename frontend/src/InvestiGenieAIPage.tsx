@@ -79,11 +79,19 @@ function investigationConversationKnowledgeDraft(conversation: AIConversation): 
       `Query: ${evidence.query || '(all records)'}; breakdown: ${evidence.breakdown_field ?? 'none'}`,
       `Current: ${JSON.stringify(evidence.current)}; baseline: ${JSON.stringify(evidence.baseline)}; error: ${evidence.error ?? 'none'}`,
     ].join('\n'));
+    const dataQuery = result.query_result ? [
+      `#### Executed grouped query: ${result.query_result.data_view_name}`,
+      `Group by: ${result.query_result.group_by.join(', ')}`,
+      `Rows returned: ${result.query_result.row_count}; truncated: ${result.query_result.truncated}`,
+      '```sql', result.query_result.sql, '```',
+      JSON.stringify(result.query_result.rows),
+    ].join('\n') : '';
     return [
       `### Investigation result ${index + 1} (${result.complete === false ? 'partial' : 'complete'})`,
       `Summary: ${result.summary}`,
       'Findings:', ...(findings.length ? findings : ['No supported findings.']),
       'Sources and query scope:', ...(sources.length ? sources : ['No source details recorded.']),
+      ...(dataQuery ? ['Executed data query:', dataQuery] : []),
       ...(playbooks.length ? ['Playbook evidence:', ...playbooks] : []),
       'Caveats:', ...(result.caveats.length ? result.caveats.map((caveat) => `- ${caveat}`) : ['- None recorded.']),
     ].join('\n\n');
@@ -128,6 +136,8 @@ function investigationConversationKnowledgeDraft(conversation: AIConversation): 
 
 function canSaveInvestigationSession(conversation: AIConversation): boolean {
   return conversation.messages.some((message) => message.result
+    && message.result.response_mode !== 'conversation'
+    && message.result.response_mode !== 'data_query'
     && message.result.complete !== false
     && message.result.evidence_status !== 'insufficient_evidence'
     && message.result.summary.trim().length > 0);
@@ -135,6 +145,9 @@ function canSaveInvestigationSession(conversation: AIConversation): boolean {
 
 function InvestigationResultView({ result, label }: { result: InvestigationResult; label: string }) {
   const conversationalReply = result.response_mode === 'conversation';
+  const dataQueryReply = result.response_mode === 'data_query';
+  const nonInvestigationReply = conversationalReply || dataQueryReply;
+  const dataQuery = result.query_result;
 
   function playbookWindowLabel(window: NonNullable<InvestigationResult['playbook_evidence']>[number]['current'], baseline = false) {
     if (!window) return baseline ? 'Not run (All time or unavailable range)' : 'Unavailable';
@@ -143,12 +156,12 @@ function InvestigationResultView({ result, label }: { result: InvestigationResul
   }
 
   return <article className="ai-result">
-    <div className="ai-result-label"><BrainCircuit size={15} aria-hidden="true" /> {conversationalReply ? 'Response' : label}</div>
-    {!conversationalReply && <p className="ai-evidence-warning">AI hypotheses, not verified causes. Citations identify supporting samples; they do not prove the conclusion.</p>}
-    {!conversationalReply && <section className="ai-evidence-coverage" aria-label="Evidence coverage"><strong>Evidence coverage</strong>
+    <div className="ai-result-label"><BrainCircuit size={15} aria-hidden="true" /> {conversationalReply ? 'Response' : dataQueryReply ? 'Data query' : label}</div>
+    {!nonInvestigationReply && <p className="ai-evidence-warning">AI hypotheses, not verified causes. Citations identify supporting samples; they do not prove the conclusion.</p>}
+    {!nonInvestigationReply && <section className="ai-evidence-coverage" aria-label="Evidence coverage"><strong>Evidence coverage</strong>
       {result.sources.some((source) => source.evidence_queries !== undefined) ? <><span>{result.sources.reduce((total, source) => total + source.records_examined, 0).toLocaleString()} sampled records</span><span>{result.sources.reduce((total, source) => total + (source.evidence_queries?.length ?? 0), 0)} bounded evidence queries</span><span>Not an exhaustive or representative scan</span></> : <span>Detailed sampling coverage was not recorded in this saved result.</span>}
     </section>}
-    {!conversationalReply && result.playbook_evidence && result.playbook_evidence.length > 0 && <details className="ai-playbook-evidence"><summary>Investigation playbook queries ({result.playbook_evidence.length})</summary>
+    {!nonInvestigationReply && result.playbook_evidence && result.playbook_evidence.length > 0 && <details className="ai-playbook-evidence"><summary>Investigation playbook queries ({result.playbook_evidence.length})</summary>
       {result.playbook_evidence.map((evidence, index) => <section className="ai-playbook-query" key={`${evidence.playbook_id}-${evidence.step_name}-${evidence.data_view_id}-${index}`}>
         <h4>{evidence.step_name} · {evidence.data_view_name}</h4>
         <span>{evidence.playbook_title} · {evidence.index}</span>
@@ -166,15 +179,32 @@ function InvestigationResultView({ result, label }: { result: InvestigationResul
         </div>)}
       </section>)}
     </details>}
-    {!conversationalReply && result.evidence_status === 'insufficient_evidence' && <p className="ai-evidence-warning" role="status">Insufficient evidence for an incident hypothesis. An empty sample does not establish that no incident occurred.</p>}
+    {!nonInvestigationReply && result.evidence_status === 'insufficient_evidence' && <p className="ai-evidence-warning" role="status">Insufficient evidence for an incident hypothesis. An empty sample does not establish that no incident occurred.</p>}
     <p className="ai-summary">{result.summary}</p>
-    {!conversationalReply && <section className="ai-token-usage" aria-label="Token usage">
+    {dataQueryReply && dataQuery && <section className="ai-data-query-result" aria-label="Executed data query">
+      <h3>Executed SQL · {dataQuery.data_view_name}</h3>
+      <pre className="ai-executed-sql"><code>{dataQuery.sql}</code></pre>
+      <div className="ai-query-result-count" role="status">
+        {dataQuery.truncated
+          ? `Showing ${dataQuery.row_count} groups; more may match.`
+          : `${dataQuery.row_count} duplicate groups returned.`}
+      </div>
+      {dataQuery.rows.length > 0 && <div className="ai-query-result-table-wrap"><table className="ai-query-result-table">
+        <thead><tr>{dataQuery.columns.map((column) => <th key={column} scope="col">{column}</th>)}</tr></thead>
+        <tbody>{dataQuery.rows.map((row, rowIndex) => <tr key={rowIndex}>{dataQuery.columns.map((column) => {
+          const value = row[column];
+          return <td key={column}>{typeof value === 'string' ? value : value === null || value === undefined ? '—' : JSON.stringify(value)}</td>;
+        })}</tr>)}</tbody>
+      </table></div>}
+      {dataQuery.rows.length === 0 && <p>No duplicate groups matched the query.</p>}
+    </section>}
+    {!nonInvestigationReply && <section className="ai-token-usage" aria-label="Token usage">
       <strong>Provider token usage</strong>
       {result.token_usage.some((call) => call.total_tokens !== null)
         ? <div>{result.token_usage.map((call) => <span key={call.stage}>{call.stage}: {call.total_tokens === null ? 'not reported' : `${call.total_tokens.toLocaleString()} total (${call.prompt_tokens?.toLocaleString() ?? '—'} prompt + ${call.completion_tokens?.toLocaleString() ?? '—'} completion)`}</span>)}</div>
         : <span>Provider did not report token usage.</span>}
     </section>}
-    {!conversationalReply && result.findings.length > 0 && <section className="ai-findings" aria-label="Findings">
+    {!nonInvestigationReply && result.findings.length > 0 && <section className="ai-findings" aria-label="Findings">
       <h3>Findings</h3>
       {result.findings.map((finding, index) => <article className="ai-finding" key={`${finding.title}-${index}`}>
         <div className="ai-finding-heading"><h4>{finding.title}</h4><span className={`ai-severity severity-${finding.severity}`}>{finding.severity}</span></div>
@@ -183,7 +213,7 @@ function InvestigationResultView({ result, label }: { result: InvestigationResul
         <div className="ai-finding-meta"><span>{finding.confidence} confidence</span><span>Confidence is model judgment</span>{finding.evidence.map((evidence) => <span key={`${evidence.data_view_id}-${evidence.record_ids.join('-')}`}>{evidence.data_view_name}: {new Set(evidence.record_ids).size} cited sample records{evidence.record_ids.length ? ` · ${evidence.record_ids.join(', ')}` : ' · no validated sample citations'}</span>)}</div>
       </article>)}
     </section>}
-    {!conversationalReply && <details className="ai-sources-used"><summary>Sources and query scope</summary>
+    {!nonInvestigationReply && <details className="ai-sources-used"><summary>Sources and query scope</summary>
       {result.sources.map((source) => <div className="ai-source-used" key={source.data_view_id}><strong>{source.name}</strong><span>{source.index} · {source.records_examined.toLocaleString()} {source.sample_limit === undefined ? 'records reported in saved result' : `sampled rows (limit ${source.sample_limit})`}</span>
         {source.sample_records_available !== undefined && <span>{source.sample_records_available} sample records supplied to the model</span>}
         {source.aggregate_records !== undefined && <span>{source.aggregate_records === null ? 'Query aggregation count unavailable' : `${source.aggregate_records.toLocaleString()} records counted by query aggregation (not a finding count)`}</span>}
@@ -191,7 +221,7 @@ function InvestigationResultView({ result, label }: { result: InvestigationResul
         {source.evidence_queries?.map((query, index) => <small key={index}>{index + 1}. {query.sampling === 'adaptive_follow_up' ? 'adaptive follow-up query' : `${query.sampling} sample`} · {query.records_returned} records returned · {query.query_summary}{query.reason ? ` · ${query.reason}` : ''}</small>)}
       </div>)}
     </details>}
-    {!conversationalReply && result.caveats.length > 0 && <div className="ai-caveats"><strong>Limits</strong>{result.caveats.map((caveat, index) => <p key={index}>{caveat}</p>)}</div>}
+    {!nonInvestigationReply && result.caveats.length > 0 && <div className="ai-caveats"><strong>Limits</strong>{result.caveats.map((caveat, index) => <p key={index}>{caveat}</p>)}</div>}
   </article>;
 }
 

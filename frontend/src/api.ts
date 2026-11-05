@@ -49,7 +49,6 @@ export type IntegrationDescriptor = {
   query: QueryDescriptor;
   explore_modes?: ExploreMode[];
 };
-
 export type ConnectionSummary = {
   id: string;
   revision: string;
@@ -138,9 +137,19 @@ export type InvestigationFinding = {
 };
 
 export type InvestigationResult = {
-  response_mode?: 'investigation' | 'conversation';
+  response_mode?: 'investigation' | 'conversation' | 'data_query';
   summary: string;
   findings: InvestigationFinding[];
+  query_result?: {
+    data_view_id: string;
+    data_view_name: string;
+    group_by: string[];
+    sql: string;
+    columns: string[];
+    rows: Array<Record<string, unknown>>;
+    row_count: number;
+    truncated: boolean;
+  };
   playbook_evidence?: Array<{
     playbook_id: string;
     playbook_title: string;
@@ -174,7 +183,7 @@ export type InvestigationResult = {
     total_tokens: number | null;
   }>;
   complete?: boolean;
-  evidence_status?: 'sample_supported' | 'insufficient_evidence' | 'not_required';
+  evidence_status?: 'sample_supported' | 'insufficient_evidence' | 'not_required' | 'query_result';
   conclusions_verified?: boolean;
 };
 

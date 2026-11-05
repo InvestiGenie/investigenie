@@ -501,6 +501,15 @@ th[aria-sort="ascending"] .column-sort-button, th[aria-sort="descending"] .colum
 .ai-knowledge-actions > span { color: var(--muted); font-size: 11px; }
 .ai-knowledge-actions .alert { flex-basis: 100%; margin: 0; }
 .ai-summary { margin: 0 0 19px; color: var(--ink); font-size: 14px; line-height: 1.65; white-space: pre-wrap; }
+.ai-data-query-result { display: grid; gap: 8px; min-width: 0; margin: 0 0 18px; padding-top: 12px; border-top: 1px solid var(--line); }
+.ai-data-query-result h3 { margin: 0; color: var(--ink); font-size: 12px; }
+.ai-executed-sql { max-height: 220px; overflow: auto; margin: 0; padding: 9px 10px; color: var(--text-soft); background: var(--surface-subtle); border: 1px solid var(--line); border-radius: 4px; font: 10px/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ai-query-result-count { color: var(--muted); font-size: 10px; }
+.ai-query-result-table-wrap { max-width: 100%; overflow: auto; border: 1px solid var(--line); border-radius: 4px; }
+.ai-query-result-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.ai-query-result-table th, .ai-query-result-table td { min-width: 90px; max-width: 360px; padding: 7px 9px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.ai-query-result-table th { color: var(--text-soft); background: var(--surface-subtle); font-weight: 600; }
+.ai-query-result-table td { color: var(--ink); }
 .ai-token-usage { display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px 12px; margin: -9px 0 17px; color: var(--muted); font: 9px var(--mono); }
 .ai-token-usage strong { color: var(--text-soft); font: 600 9px 'DM Sans', 'Segoe UI', sans-serif; }
 .ai-token-usage > div { display: flex; flex-wrap: wrap; gap: 5px 12px; }

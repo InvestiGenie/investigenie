@@ -159,6 +159,44 @@ describe('InvestiGenieAIPage', () => {
     expect(screen.queryByRole('region', { name: 'Findings' })).not.toBeInTheDocument();
   });
 
+  it('renders grouped query results and the executed SQL without hypothesis panels', async () => {
+    const sql = "SELECT `login`, count() AS `_ig_duplicate_count` FROM `events` GROUP BY `login` HAVING count() >= 2 ORDER BY `_ig_duplicate_count` DESC LIMIT 51";
+    vi.spyOn(api, 'startInvestigation').mockResolvedValue(job({ result: {
+      ...result,
+      response_mode: 'data_query',
+      summary: 'Found 1 duplicate group for login in the requested scope.',
+      findings: [],
+      sources: [],
+      playbook_evidence: [],
+      caveats: [],
+      token_usage: [],
+      evidence_status: 'query_result',
+      query_result: {
+        data_view_id: 'login-view',
+        data_view_name: 'Login events',
+        group_by: ['login'],
+        sql,
+        columns: ['login', '_ig_duplicate_count'],
+        rows: [{ login: '0000Blaze', _ig_duplicate_count: 2 }],
+        row_count: 1,
+        truncated: false,
+      },
+    } }));
+    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    await screen.findByRole('combobox', { name: /AI model/ });
+    openDataViewPicker(); fireEvent.click(screen.getByLabelText(/Service 1/));
+    fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: 'Find duplicate logins and give me SQL' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Run investigation' }));
+    expect(await screen.findByText('Found 1 duplicate group for login in the requested scope.')).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Executed data query' })).toBeInTheDocument();
+    expect(screen.getByText(sql)).toBeInTheDocument();
+    expect(screen.getByText('0000Blaze')).toBeInTheDocument();
+    expect(screen.getByText('2', { selector: 'td' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Save full investigation as Knowledge draft' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Evidence coverage')).not.toBeInTheDocument();
+    expect(screen.queryByText(/AI hypotheses, not verified causes/)).not.toBeInTheDocument();
+  });
+
   it('explicitly saves completed findings as an unverified scoped knowledge draft', async () => {
     const completed = job();
     vi.spyOn(api, 'startInvestigation').mockResolvedValue(completed);
