@@ -415,6 +415,7 @@ th[aria-sort="ascending"] .column-sort-button, th[aria-sort="descending"] .colum
 .ai-history-row { min-height: 38px; display: flex; align-items: center; gap: 8px; padding: 3px 0 8px; border-bottom: 1px solid var(--line); }
 .ai-history-row > label { flex: 0 0 auto; color: var(--muted); font-size: 10px; font-weight: 600; }
 .ai-history-row > select { width: min(420px, 100%); min-width: 0; height: 30px; padding: 0 8px; color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 5px; font-size: 10px; }
+.ai-chat-token-total { flex: 0 0 auto; color: var(--muted); font: 10px var(--mono); white-space: nowrap; }
 .ai-retention-control { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10px; }
 .ai-retention-control input { width: 68px; height: 30px; padding: 0 6px; color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 5px; font-size: 10px; }
 .ai-retention-save { width: 30px; height: 30px; flex: 0 0 30px; display: grid; place-items: center; padding: 0; }

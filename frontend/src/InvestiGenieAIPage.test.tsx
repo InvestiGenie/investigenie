@@ -452,6 +452,7 @@ describe('InvestiGenieAIPage', () => {
     await screen.findByRole('option', { name: 'Checkout outage' });
     fireEvent.change(screen.getByLabelText('AI conversation history'), { target: { value: firstConversation.id } });
     expect(await screen.findByText(firstResult.summary)).toBeInTheDocument();
+    expect(screen.getByText('Chat tokens: 480')).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: followUpMessage } });
     fireEvent.click(screen.getByRole('button', { name: 'Send follow-up' }));
     await waitFor(() => expect(continueInvestigation).toHaveBeenCalledWith(
@@ -461,6 +462,7 @@ describe('InvestiGenieAIPage', () => {
       defaultControls,
     ));
     expect(await screen.findByText(secondResult.summary)).toBeInTheDocument();
+    expect(screen.getByText('Chat tokens: 960')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Save full investigation as Knowledge draft' }));
     await waitFor(() => expect(saveDraft).toHaveBeenCalledTimes(1));
     const saved = saveDraft.mock.calls[0][0];
@@ -468,6 +470,45 @@ describe('InvestiGenieAIPage', () => {
     expect(saved.content).toContain(followUpMessage);
     expect(saved.content).toContain(firstResult.summary);
     expect(saved.content).toContain(secondResult.summary);
+  });
+
+  it('adds active partial turn usage to the conversation token total', async () => {
+    const conversation = conversationForResult('token-case', 'Token case', 'Initial question');
+    const partialResult: InvestigationResult = {
+      ...result,
+      token_usage: [
+        { stage: 'planning', prompt_tokens: 40, completion_tokens: 10, total_tokens: 50 },
+        { stage: 'hypothesis', prompt_tokens: 70, completion_tokens: 30, total_tokens: 100 },
+      ],
+    };
+    const followUpMessage = 'Check one more signal.';
+    vi.mocked(api.aiConversations).mockResolvedValue([{
+      id: conversation.id, revision: conversation.revision, title: conversation.title, updated_at_ms: conversation.updated_at_ms,
+    }]);
+    vi.mocked(api.aiConversation).mockResolvedValue(conversation);
+    vi.spyOn(api, 'continueAIInvestigation').mockResolvedValue({
+      conversation: {
+        ...conversation,
+        revision: 'revision-2',
+        messages: [...conversation.messages, { role: 'user', content: followUpMessage }],
+      },
+      investigation: job({
+        id: 'token-follow-up',
+        conversation_id: conversation.id,
+        status: 'awaiting_decision',
+        result: partialResult,
+        pause_reason: 'The investigation reached its check-in budget.',
+      }),
+    });
+
+    render(<InvestiGenieAIPage dataViews={dataViews} />);
+    await screen.findByRole('option', { name: 'Token case' });
+    fireEvent.change(screen.getByLabelText('AI conversation history'), { target: { value: conversation.id } });
+    expect(await screen.findByText('Chat tokens: 480')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('Ask InvestiGenie AI'), { target: { value: followUpMessage } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send follow-up' }));
+    expect(await screen.findByText('Chat tokens: 630')).toBeInTheDocument();
+    expect(screen.getByText('Should InvestiGenie keep investigating?')).toBeInTheDocument();
   });
 
   it('renders findings, confidence, evidence and bounded sources', async () => {

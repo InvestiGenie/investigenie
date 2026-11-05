@@ -2329,6 +2329,95 @@ fn truncate_chars(text: &str, limit: usize) -> String {
     text.trim().chars().take(limit).collect()
 }
 
+fn sanitize_representativeness_claim(text: &str) -> String {
+    let normalized = text.to_ascii_lowercase();
+    let mut sanitized = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(offset) = normalized[cursor..].find("representative") {
+        let start = cursor + offset;
+        let end = start + "representative".len();
+        let before_is_boundary =
+            start == 0 || !normalized.as_bytes()[start - 1].is_ascii_alphabetic();
+        let after_is_boundary =
+            end == normalized.len() || !normalized.as_bytes()[end].is_ascii_alphabetic();
+        if !before_is_boundary || !after_is_boundary {
+            sanitized.push_str(&text[cursor..end]);
+            cursor = end;
+            continue;
+        }
+
+        let remaining = &normalized[start..];
+        let exhaustive_phrase = [
+            "representative but not exhaustive",
+            "representative and not exhaustive",
+        ]
+        .into_iter()
+        .find(|phrase| remaining.starts_with(phrase));
+        if let Some(phrase) = exhaustive_phrase {
+            let prefix = &normalized[..start];
+            let already_negative = [
+                "not statistically ",
+                "not demonstrated to be ",
+                "not established as ",
+                "not shown to be ",
+                "not a ",
+                "not an ",
+                "not the ",
+                "no ",
+                "non-",
+            ]
+            .iter()
+            .any(|negative| prefix.ends_with(negative));
+            if already_negative {
+                let phrase_end = start + phrase.len();
+                sanitized.push_str(&text[cursor..phrase_end]);
+                cursor = phrase_end;
+                continue;
+            }
+            let replacement_start = if prefix.ends_with("not ") {
+                start - "not ".len()
+            } else {
+                start
+            };
+            sanitized.push_str(&text[cursor..replacement_start]);
+            sanitized.push_str("not statistically representative and not exhaustive");
+            cursor = start + phrase.len();
+            continue;
+        }
+
+        let prefix = &normalized[..start];
+        if [
+            "not statistically ",
+            "not demonstrated to be ",
+            "not established as ",
+            "not shown to be ",
+            "not a ",
+            "not an ",
+            "not the ",
+            "no ",
+            "non-",
+        ]
+        .iter()
+        .any(|negative| prefix.ends_with(negative))
+        {
+            sanitized.push_str(&text[cursor..end]);
+            cursor = end;
+            continue;
+        }
+
+        if prefix.ends_with("not ") {
+            sanitized.push_str(&text[cursor..start - "not ".len()]);
+            sanitized.push_str("not statistically representative");
+        } else {
+            sanitized.push_str(&text[cursor..start]);
+            sanitized.push_str("not statistically representative");
+        }
+        cursor = end;
+    }
+    sanitized.push_str(&text[cursor..]);
+    sanitized
+}
+
 fn truncate_utf8_bytes(text: &str, limit: usize) -> &str {
     let end = text
         .char_indices()
@@ -2404,15 +2493,15 @@ fn sanitize_findings(output: ModelFindings, sources: &[SourceResult]) -> (ModelF
                 return None;
             }
             Some(Finding {
-                title: truncate_chars(&finding.title, 300),
-                detail: truncate_chars(&finding.detail, 4_000),
+                title: sanitize_representativeness_claim(&truncate_chars(&finding.title, 300)),
+                detail: sanitize_representativeness_claim(&truncate_chars(&finding.detail, 4_000)),
                 severity: finding.severity,
                 confidence: finding.confidence,
                 evidence,
             })
         })
         .collect::<Vec<_>>();
-    let mut summary = truncate_chars(&output.summary, 4_000);
+    let mut summary = sanitize_representativeness_claim(&truncate_chars(&output.summary, 4_000));
     if findings.is_empty() {
         summary = "Insufficient sampled evidence to support an incident finding. This does not establish that the selected time range is incident-free.".to_owned();
     } else if summary.is_empty() {
@@ -2421,7 +2510,7 @@ fn sanitize_findings(output: ModelFindings, sources: &[SourceResult]) -> (ModelF
     let caveats = output
         .caveats
         .iter()
-        .map(|caveat| truncate_chars(caveat, 1_000))
+        .map(|caveat| sanitize_representativeness_claim(&truncate_chars(caveat, 1_000)))
         .filter(|caveat| !caveat.is_empty())
         .take(20)
         .collect();
@@ -3341,6 +3430,40 @@ mod tests {
             json!([{"data_view_id":"logs","data_view_name":"Logs","record_ids":["e1"],"count":1}])
         );
         assert_eq!(clean.caveats, vec!["kept"]);
+    }
+
+    #[test]
+    fn bounded_sample_outputs_cannot_claim_statistical_representativeness() {
+        let sources = vec![source(view("logs", "Logs"), &["e1"], 4)];
+        let output = serde_json::from_value(json!({
+            "summary":"This is a sampled result, so the findings are representative but not exhaustive.",
+            "findings":[{
+                "title":"Login pattern",
+                "detail":"This sample is representative but not exhaustive.",
+                "evidence":[{"data_view_id":"logs","record_ids":["e1"],"count":1}]
+            }],
+            "caveats":["The sample is not statistically representative."]
+        }))
+        .unwrap();
+        let (clean, _) = sanitize_findings(output, &sources);
+        assert_eq!(
+            clean.summary,
+            "This is a sampled result, so the findings are not statistically representative and not exhaustive."
+        );
+        assert_eq!(
+            clean.findings[0].detail,
+            "This sample is not statistically representative and not exhaustive."
+        );
+        assert_eq!(
+            clean.caveats,
+            vec!["The sample is not statistically representative."]
+        );
+        assert_eq!(
+            sanitize_representativeness_claim(
+                "The sample is not representative but not exhaustive."
+            ),
+            "The sample is not statistically representative and not exhaustive."
+        );
     }
 
     #[test]

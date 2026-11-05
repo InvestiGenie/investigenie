@@ -143,6 +143,30 @@ function canSaveInvestigationSession(conversation: AIConversation): boolean {
     && message.result.summary.trim().length > 0);
 }
 
+function conversationTokenUsage(conversation: AIConversation, partialResult: InvestigationResult | null) {
+  const results = conversation.messages.flatMap((message) => message.result ? [message.result] : []);
+  if (partialResult) results.push(partialResult);
+  let total = 0;
+  let reportedCalls = 0;
+  let unreportedCalls = 0;
+  for (const result of results) {
+    for (const call of result.token_usage ?? []) {
+      const callTotal = typeof call.total_tokens === 'number'
+        ? call.total_tokens
+        : typeof call.prompt_tokens === 'number' && typeof call.completion_tokens === 'number'
+          ? call.prompt_tokens + call.completion_tokens
+          : null;
+      if (callTotal === null) {
+        unreportedCalls += 1;
+      } else {
+        total += callTotal;
+        reportedCalls += 1;
+      }
+    }
+  }
+  return { total: reportedCalls > 0 ? total : null, hasUnreported: unreportedCalls > 0 };
+}
+
 function InvestigationResultView({ result, label }: { result: InvestigationResult; label: string }) {
   const conversationalReply = result.response_mode === 'conversation';
   const dataQueryReply = result.response_mode === 'data_query';
@@ -407,6 +431,14 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
 
   const busy = starting || (job !== null && activeStatuses.has(job.status));
   const result = job?.result ?? null;
+  const partialConversationResult = job && activeConversation
+      && job.conversation_id === activeConversation.id
+      && activeStatuses.has(job.status)
+    ? job.result
+    : null;
+  const chatTokenUsage = activeConversation
+    ? conversationTokenUsage(activeConversation, partialConversationResult)
+    : null;
 
   async function refreshConversations() {
     try {
@@ -627,6 +659,7 @@ export default function InvestiGenieAIPage({ dataViews, onManageModels, initialD
           <option value="">New investigation</option>
           {conversations.map((conversation) => <option key={conversation.id} value={conversation.id}>{conversation.title}</option>)}
         </select>
+        {chatTokenUsage && <span className="ai-chat-token-total" role="status" aria-label="Conversation token total">Chat tokens: {chatTokenUsage.total?.toLocaleString() ?? '—'}{chatTokenUsage.hasUnreported ? '+' : ''}</span>}
           <label className="ai-retention-control" htmlFor="ai-history-retention">Retention (days)<input id="ai-history-retention" aria-label="History retention days" type="number" min="1" max="3650" step="1" value={retentionDays} disabled={retentionSaving || !settingsRevision} onChange={(event) => { setRetentionDays(event.target.value); setRetentionNotice(''); }} /></label>
           <button type="button" className="quiet-button ai-retention-save" aria-label="Save history retention" title="Save history retention" disabled={retentionSaving || !settingsRevision || !Number.isInteger(Number(retentionDays)) || Number(retentionDays) < 1 || Number(retentionDays) > 3_650 || Number(retentionDays) === Number(serverSettings.investigation_history_retention_days ?? DEFAULT_HISTORY_RETENTION_DAYS)} onClick={() => void saveHistoryRetention()}><Save size={14} aria-hidden="true" /></button>
         {activeConversation && <button type="button" className="quiet-button" aria-label="Delete conversation" title="Delete conversation" disabled={busy || conversationBusy} onClick={() => void removeConversation()}><Trash2 size={14} aria-hidden="true" /></button>}
