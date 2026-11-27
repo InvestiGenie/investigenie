@@ -1,8 +1,7 @@
 use super::{LokiClient, LokiError, LokiSettings};
 use crate::data_connectors::{
-    credential_setting, string_setting, ConnectionConfig, Connector, ConnectorError,
-    ConnectorFuture, FieldSummary, IndexSummary, InvestigationFilter,
-    InvestigationFilterOperator,
+    string_setting, ConnectionConfig, Connector, ConnectorError, ConnectorFuture, FieldSummary,
+    IndexSummary, InvestigationFilter, InvestigationFilterOperator,
 };
 use crate::search::SearchRequest;
 use axum::http::StatusCode;
@@ -12,39 +11,16 @@ use std::sync::Arc;
 pub fn connect(config: &ConnectionConfig) -> Result<Arc<dyn Connector>, ConnectorError> {
     let raw_url = string_setting(config, "url")?.ok_or_else(ConnectorError::invalid_connection)?;
     let url = url::Url::parse(&raw_url).map_err(|_| ConnectorError::invalid_connection())?;
-    let username = credential_setting(config, "username")?;
-    let password = string_setting(config, "password")?.filter(|value| !value.is_empty());
-    let bearer_token = credential_setting(config, "bearer_token")?;
-    let auth_type = string_setting(config, "auth_type")?.unwrap_or_else(|| {
-        if bearer_token.is_some() {
-            "bearer".to_owned()
-        } else if username.is_some() || password.is_some() {
-            "basic".to_owned()
-        } else {
-            "none".to_owned()
-        }
-    });
-    // Hidden credential inputs for other modes may be submitted empty; only the selected mode's values matter.
-    let (username, password, bearer_token) = match auth_type.as_str() {
-        "none" => (None, None, None),
-        "basic" => (username, password, None),
-        "bearer" => (None, None, bearer_token),
-        _ => (username, password, bearer_token),
-    };
     Ok(Arc::new(LokiClient::new(LokiSettings {
         url,
-        auth_type,
-        username,
-        password,
-        bearer_token,
+        auth: crate::http_auth::HttpAuth::from_config(config)?,
         tenant_id: string_setting(config, "tenant_id")?,
     })?))
 }
 
 impl Connector for LokiClient {
     fn public_configuration(&self) -> ConnectionConfig {
-        let mut configuration = ConnectionConfig::new();
-        configuration.insert("auth_type".to_owned(), json!(self.auth_type));
+        let mut configuration = self.auth.public_configuration();
         if let Some(tenant_id) = self.tenant_id.as_deref() {
             configuration.insert("tenant_id".to_owned(), json!(tenant_id));
         }
@@ -73,10 +49,7 @@ impl Connector for LokiClient {
         Box::pin(async move { Ok(LokiClient::search(self, request).await?) })
     }
 
-    fn investigation_filter_operators(
-        &self,
-        field_type: &str,
-    ) -> Vec<InvestigationFilterOperator> {
+    fn investigation_filter_operators(&self, field_type: &str) -> Vec<InvestigationFilterOperator> {
         match field_type {
             "label" => vec![InvestigationFilterOperator::Eq],
             "text" => vec![InvestigationFilterOperator::Contains],
@@ -183,6 +156,11 @@ impl From<LokiError> for ConnectorError {
                 StatusCode::BAD_GATEWAY,
                 "loki_unreachable",
                 "Could not complete the Loki request; it may have timed out",
+            ),
+            LokiError::Authentication => (
+                StatusCode::BAD_GATEWAY,
+                "loki_authentication_failed",
+                "Could not obtain an OAuth access token for Loki",
             ),
             LokiError::Rejected { status } => (
                 match status {

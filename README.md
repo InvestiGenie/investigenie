@@ -2,7 +2,7 @@
 
 **Connect every data source once. Investigate all your logs from one place.**
 
-InvestiGenie is a self-hosted log explorer with an AI investigator. Browse supported log, metric, and SQL sources from one screen. AI investigations currently support Elasticsearch and ClickHouse: they plan from metadata, examine bounded samples and source aggregations, and report findings with evidence references rather than scanning every matching record.
+InvestiGenie is a self-hosted log explorer with an AI investigator. Browse supported log, metric, and SQL sources from one screen. AI investigations use supported connectors to plan from metadata, examine bounded samples and source aggregations, and report findings with evidence references rather than scanning every matching record.
 
 Website: [investigenie.com](https://investigenie.com) · Releases: [GitHub Releases](https://github.com/InvestiGenie/investigenie/releases)
 
@@ -12,9 +12,9 @@ Website: [investigenie.com](https://investigenie.com) · Releases: [GitHub Relea
 - **Supported datasources:** Elasticsearch, ClickHouse, BigQuery, Loki, Prometheus, VictoriaLogs, and VictoriaMetrics. Explore capabilities vary by connector; build-time registration alone does not enable AI investigations for a datasource.
 - **Explore:** choose Logs, Metrics, or Traces. Logs keeps the existing query, time window, document table, and two 50-record pages per search. Metrics runs bounded PromQL or MetricsQL range queries for Prometheus and VictoriaMetrics, with a series chart and metric-name list. Traces is reserved for a future Tempo integration. Logs graph-selected ranges start a fresh capped search; totals and histograms retain the matching scope. Elasticsearch counts matches across the entire selected pattern.
 - **Histogram:** auto or fixed intervals, breakdown by field (including All time), and drag-to-zoom.
-- **InvestiGenie AI:** ask a question across 1–5 Elasticsearch or ClickHouse Data Views. The engine uses up to three bounded queries per view and retains up to eight sample rows; source aggregations may cover more records. Results distinguish those counts, show cited samples and caveats, and label conclusions as unverified hypotheses. Other connectors support Explore, but not AI query translation yet.
-- **AI history:** reopen or delete encrypted conversation history and ask follow-ups using saved findings. Follow-ups do not rescan sources; active scan jobs are not resumed after a restart.
-- **Knowledge:** manually create, edit, publish, archive, restore, and delete encrypted service context, runbooks, and resolved incidents. Completed investigations can be explicitly saved as unverified knowledge drafts for review. Search by content and filter by status, type, service, and environment. Automatic investigation retrieval is a later milestone.
+- **InvestiGenie AI:** ask a question across 1–5 supported Data Views. The engine uses up to three bounded queries per view and retains up to eight sample rows; an optional follow-up can add one four-row query. Source aggregations may cover more records. Results distinguish those counts, show cited samples and caveats, and label conclusions as unverified hypotheses. Grouped counts are available on connectors that advertise them.
+- **AI history:** reopen or delete encrypted conversation history and ask follow-ups in the saved scope. Investigative follow-ups gather fresh bounded evidence; conversational follow-ups do not rescan. Active scan jobs are not resumed after a restart.
+- **Knowledge:** manually create, edit, publish, archive, restore, and delete encrypted service context, runbooks, resolved incidents, and Investigation Playbooks. Published Playbooks guide bounded preflight queries. Completed investigations can be explicitly saved as unverified knowledge drafts for review. Search by content and filter by status, type, service, and environment. Automatic retrieval of other entries is a later milestone.
 - **Bring your own model:** works with any OpenAI-compatible provider, including local ones.
 - **Secure by default:** credentials are encrypted at rest, never sent to the browser or the AI, and datasources are only read.
 - **Extensible:** datasource adapters live in `integrations/data_connectors/`; AI transports live in `integrations/ai_connectors/`, starting with OpenAI-compatible Chat Completions. An AI skill guides datasource additions.
@@ -38,8 +38,8 @@ GHCR pull access depends on package visibility and permissions. If anonymous pul
 Then:
 1. **Connections:** add a supported datasource.
 2. **Data Views:** pick a connection, index or table, and time field.
-3. **Explore** your data, or add a provider under **AI Models** and ask **InvestiGenie AI** over supported Elasticsearch or ClickHouse Data Views.
-4. **Knowledge:** create entries manually, or reopen a completed investigation in AI history and choose **Save as knowledge draft**, then **Review knowledge draft**. Review and publish entries yourself; completed investigations do not automatically add knowledge, and investigations do not retrieve knowledge yet. See the [knowledge workflow](docs/frontend.md#knowledge-workflow).
+3. **Explore** your data, or add a provider under **AI Models** and ask **InvestiGenie AI** over supported Data Views.
+4. **Knowledge:** create entries manually, or reopen a completed investigation in AI history and choose **Save as knowledge draft**, then **Review knowledge draft**. Review and publish entries yourself; published Investigation Playbooks feed bounded preflight queries, while other Knowledge entries are not yet retrieved automatically. See the [knowledge workflow](docs/frontend.md#knowledge-workflow).
 
 > Release binaries are unsigned. On macOS, run `xattr -d com.apple.quarantine investigenie-api` once. On Windows, choose **More info → Run anyway**.
 

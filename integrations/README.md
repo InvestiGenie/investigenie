@@ -60,6 +60,8 @@ For the current built-in adapters, see [integration behavior](../docs/integratio
 
 All seven built-in connectors support bounded AI sample investigations through typed, metadata-validated filters compiled inside their integration adapters. Elasticsearch, ClickHouse, BigQuery, and VictoriaLogs also advertise grouped-count queries. Loki and the metrics connectors do not advertise grouped counts, so the AI returns a clear capability response rather than implying an exhaustive duplicate result from samples. The AI layer never inspects connector IDs or constructs native query strings.
 
+Loki supports OAuth 2.0 client credentials through the shared backend HTTP authentication helper, as well as none, Basic, and bearer modes. OAuth token endpoints require HTTPS except loopback; client IDs and secrets are encrypted and omitted from summaries. Elasticsearch investigation filters do not offer substring matching because sample searches disable leading Lucene wildcards. ClickHouse filters escape backslashes and quotes in SQL literals and apply separate LIKE-pattern escaping.
+
 BigQuery exposes tables from one configured project and dataset as fully qualified indices. Connections use an encrypted service-account JSON key, standard SQL is parsed as one query statement, and IAM remains the access boundary for custom SQL. Each query job is limited to 10 GiB billed bytes; pages use BigQuery job page tokens, exact totals, and typed result decoding. First-page histograms run as separate bounded jobs, and All time needs an additional bounded extent query. Row IDs are job-relative presentation IDs; document lookup and AI SQL translation are unavailable. See [BigQuery setup and limits](../docs/integrations.md#bigquery).
 
 ## 4. Return the Discover shape

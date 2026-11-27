@@ -313,6 +313,35 @@ describe('ConnectionsPage', () => {
     expect(request).not.toHaveProperty('max_execution_time');
   });
 
+  it('creates a Loki OAuth connection using metadata without sending hidden credentials', async () => {
+    const baseField = elasticsearchIntegration.connection_fields[0];
+    const oauth = { field: 'auth_type', value: 'oauth2' };
+    const integration = {
+      ...thirdIntegration, id: 'loki', display_name: 'Grafana Loki',
+      connection_fields: [
+        { ...baseField, label: 'URL' },
+        { ...baseField, name: 'auth_type', label: 'Authentication', input_type: 'select' as const, required: false, group: 'authentication', options: [{ value: 'none', label: 'None' }, { value: 'oauth2', label: 'OAuth 2.0 client credentials' }] },
+        { ...baseField, name: 'oauth_token_url', label: 'Token URL', visible_when: oauth },
+        { ...baseField, name: 'oauth_client_id', label: 'Client ID', input_type: 'text' as const, secret: true, group: 'credentials', visible_when: oauth },
+        { ...baseField, name: 'oauth_client_secret', label: 'Client secret', input_type: 'password' as const, secret: true, group: 'credentials', visible_when: oauth },
+      ],
+    };
+    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse({ integrations: [integration] }));
+    render(<ConnectionsPage connections={[]} onConnectionsChange={vi.fn().mockResolvedValue(undefined)} />);
+    fireEvent.click(screen.getByRole('button', { name: /Add connection/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /Grafana Loki/ }));
+    fireEvent.change(screen.getByLabelText('Connection name'), { target: { value: 'Logs' } });
+    fireEvent.change(screen.getByLabelText('URL'), { target: { value: 'https://logs.example.com' } });
+    fireEvent.change(screen.getByLabelText('Authentication'), { target: { value: 'oauth2' } });
+    fireEvent.change(screen.getByLabelText('Token URL'), { target: { value: 'https://idp.example.com/token' } });
+    fireEvent.change(screen.getByLabelText('Client ID'), { target: { value: 'client' } });
+    fireEvent.change(screen.getByLabelText('Client secret'), { target: { value: 'secret' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Test and add' }));
+    await screen.findByText('Connection tested and added.');
+    const addCall = vi.mocked(fetch).mock.calls.find(([, init]) => init?.method === 'POST');
+    expect(JSON.parse(String(addCall?.[1]?.body))).toEqual({ name: 'Logs', connection_type: 'loki', url: 'https://logs.example.com', oauth_token_url: 'https://idp.example.com/token', oauth_client_id: 'client', oauth_client_secret: 'secret' });
+  });
+
   it.each(['none', 'basic', 'api_key'])('retains the Elasticsearch %s authentication workflow through metadata', async (authType) => {
     render(<ConnectionsPage connections={[]} onConnectionsChange={vi.fn().mockResolvedValue(undefined)} />);
     fireEvent.click(screen.getByRole('button', { name: /Add connection/ }));

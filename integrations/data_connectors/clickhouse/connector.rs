@@ -1,8 +1,8 @@
 use super::{ClickHouseClient, ClickHouseError, ClickHouseTimeField};
 use crate::data_connectors::{
     string_setting, ConnectionConfig, Connector, ConnectorError, ConnectorFuture, FieldSummary,
-    IndexSummary, InvestigationFilter, InvestigationFilterOperator,
-    InvestigationGroupCountRequest, InvestigationGroupCountResult,
+    IndexSummary, InvestigationFilter, InvestigationFilterOperator, InvestigationGroupCountRequest,
+    InvestigationGroupCountResult,
 };
 use crate::search::SearchRequest;
 use axum::http::StatusCode;
@@ -105,10 +105,7 @@ impl Connector for ClickHouseClient {
             Ok(response)
         })
     }
-    fn investigation_filter_operators(
-        &self,
-        field_type: &str,
-    ) -> Vec<InvestigationFilterOperator> {
+    fn investigation_filter_operators(&self, field_type: &str) -> Vec<InvestigationFilterOperator> {
         let normalized = base_clickhouse_type(field_type);
         let string_field = normalized.starts_with("string");
         if !is_investigation_scalar_type(&normalized) {
@@ -191,8 +188,8 @@ impl Connector for ClickHouseClient {
                     };
                     if field_type != &filter.field_type
                         || !self
-                        .investigation_filter_operators(field_type)
-                        .contains(&filter.operator)
+                            .investigation_filter_operators(field_type)
+                            .contains(&filter.operator)
                     {
                         return Err(ClickHouseError::InvalidQuery);
                     }
@@ -314,7 +311,7 @@ fn clickhouse_filter(filter: &InvestigationFilter) -> Result<String, ConnectorEr
     }
     let field = super::quote_identifier(&filter.field);
     let value = match &filter.value {
-        Value::String(value) => format!("'{}'", value.replace('\'', "''")),
+        Value::String(value) => clickhouse_string_literal(value),
         Value::Bool(value) => value.to_string(),
         Value::Number(value) => value.to_string(),
         _ => return Err(ClickHouseError::InvalidQuery.into()),
@@ -325,12 +322,13 @@ fn clickhouse_filter(filter: &InvestigationFilter) -> Result<String, ConnectorEr
             let Some(text) = filter.value.as_str() else {
                 return Err(ClickHouseError::InvalidQuery.into());
             };
+            let pattern = text
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
             format!(
-                "{field} LIKE '%{}%'",
-                text.replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_")
-                    .replace('\'', "''")
+                "{field} LIKE {}",
+                clickhouse_string_literal(&format!("%{pattern}%"))
             )
         }
         InvestigationFilterOperator::Gt => format!("{field} > {value}"),
@@ -338,6 +336,10 @@ fn clickhouse_filter(filter: &InvestigationFilter) -> Result<String, ConnectorEr
         InvestigationFilterOperator::Lt => format!("{field} < {value}"),
         InvestigationFilterOperator::Lte => format!("{field} <= {value}"),
     })
+}
+
+fn clickhouse_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 fn rejected_limit_setting(detail: &str) -> Option<&'static str> {
@@ -475,7 +477,31 @@ mod tests {
             .unwrap();
         assert_eq!(
             query,
-            "SELECT * FROM `events` WHERE `message` LIKE '%error\\%'' OR 1=1 --%'"
+            r"SELECT * FROM `events` WHERE `message` LIKE '%error\\%\' OR 1=1 --%'"
+        );
+        let injection = InvestigationFilter {
+            field: "message".to_owned(),
+            field_type: "String".to_owned(),
+            operator: InvestigationFilterOperator::Eq,
+            value: json!(r"x\' OR 1=1 --"),
+        };
+        assert_eq!(
+            connector
+                .build_investigation_query("events", &[injection])
+                .unwrap(),
+            r"SELECT * FROM `events` WHERE `message` = 'x\\\' OR 1=1 --'"
+        );
+        let pattern = InvestigationFilter {
+            field: "message".to_owned(),
+            field_type: "String".to_owned(),
+            operator: InvestigationFilterOperator::Contains,
+            value: json!(r"a_b\"),
+        };
+        assert_eq!(
+            connector
+                .build_investigation_query("events", &[pattern])
+                .unwrap(),
+            r"SELECT * FROM `events` WHERE `message` LIKE '%a\\_b\\\\%'"
         );
     }
 

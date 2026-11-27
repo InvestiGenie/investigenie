@@ -2,7 +2,12 @@ use crate::search::TimeRange;
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
 use tracing::Instrument;
 
 pub type ConnectionConfig = Map<String, Value>;
@@ -10,6 +15,30 @@ pub type ConnectorFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ConnectorError>> + Send + 'a>>;
 pub const MAX_METRIC_SERIES: usize = 50;
 pub const MAX_METRIC_POINTS: usize = 500;
+
+pub fn shared_http_client(timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
+    let build = || {
+        reqwest::Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+    };
+    if cfg!(test) {
+        return build();
+    }
+    static CLIENTS: OnceLock<Mutex<std::collections::HashMap<Duration, reqwest::Client>>> =
+        OnceLock::new();
+    let mut clients = CLIENTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(client) = clients.get(&timeout) {
+        return Ok(client.clone());
+    }
+    let client = build()?;
+    clients.insert(timeout, client.clone());
+    Ok(client)
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

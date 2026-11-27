@@ -168,7 +168,7 @@ python3 -m unittest discover -s playground/tests
 ./playground/playground.sh up --observability
 ```
 
-This adds Loki (with the same logs as JSON lines, labelled by `service_name`, `level` and `environment`), Prometheus (scraping the seeder's `playground_http_requests_total`, `playground_http_request_duration_seconds` and `playground_scenario_active` metrics) and Mimir (Prometheus remote-write target). InvestiGenie includes Loki and Prometheus connectors for Explore; add their connections and Data Views manually. These connectors do not yet implement AI investigation filter translation. Mimir is the stack's remote-write backend, not an additional dedicated InvestiGenie connector.
+This adds Loki (with the same logs as JSON lines, labelled by `service_name`, `level` and `environment`), Prometheus (scraping the seeder's `playground_http_requests_total`, `playground_http_request_duration_seconds` and `playground_scenario_active` metrics) and Mimir (Prometheus remote-write target). InvestiGenie includes Loki and Prometheus connectors for Explore and bounded AI investigations; add their connections and Data Views manually. Mimir is the stack's remote-write backend, not an additional dedicated InvestiGenie connector.
 
 ```promql
 sum by (service, status) (rate(playground_http_requests_total[5m]))

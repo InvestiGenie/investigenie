@@ -2483,6 +2483,86 @@ async fn filesystem_api_status_capacity_errors_remain_errors_and_hide_credential
 }
 
 #[tokio::test]
+async fn loki_oauth_connection_create_edit_and_switch_keep_credentials_private() {
+    let (_directory, storage) = status_storage().await;
+    let state = state(storage.clone());
+    let server = MockServer::start().await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"access_token":"access-token","token_type":"Bearer","expires_in":3600}),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("GET"))
+        .and(matchers::path("/loki/api/v1/labels"))
+        .and(matchers::header("authorization", "Bearer access-token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"status":"success","data":[]})),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("GET"))
+        .and(matchers::path("/loki/api/v1/labels"))
+        .and(|request: &wiremock::Request| !request.headers.contains_key("authorization"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"status":"success","data":[]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let added = add_connection(
+        State(state.clone()),
+        Json(
+            serde_json::from_value(json!({
+                "name":"logs","connection_type":"loki","url":server.uri(),
+                "oauth_token_url":format!("{}/token", server.uri()),
+                "oauth_client_id":"private-client-id","oauth_client_secret":"private-client-secret"
+            }))
+            .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    let listed = connections(State(state.clone())).await.unwrap().0;
+    assert!(!listed.to_string().contains("private-client-id"));
+    assert!(!listed.to_string().contains("private-client-secret"));
+    assert_eq!(
+        listed["connections"][0]["configuration"]["auth_type"],
+        "oauth2"
+    );
+    let edited = update_connection(
+        State(state.clone()),
+        Path("logs".to_owned()),
+        headers(added.0["revision"].as_str().unwrap()),
+        Json(
+            serde_json::from_value(json!({"name":"logs","url":server.uri(),"auth_type":"oauth2"}))
+                .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    let saved = storage.connection("logs").await.unwrap().record;
+    assert_eq!(saved.config["oauth_client_secret"], "private-client-secret");
+    let _ = update_connection(
+        State(state),
+        Path("logs".to_owned()),
+        headers(edited.0["revision"].as_str().unwrap()),
+        Json(
+            serde_json::from_value(json!({"name":"logs","url":server.uri(),"auth_type":"none"}))
+                .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    let saved = storage.connection("logs").await.unwrap().record;
+    assert!(!saved.config.contains_key("oauth_client_id"));
+    assert!(!saved.config.contains_key("oauth_client_secret"));
+}
+
+#[tokio::test]
 async fn filesystem_api_retains_and_replaces_credentials_on_edit_and_reopen() {
     use crate::storage::PersistenceOptions;
     use base64::{engine::general_purpose::STANDARD, Engine};

@@ -3,8 +3,8 @@ use super::{
 };
 use crate::data_connectors::{
     string_setting, ConnectionConfig, Connector, ConnectorError, ConnectorFuture, FieldSummary,
-    IndexSummary, InvestigationFilter, InvestigationFilterOperator,
-    InvestigationGroupCountRequest, InvestigationGroupCountResult,
+    IndexSummary, InvestigationFilter, InvestigationFilterOperator, InvestigationGroupCountRequest,
+    InvestigationGroupCountResult,
 };
 use crate::search::SearchRequest;
 use axum::http::StatusCode;
@@ -75,15 +75,11 @@ impl Connector for ElasticsearchClient {
     fn search(&self, request: SearchRequest) -> ConnectorFuture<'_, Value> {
         Box::pin(async move { Ok(json!(self.search(request).await?)) })
     }
-    fn investigation_filter_operators(
-        &self,
-        field_type: &str,
-    ) -> Vec<InvestigationFilterOperator> {
+    fn investigation_filter_operators(&self, field_type: &str) -> Vec<InvestigationFilterOperator> {
         match field_type.trim().to_ascii_lowercase().as_str() {
-            "keyword" | "constant_keyword" | "wildcard" | "text" => vec![
-                InvestigationFilterOperator::Eq,
-                InvestigationFilterOperator::Contains,
-            ],
+            "keyword" | "constant_keyword" | "wildcard" | "text" => {
+                vec![InvestigationFilterOperator::Eq]
+            }
             "long" | "integer" | "short" | "byte" | "double" | "float" | "half_float"
             | "scaled_float" | "unsigned_long" | "date" | "date_nanos" => vec![
                 InvestigationFilterOperator::Eq,
@@ -177,9 +173,9 @@ impl Connector for ElasticsearchClient {
                     .get(field)
                     .ok_or(ElasticsearchError::InvalidIndex)?;
                 if caps.is_empty()
-                    || caps
-                        .iter()
-                        .any(|capability| !capability.aggregatable || !is_aggregatable_type(&capability.field_type))
+                    || caps.iter().any(|capability| {
+                        !capability.aggregatable || !is_aggregatable_type(&capability.field_type)
+                    })
                 {
                     return Err(ElasticsearchError::InvalidIndex.into());
                 }
@@ -196,9 +192,9 @@ impl Connector for ElasticsearchClient {
                 }
             }
             if request.time_range.is_some()
-                && !fields.iter().any(|field| {
-                    field.name == request.time_field && field.is_time_field
-                })
+                && !fields
+                    .iter()
+                    .any(|field| field.name == request.time_field && field.is_time_field)
             {
                 return Err(ElasticsearchError::InvalidIndex.into());
             }
@@ -264,7 +260,9 @@ impl Connector for ElasticsearchClient {
                 if count < request.minimum_count {
                     continue;
                 }
-                let key = bucket.get("key").ok_or(ElasticsearchError::InvalidResponse)?;
+                let key = bucket
+                    .get("key")
+                    .ok_or(ElasticsearchError::InvalidResponse)?;
                 let values = if request.group_by.len() == 1 {
                     vec![key.clone()]
                 } else {
@@ -363,7 +361,6 @@ fn escape_wildcard(value: &str) -> String {
         .replace('?', "\\?")
 }
 
-
 fn elasticsearch_filter(filter: &InvestigationFilter) -> Result<String, ConnectorError> {
     if !crate::search::safe_field_name(&filter.field) {
         return Err(invalid_investigation_filter());
@@ -373,26 +370,35 @@ fn elasticsearch_filter(filter: &InvestigationFilter) -> Result<String, Connecto
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| filter.value.to_string());
-    let escaped = value
-        .chars()
-        .flat_map(|character| {
-            if "\\+-=&|><!(){}[]^\"~*?:/".contains(character) {
-                vec!['\\', character]
-            } else {
-                vec![character]
-            }
-        })
-        .collect::<String>();
+    let escape = |value: &str| {
+        value
+            .chars()
+            .flat_map(|character| {
+                if character.is_whitespace() || "\\+-=&|><!(){}[]^\"~*?:/".contains(character) {
+                    vec!['\\', character]
+                } else {
+                    vec![character]
+                }
+            })
+            .collect::<String>()
+    };
+    let field = escape(&filter.field);
+    let escaped = escape(&value);
+    let bound = if value
+        .parse::<f64>()
+        .is_ok_and(|number| number.is_finite() && number >= 0.0)
+    {
+        escaped.clone()
+    } else {
+        format!("\"{escaped}\"")
+    };
     Ok(match filter.operator {
-        InvestigationFilterOperator::Eq => format!("{}:\"{}\"", filter.field, escaped),
-        InvestigationFilterOperator::Contains if filter.value.is_string() => {
-            format!("{}:*{}*", filter.field, escaped)
-        }
+        InvestigationFilterOperator::Eq => format!("{field}:\"{escaped}\""),
         InvestigationFilterOperator::Contains => return Err(invalid_investigation_filter()),
-        InvestigationFilterOperator::Gt => format!("{}:{{{} TO *]", filter.field, escaped),
-        InvestigationFilterOperator::Gte => format!("{}:[{} TO *]", filter.field, escaped),
-        InvestigationFilterOperator::Lt => format!("{}:[* TO {}}}", filter.field, escaped),
-        InvestigationFilterOperator::Lte => format!("{}:[* TO {}]", filter.field, escaped),
+        InvestigationFilterOperator::Gt => format!("{field}:{{{bound} TO *]"),
+        InvestigationFilterOperator::Gte => format!("{field}:[{bound} TO *]"),
+        InvestigationFilterOperator::Lt => format!("{field}:[* TO {bound}}}"),
+        InvestigationFilterOperator::Lte => format!("{field}:[* TO {bound}]"),
     })
 }
 
@@ -527,16 +533,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn investigation_filters_use_supported_types_and_escape_wildcards() {
+    fn investigation_filters_reject_leading_wildcards_and_escape_lucene() {
         let config = serde_json::from_value(json!({"url":"http://localhost:9200"})).unwrap();
         let connector = connect(&config).unwrap();
-        assert!(connector
+        assert!(!connector
             .investigation_filter_operators("keyword")
             .contains(&InvestigationFilterOperator::Contains));
         assert!(!connector
             .investigation_filter_operators("object")
             .contains(&InvestigationFilterOperator::Eq));
-        let query = connector
+        assert!(connector
             .build_investigation_query(
                 "events",
                 &[InvestigationFilter {
@@ -546,8 +552,30 @@ mod tests {
                     value: json!("user*name"),
                 }],
             )
+            .is_err());
+        let query = connector
+            .build_investigation_query(
+                "events",
+                &[
+                    InvestigationFilter {
+                        field: "user-agent".to_owned(),
+                        field_type: "keyword".to_owned(),
+                        operator: InvestigationFilterOperator::Eq,
+                        value: json!("client one"),
+                    },
+                    InvestigationFilter {
+                        field: "latency".to_owned(),
+                        field_type: "long".to_owned(),
+                        operator: InvestigationFilterOperator::Gte,
+                        value: json!(-10),
+                    },
+                ],
+            )
             .unwrap();
-        assert_eq!(query, "login:*user\\*name*");
+        assert_eq!(
+            query,
+            r#"user\-agent:"client\ one" AND latency:["\-10" TO *]"#
+        );
     }
 
     #[tokio::test]
@@ -618,7 +646,10 @@ mod tests {
         assert_eq!(result.query_language, "Elasticsearch Query DSL");
         assert!(result.query.contains("/_search"));
         assert_eq!(result.columns, ["login", "_ig_duplicate_count"]);
-        assert_eq!(result.rows, [json!({"login":"alice","_ig_duplicate_count":3})]);
+        assert_eq!(
+            result.rows,
+            [json!({"login":"alice","_ig_duplicate_count":3})]
+        );
         assert!(result.truncated);
     }
 
@@ -693,12 +724,42 @@ mod tests {
     #[test]
     fn rejected_errors_use_curated_messages_by_error_type() {
         for (status, kind, detail, expected_status, expected) in [
-            (404, "index_not_found_exception", "no such index [x]", StatusCode::NOT_FOUND, "No Elasticsearch index"),
-            (400, "illegal_argument_exception", "Text fields are not optimised for operations", StatusCode::BAD_REQUEST, "Text fields cannot be sorted"),
-            (400, "query_shard_exception", "No mapping found for [x] in order to sort on", StatusCode::BAD_REQUEST, "not mapped in every index"),
-            (400, "query_shard_exception", "Failed to parse query [a AND]", StatusCode::BAD_REQUEST, "could not parse the query"),
+            (
+                404,
+                "index_not_found_exception",
+                "no such index [x]",
+                StatusCode::NOT_FOUND,
+                "No Elasticsearch index",
+            ),
+            (
+                400,
+                "illegal_argument_exception",
+                "Text fields are not optimised for operations",
+                StatusCode::BAD_REQUEST,
+                "Text fields cannot be sorted",
+            ),
+            (
+                400,
+                "query_shard_exception",
+                "No mapping found for [x] in order to sort on",
+                StatusCode::BAD_REQUEST,
+                "not mapped in every index",
+            ),
+            (
+                400,
+                "query_shard_exception",
+                "Failed to parse query [a AND]",
+                StatusCode::BAD_REQUEST,
+                "could not parse the query",
+            ),
             (429, "", "", StatusCode::SERVICE_UNAVAILABLE, "overloaded"),
-            (500, "search_timeout_exception", "Time exceeded", StatusCode::GATEWAY_TIMEOUT, "timed out"),
+            (
+                500,
+                "search_timeout_exception",
+                "Time exceeded",
+                StatusCode::GATEWAY_TIMEOUT,
+                "timed out",
+            ),
         ] {
             let error: ConnectorError = ElasticsearchError::Rejected {
                 status,

@@ -13,7 +13,7 @@ use crate::search::{
     BreakdownCount, HistogramInterval, TimeRange, BREAKDOWN_OTHER_KEY, MAX_BREAKDOWN_VALUES,
 };
 use chrono::Utc;
-use reqwest::{redirect::Policy, Client, Response, Url};
+use reqwest::{Client, Response, Url};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
@@ -135,10 +135,7 @@ impl PrometheusClient {
         {
             return Err(PrometheusError::InvalidConfiguration);
         }
-        let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(Policy::none())
-            .build()
+        let client = crate::data_connectors::shared_http_client(REQUEST_TIMEOUT)
             .map_err(|_| PrometheusError::ClientConfiguration)?;
         Ok(Self {
             base_url: settings.url,

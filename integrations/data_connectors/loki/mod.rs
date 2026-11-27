@@ -6,12 +6,13 @@ use std::{
 };
 
 use crate::data_connectors::IntegrationDescriptor;
+use crate::http_auth::HttpAuth;
 use crate::search::{
     BreakdownCount, HistogramInterval, HistogramOptions, TimeRange, BREAKDOWN_OTHER_KEY,
     MAX_BREAKDOWN_VALUES,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
-use reqwest::{header, redirect::Policy, Client, Response, Url};
+use reqwest::{header, Client, Response, Url};
 use serde_json::{json, Value};
 use thiserror::Error;
 
@@ -28,20 +29,18 @@ const MAX_CURSOR_OFFSET: u64 = MAX_RETURNED_ENTRIES as u64;
 const NANOS_PER_MILLI: i64 = 1_000_000;
 
 pub fn descriptor() -> IntegrationDescriptor {
+    let mut connection_fields = vec![
+        json!({"name":"url","label":"URL","input_type":"url","required":true,"secret":false,"editable":true,"placeholder":"http://localhost:3100"}),
+    ];
+    connection_fields.extend(crate::http_auth::connection_fields());
+    connection_fields.push(json!({"name":"tenant_id","label":"Tenant ID (optional)","input_type":"text","required":false,"secret":false,"editable":true,"placeholder":"X-Scope-OrgID"}));
     IntegrationDescriptor {
         id: "loki",
         display_name: "Grafana Loki",
         icon: "loki",
         query_language: "LogQL",
         description: "Read-only log queries over Loki streams",
-        connection_fields: vec![
-            json!({"name":"url","label":"URL","input_type":"url","required":true,"secret":false,"editable":true,"placeholder":"http://localhost:3100"}),
-            json!({"name":"auth_type","label":"Authentication","input_type":"select","required":false,"secret":false,"editable":true,"group":"authentication","placeholder":"","options":[{"value":"none","label":"None"},{"value":"basic","label":"Basic"},{"value":"bearer","label":"Bearer token"}]}),
-            json!({"name":"username","label":"Username","input_type":"text","required":true,"secret":true,"editable":true,"group":"credentials","placeholder":"","visible_when":{"field":"auth_type","value":"basic"}}),
-            json!({"name":"password","label":"Password","input_type":"password","required":true,"secret":true,"editable":true,"group":"credentials","placeholder":"","visible_when":{"field":"auth_type","value":"basic"}}),
-            json!({"name":"bearer_token","label":"Bearer token","input_type":"password","required":true,"secret":true,"editable":true,"group":"credentials","placeholder":"","visible_when":{"field":"auth_type","value":"bearer"}}),
-            json!({"name":"tenant_id","label":"Tenant ID (optional)","input_type":"text","required":false,"secret":false,"editable":true,"placeholder":"X-Scope-OrgID"}),
-        ],
+        connection_fields,
         query: json!({"placeholder":"Enter a LogQL query, e.g. {app=\"api\"} |= \"error\"","default_query":"{}","field_query":"{query}","identifier_quote":"","help":"LogQL query runs against the selected Loki log dataset","document_mode":"inline","sort_requires_projection":false,"histogram_total_from_buckets":false,"schema_label":"Loki stream labels"}),
         explore_modes: vec!["logs"],
     }
@@ -50,10 +49,7 @@ pub fn descriptor() -> IntegrationDescriptor {
 #[derive(Clone)]
 pub struct LokiSettings {
     pub url: Url,
-    pub auth_type: String,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub bearer_token: Option<String>,
+    pub auth: HttpAuth,
     pub tenant_id: Option<String>,
 }
 
@@ -61,10 +57,7 @@ pub struct LokiSettings {
 pub struct LokiClient {
     base_url: Url,
     client: Client,
-    auth_type: &'static str,
-    username: Option<String>,
-    password: Option<String>,
-    bearer_token: Option<String>,
+    auth: HttpAuth,
     tenant_id: Option<String>,
 }
 
@@ -84,6 +77,8 @@ pub enum LokiError {
     ClientConfiguration,
     #[error("Loki request could not be completed")]
     Request,
+    #[error("Loki authentication could not obtain a token")]
+    Authentication,
     #[error("Loki rejected the request with HTTP {status}")]
     Rejected { status: u16 },
     #[error("Loki returned an invalid response")]
@@ -123,34 +118,6 @@ impl LokiClient {
         {
             return Err(LokiError::InvalidUrl);
         }
-        let (auth_type, username, password, bearer_token) = match settings.auth_type.as_str() {
-            "none" if settings.username.is_none()
-                && settings.password.is_none()
-                && settings.bearer_token.is_none() => ("none", None, None, None),
-            "basic"
-                if settings.username.as_deref().is_some_and(|value| !value.trim().is_empty())
-                    && settings.password.as_deref().is_some_and(|value| !value.is_empty())
-                    && settings.bearer_token.is_none() =>
-            {
-                (
-                    "basic",
-                    settings.username,
-                    settings.password,
-                    None,
-                )
-            }
-            "bearer"
-                if settings.username.is_none()
-                    && settings.password.is_none()
-                    && settings
-                        .bearer_token
-                        .as_deref()
-                        .is_some_and(|value| !value.trim().is_empty()) =>
-            {
-                ("bearer", None, None, settings.bearer_token)
-            }
-            _ => return Err(LokiError::InvalidConfiguration),
-        };
         let tenant_id = settings.tenant_id.filter(|value| !value.trim().is_empty());
         if tenant_id
             .as_deref()
@@ -158,30 +125,25 @@ impl LokiClient {
         {
             return Err(LokiError::InvalidConfiguration);
         }
-        let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(Policy::none())
-            .build()
+        let client = crate::data_connectors::shared_http_client(REQUEST_TIMEOUT)
             .map_err(|_| LokiError::ClientConfiguration)?;
         Ok(Self {
             base_url: settings.url,
             client,
-            auth_type,
-            username,
-            password,
-            bearer_token,
+            auth: settings.auth,
             tenant_id,
         })
     }
 
     pub async fn test_connection(&self) -> Result<(), LokiError> {
         let response = self
-            .request("loki/api/v1/labels")?
+            .request("loki/api/v1/labels")
+            .await?
             .query(&[("limit", "1")])
             .send()
             .await
             .map_err(|_| LokiError::Request)?;
-        let body = read_bounded(response).await?;
+        let body = self.read_bounded(response).await?;
         let response: Value =
             serde_json::from_slice(&body).map_err(|_| LokiError::InvalidResponse)?;
         validate_success(&response)?;
@@ -194,11 +156,12 @@ impl LokiClient {
     ) -> Result<Vec<crate::data_connectors::FieldSummary>, LokiError> {
         validate_index(index)?;
         let response = self
-            .request("loki/api/v1/labels")?
+            .request("loki/api/v1/labels")
+            .await?
             .send()
             .await
             .map_err(|_| LokiError::Request)?;
-        let body = read_bounded(response).await?;
+        let body = self.read_bounded(response).await?;
         let response: Value =
             serde_json::from_slice(&body).map_err(|_| LokiError::InvalidResponse)?;
         validate_success(&response)?;
@@ -230,10 +193,7 @@ impl LokiClient {
         Ok(fields)
     }
 
-    pub async fn search(
-        &self,
-        request: crate::search::SearchRequest,
-    ) -> Result<Value, LokiError> {
+    pub async fn search(&self, request: crate::search::SearchRequest) -> Result<Value, LokiError> {
         validate_index(&request.index)?;
         if request.size == 0 || request.size > MAX_PAGE_SIZE {
             return Err(LokiError::InvalidQuery);
@@ -244,7 +204,10 @@ impl LokiClient {
             return Err(LokiError::InvalidQuery);
         }
         let offset = cursor_offset(request.cursor.as_deref(), request.from)?;
-        if request.sort_order.as_deref().is_some_and(|order| order != "asc" && order != "desc")
+        if request
+            .sort_order
+            .as_deref()
+            .is_some_and(|order| order != "asc" && order != "desc")
             || request
                 .sort_by
                 .as_deref()
@@ -282,19 +245,25 @@ impl LokiClient {
             ("timeout".to_owned(), QUERY_TIMEOUT.to_owned()),
         ];
         let response = self
-            .request("loki/api/v1/query_range")?
+            .request("loki/api/v1/query_range")
+            .await?
             .query(&params)
             .send()
             .await
             .map_err(|_| LokiError::Request)?;
-        let body = read_bounded(response).await?;
-        let response: Value = serde_json::from_slice(&body).map_err(|_| LokiError::InvalidResponse)?;
+        let body = self.read_bounded(response).await?;
+        let response: Value =
+            serde_json::from_slice(&body).map_err(|_| LokiError::InvalidResponse)?;
         validate_success(&response)?;
         let data = response.get("data").ok_or(LokiError::InvalidResponse)?;
         if data.get("resultType").and_then(Value::as_str) != Some("streams") {
             return Err(LokiError::InvalidResponse);
         }
-        let mut entries = parse_streams(data.get("result").and_then(Value::as_array).ok_or(LokiError::InvalidResponse)?)?;
+        let mut entries = parse_streams(
+            data.get("result")
+                .and_then(Value::as_array)
+                .ok_or(LokiError::InvalidResponse)?,
+        )?;
         if entries.len() >= MAX_RETURNED_ENTRIES {
             return Err(LokiError::TooManyEntries);
         }
@@ -319,8 +288,16 @@ impl LokiClient {
                 histogram_unavailable_reason = Some("Loki histograms currently support UTC only.");
             } else {
                 let range = request.time_range.unwrap_or(TimeRange {
-                    start: entries.iter().map(|entry| entry.timestamp).min().unwrap_or(0),
-                    end: entries.iter().map(|entry| entry.timestamp).max().unwrap_or(0),
+                    start: entries
+                        .iter()
+                        .map(|entry| entry.timestamp)
+                        .min()
+                        .unwrap_or(0),
+                    end: entries
+                        .iter()
+                        .map(|entry| entry.timestamp)
+                        .max()
+                        .unwrap_or(0),
                 });
                 let (buckets, interval) = sample_histogram(&entries, range, &options)?;
                 histogram = buckets;
@@ -359,7 +336,7 @@ impl LokiClient {
         Ok(result)
     }
 
-    fn request(&self, path: &str) -> Result<reqwest::RequestBuilder, LokiError> {
+    async fn request(&self, path: &str) -> Result<reqwest::RequestBuilder, LokiError> {
         let mut endpoint = self.base_url.clone();
         let mut segments = endpoint
             .path_segments_mut()
@@ -369,27 +346,24 @@ impl LokiClient {
             segments.push(segment);
         }
         drop(segments);
-        let mut request = self.client.get(endpoint);
-        request = match self.auth_type {
-            "basic" => request.basic_auth(
-                self.username.as_deref().unwrap_or_default(),
-                self.password.as_deref(),
-            ),
-            "bearer" => {
-                let token = self.bearer_token.as_deref().ok_or(LokiError::InvalidConfiguration)?;
-                let mut value = header::HeaderValue::from_str(&format!("Bearer {token}"))
-                    .map_err(|_| LokiError::InvalidConfiguration)?;
-                value.set_sensitive(true);
-                request.header(header::AUTHORIZATION, value)
-            }
-            _ => request,
-        };
+        let mut request = self
+            .auth
+            .authorize(self.client.get(endpoint))
+            .await
+            .map_err(|_| LokiError::Authentication)?;
         if let Some(tenant_id) = self.tenant_id.as_deref() {
             let value = header::HeaderValue::from_str(tenant_id)
                 .map_err(|_| LokiError::InvalidConfiguration)?;
             request = request.header("X-Scope-OrgID", value);
         }
         Ok(request)
+    }
+
+    async fn read_bounded(&self, response: Response) -> Result<Vec<u8>, LokiError> {
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.auth.invalidate();
+        }
+        read_bounded(response).await
     }
 }
 
@@ -442,8 +416,8 @@ fn parse_streams(streams: &[Value]) -> Result<Vec<LogEntry>, LokiError> {
                 timestamp.div_euclid(1_000_000_000),
                 timestamp.rem_euclid(1_000_000_000) as u32,
             )
-                .ok_or(LokiError::InvalidResponse)?
-                .to_rfc3339_opts(SecondsFormat::Nanos, true);
+            .ok_or(LokiError::InvalidResponse)?
+            .to_rfc3339_opts(SecondsFormat::Nanos, true);
             let mut source = labels.clone();
             source.insert("_time".to_owned(), json!(time));
             source.insert("_msg".to_owned(), json!(line));
@@ -463,7 +437,11 @@ fn parse_streams(streams: &[Value]) -> Result<Vec<LogEntry>, LokiError> {
     Ok(entries)
 }
 
-fn compare_entries(left: &LogEntry, right: &LogEntry, request: &crate::search::SearchRequest) -> Ordering {
+fn compare_entries(
+    left: &LogEntry,
+    right: &LogEntry,
+    request: &crate::search::SearchRequest,
+) -> Ordering {
     let field = request.sort_by.as_deref().unwrap_or("_time");
     let mut ordering = match (left.source.get(field), right.source.get(field)) {
         (Some(Value::String(left)), Some(Value::String(right))) if field == "_time" => {
@@ -489,9 +467,7 @@ fn sample_histogram(
     let interval = options
         .interval
         .or_else(|| {
-            HistogramInterval::automatic(
-                range.end.saturating_sub(range.start).max(1) as f64,
-            )
+            HistogramInterval::automatic(range.end.saturating_sub(range.start).max(1) as f64)
         })
         .ok_or(LokiError::InvalidQuery)?;
     let millis = interval.approximate_millis();
@@ -503,7 +479,10 @@ fn sample_histogram(
     }
     let mut buckets = BTreeMap::<i64, BucketCounts>::new();
     for index in 0..count {
-        buckets.insert(start.saturating_add(index.saturating_mul(millis)), BucketCounts::default());
+        buckets.insert(
+            start.saturating_add(index.saturating_mul(millis)),
+            BucketCounts::default(),
+        );
     }
     let mut key_totals = HashMap::<String, u64>::new();
     for entry in entries {
@@ -550,7 +529,10 @@ fn sample_histogram(
             }
         })
         .collect();
-    Ok((histogram, format!("{}{}", interval.count, interval.suffix())))
+    Ok((
+        histogram,
+        format!("{}{}", interval.count, interval.suffix()),
+    ))
 }
 
 fn validate_success(response: &Value) -> Result<(), LokiError> {
@@ -589,13 +571,11 @@ fn cursor_offset(cursor: Option<&str>, from: usize) -> Result<u64, LokiError> {
     match cursor {
         None if from <= 10_000 => Ok(from as u64),
         Some("") => Ok(0),
-        Some(token) if token.len() <= 4 && token.bytes().all(|byte| byte.is_ascii_digit()) => {
-            token
-                .parse::<u64>()
-                .ok()
-                .filter(|offset| *offset <= MAX_CURSOR_OFFSET)
-                .ok_or(LokiError::InvalidQuery)
-        }
+        Some(token) if token.len() <= 4 && token.bytes().all(|byte| byte.is_ascii_digit()) => token
+            .parse::<u64>()
+            .ok()
+            .filter(|offset| *offset <= MAX_CURSOR_OFFSET)
+            .ok_or(LokiError::InvalidQuery),
         _ => Err(LokiError::InvalidQuery),
     }
 }
@@ -609,32 +589,49 @@ mod tests {
     fn client(url: &str) -> LokiClient {
         LokiClient::new(LokiSettings {
             url: Url::parse(url).unwrap(),
-            auth_type: "none".to_owned(),
-            username: None,
-            password: None,
-            bearer_token: None,
+            auth: HttpAuth::None,
             tenant_id: None,
         })
         .unwrap()
     }
 
     #[test]
-    fn auth_configuration_rejects_mixed_or_partial_credentials() {
-        for (auth_type, username, password, bearer_token) in [
-            ("basic", Some("user".to_owned()), None, None),
-            ("bearer", None, None, Some("   ".to_owned())),
-            ("none", None, None, Some("token".to_owned())),
+    fn auth_configuration_rejects_partial_credentials() {
+        for config in [
+            json!({"auth_type":"basic","username":" "}),
+            json!({"auth_type":"bearer","bearer_token":" "}),
         ] {
-            assert!(LokiClient::new(LokiSettings {
-                url: Url::parse("http://localhost:3100").unwrap(),
-                auth_type: auth_type.to_owned(),
-                username,
-                password,
-                bearer_token,
-                tenant_id: None,
-            })
-            .is_err());
+            assert!(HttpAuth::from_config(config.as_object().unwrap()).is_err());
         }
+    }
+
+    #[test]
+    fn oauth_edits_retain_secrets_and_auth_switch_clears_them() {
+        let existing = json!({"auth_type":"oauth2","oauth_token_url":"https://idp.example/token","oauth_client_id":"client","oauth_client_secret":"secret","oauth_scopes":"logs:read"});
+        let update = json!({"auth_type":"oauth2","oauth_audience":"logs"});
+        let descriptor = descriptor();
+        let edited = crate::data_connectors::editable_configuration(
+            &descriptor,
+            existing.as_object().unwrap(),
+            update.as_object().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(edited["oauth_client_id"], "client");
+        assert_eq!(edited["oauth_client_secret"], "secret");
+        let public = crate::data_connectors::public_configuration(&descriptor, &edited);
+        assert!(
+            !public.contains_key("oauth_client_id") && !public.contains_key("oauth_client_secret")
+        );
+        let switched = crate::data_connectors::editable_configuration(
+            &descriptor,
+            &edited,
+            json!({"auth_type":"none"}).as_object().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !switched.contains_key("oauth_client_id")
+                && !switched.contains_key("oauth_client_secret")
+        );
     }
 
     #[test]
@@ -643,6 +640,45 @@ mod tests {
         assert_eq!(descriptor.id, "loki");
         assert_eq!(descriptor.query_language, "LogQL");
         assert_eq!(descriptor.query["document_mode"], "inline");
+    }
+
+    #[tokio::test]
+    async fn oauth_requests_include_tenant_and_refresh_after_unauthorized() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"access_token":"access-token","token_type":"Bearer","expires_in":3600}),
+            ))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path("/loki/api/v1/labels"))
+            .and(matchers::header("authorization", "Bearer access-token"))
+            .and(matchers::header("x-scope-orgid", "tenant-a"))
+            .respond_with(move |_: &wiremock::Request| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(401)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({"status":"success","data":[]}))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let config = json!({"url":server.uri(),"auth_type":"oauth2","oauth_token_url":format!("{}/token", server.uri()),"oauth_client_id":"client-id","oauth_client_secret":"client-secret","tenant_id":"tenant-a"});
+        let connector = connect(config.as_object().unwrap()).unwrap();
+        assert!(connector.test_connection().await.is_err());
+        connector.test_connection().await.unwrap();
+        let public = Value::Object(connector.public_configuration()).to_string();
+        assert!(!public.contains("client-id") && !public.contains("client-secret"));
     }
 
     #[test]
@@ -682,7 +718,9 @@ mod tests {
             "time_range":{"start":86400000i64,"end":86402000i64}
         }))
         .unwrap();
-        let result = Connector::search(&client(&server.uri()), request).await.unwrap();
+        let result = Connector::search(&client(&server.uri()), request)
+            .await
+            .unwrap();
         assert_eq!(result["total"], 3);
         assert_eq!(result["total_relation"], "eq");
         assert_eq!(result["hits"].as_array().unwrap().len(), 2);
