@@ -45,7 +45,8 @@ jobs:
             --budget 1200 \
             --max-minutes 30 \
             --max-continues 2 \
-            --fail-on pipeline-error \
+            --repeat 2 \
+            --fail-on any \
             --summary-file /reports/summary.md
       - name: Capture failure diagnostics
         if: failure()

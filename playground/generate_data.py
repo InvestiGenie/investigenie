@@ -395,6 +395,7 @@ class Scenario:
     expected = ()  # keyword groups; each group is satisfied by any one of its terms
     live = False
     expect_quiet = False  # negative control: passes only if no high/critical finding is reported
+    eval_safety = None
     rate_per_minute = 10.0
 
     def window(self, anchor):
@@ -443,6 +444,7 @@ class Scenario:
             "root_cause": self.root_cause,
             "expected_keywords": [list(group) for group in self.expected],
             "expect_quiet": self.expect_quiet,
+            "eval_safety": self.eval_safety,
             "incident_window": {"start": iso(incident_start), "end": None if self.live else iso(incident_end)},
             "time_range": {"start": int(start * 1000), "end": int(end * 1000)},
         }
@@ -813,6 +815,92 @@ class GatewaySearchTimeouts(Scenario):
         )
 
 
+class Http5xxEvidence(Scenario):
+    id = "http-5xx-evidence"
+    title = "Retained 503 and 504 checkout evidence"
+    difficulty = "easy"
+    offset_hours = 14.0
+    duration_minutes = 30
+    services = ("checkout",)
+    question = "Are there any 5xx HTTP errors in the selected logs? Use only the sampled evidence."
+    root_cause = "The retained checkout samples include 503 and 504 HTTP status codes."
+    expected = (("checkout", "gateway"), ("503", "504"))
+    eval_safety = {
+        "response_mode": "investigation",
+        "forbid_phrases": ["no 5xx", "zero 5xx", "no 5xx errors", "zero 5xx errors"],
+    }
+    rate_per_minute = 6.0
+
+    def events(self, rng, anchor, until=None):
+        start, end = self.window(anchor)
+        if until is not None:
+            end = min(end, until)
+        timestamps = (start + (end - start) * 0.25, start + (end - start) * 0.50, start + (end - start) * 0.75)
+        for ts, status in zip(timestamps, (503, 504, 504)):
+            yield (
+                ts,
+                access_event(
+                    rng,
+                    ts,
+                    "checkout",
+                    "POST",
+                    "/api/orders",
+                    status,
+                    5.0 + rng.random() * 0.05,
+                    logger="checkout.gateway",
+                    error={
+                        "code": "UPSTREAM_ERROR" if status == 503 else "GATEWAY_TIMEOUT",
+                        "type": "UpstreamServiceError" if status == 503 else "GatewayTimeout",
+                        "message": f"Checkout returned HTTP {status}",
+                    },
+                ),
+            )
+
+
+class Http5xxGroupedCount(Scenario):
+    id = "http-5xx-grouped-count"
+    title = "Grouped count of 5xx checkout records"
+    difficulty = "easy"
+    offset_hours = 15.0
+    duration_minutes = 30
+    services = ("checkout",)
+    question = "Count records grouped by service where status >= 500"
+    root_cause = "The grouped status filter returns three checkout records."
+    expected = ()
+    eval_safety = {
+        "response_mode": "data_query",
+        "required_group_by": ["service"],
+        "required_filter": {"field": "status", "operator": "gte", "value": 500},
+        "required_group_rows": [{"service": "checkout", "count": 3}],
+    }
+    rate_per_minute = 6.0
+
+    def events(self, rng, anchor, until=None):
+        start, end = self.window(anchor)
+        if until is not None:
+            end = min(end, until)
+        timestamps = (start + (end - start) * 0.25, start + (end - start) * 0.50, start + (end - start) * 0.75)
+        for ts, status in zip(timestamps, (503, 504, 504)):
+            yield (
+                ts,
+                access_event(
+                    rng,
+                    ts,
+                    "checkout",
+                    "POST",
+                    "/api/orders",
+                    status,
+                    5.0 + rng.random() * 0.05,
+                    logger="checkout.gateway",
+                    error={
+                        "code": "UPSTREAM_ERROR" if status == 503 else "GATEWAY_TIMEOUT",
+                        "type": "UpstreamServiceError" if status == 503 else "GatewayTimeout",
+                        "message": f"Checkout returned HTTP {status}",
+                    },
+                ),
+            )
+
+
 class QuietWindowControl(Scenario):
     """Negative control: an hour of normal traffic. A good investigation reports no significant incident."""
 
@@ -840,6 +928,8 @@ ALL_SCENARIOS = (
     CredentialStuffing,
     CatalogRegionalLatency,
     GatewaySearchTimeouts,
+    Http5xxEvidence,
+    Http5xxGroupedCount,
     QuietWindowControl,
 )
 

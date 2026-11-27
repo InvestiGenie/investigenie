@@ -12,6 +12,7 @@ pub enum KnowledgeKind {
     Runbook,
     ResolvedIncident,
     InvestigationPlaybook,
+    Dashboard,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

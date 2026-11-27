@@ -38,6 +38,20 @@ class CorpusTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             gd.select_scenarios("no-such-scenario", 7)
 
+    def test_ai_safety_scenarios_have_structured_expectations(self):
+        scenarios = {scenario.id: scenario for scenario in gd.select_scenarios("all", 7)}
+        evidence = scenarios["http-5xx-evidence"]
+        grouped = scenarios["http-5xx-grouped-count"]
+
+        self.assertEqual(evidence.ground_truth(ANCHOR)["eval_safety"]["response_mode"], "investigation")
+        self.assertIn("no 5xx", evidence.ground_truth(ANCHOR)["eval_safety"]["forbid_phrases"])
+        grouped_safety = grouped.ground_truth(ANCHOR)["eval_safety"]
+        self.assertEqual(len(scenario_events(evidence)), 3)
+        self.assertEqual(len(scenario_events(grouped)), 3)
+        self.assertEqual(grouped_safety["response_mode"], "data_query")
+        self.assertEqual(grouped_safety["required_filter"]["operator"], "gte")
+        self.assertEqual(grouped_safety["required_group_rows"], [{"service": "checkout", "count": 3}])
+
     def test_scenario_windows_do_not_overlap(self):
         windows = sorted(s.window(ANCHOR) for s in gd.select_scenarios("all", 7))
         for (_, end), (start, _) in zip(windows, windows[1:]):

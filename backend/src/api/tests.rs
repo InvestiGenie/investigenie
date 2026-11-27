@@ -4,6 +4,30 @@ use tower::ServiceExt;
 use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
+async fn dashboard_kind_round_trips_through_knowledge_storage() {
+    let (_directory, storage) = status_storage().await;
+    let app = router("http://localhost".parse().unwrap(), storage);
+    let body = json!({
+        "title":"Checkout operations",
+        "kind":"dashboard",
+        "status":"published",
+        "content":"{\"title\":\"Checkout operations\",\"source\":\"grafana\",\"panels\":[]}",
+        "tags":["dashboard","grafana"]
+    });
+    let response = app
+        .clone()
+        .oneshot(json_request("/api/knowledge", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(response.into_body(), 65_536).await.unwrap();
+    let created: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(created["entry"]["kind"], "dashboard");
+    assert_eq!(created["entry"]["status"], "published");
+    assert!(created["entry"]["content"].as_str().unwrap().contains("grafana"));
+}
+
+#[tokio::test]
 async fn knowledge_routes_manage_entries_and_enforce_revisions() {
     let (_directory, storage) = status_storage().await;
     let default_playbook = storage

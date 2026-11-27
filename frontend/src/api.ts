@@ -87,7 +87,7 @@ export type ApplicationSettings = {
   [key: string]: unknown;
 };
 
-export type KnowledgeKind = 'service_context' | 'runbook' | 'resolved_incident' | 'investigation_playbook';
+export type KnowledgeKind = 'service_context' | 'runbook' | 'resolved_incident' | 'investigation_playbook' | 'dashboard';
 export type KnowledgeStatus = 'draft' | 'published' | 'archived';
 export type InvestigationPlaybookStep = {
   name: string;

@@ -108,6 +108,54 @@ class OutcomeTests(unittest.TestCase):
                 self.assertEqual(row["provider_timeout_exhausted"], timeout_exhausted)
 
 
+class SafetyEvaluationTests(unittest.TestCase):
+    def test_rejects_5xx_contradiction_and_accepts_correct_result(self):
+        contradictory = {
+            "summary": "No 5xx errors were observed.",
+            "findings": [{"title": "No 5xx Errors", "detail": "The sample is clean."}],
+            "caveats": [],
+        }
+        correct = {
+            "response_mode": "investigation",
+            "summary": "The sample contains 503 and 504 statuses.",
+            "findings": [{"title": "5xx detected", "detail": "The checkout service returned 503 and 504."}],
+            "caveats": [],
+        }
+        scenario = {"eval_safety": {"response_mode": "investigation", "forbid_phrases": ["no 5xx", "zero 5xx"]}}
+
+        contradictory_passed, contradictory_checks = ai_eval.evaluate_safety(contradictory, scenario)
+        correct_passed, correct_checks = ai_eval.evaluate_safety(correct, scenario)
+
+        self.assertFalse(contradictory_passed)
+        self.assertTrue(correct_passed)
+        self.assertTrue(any(not check["passed"] for check in contradictory_checks))
+        self.assertTrue(all(check["passed"] for check in correct_checks))
+
+    def test_accepts_only_matching_typed_grouped_result(self):
+        result = {
+            "response_mode": "data_query",
+            "summary": "Found one duplicate group.",
+            "query_result": {
+                "group_by": ["service"],
+                "query": "status range gte 500 group by service",
+                "rows": [{"service": "checkout", "_ig_duplicate_count": 3}],
+            },
+        }
+        scenario = {
+            "eval_safety": {
+                "response_mode": "data_query",
+                "required_group_by": ["service"],
+                "required_filter": {"field": "status", "operator": "gte", "value": 500},
+                "required_group_rows": [{"service": "checkout", "count": 3}],
+            }
+        }
+
+        passed, checks = ai_eval.evaluate_safety(result, scenario)
+
+        self.assertTrue(passed)
+        self.assertEqual(len(checks), 4)
+
+
 class FollowUpModeTests(unittest.TestCase):
     def test_modes_expand_baseline_adaptive_comparison_in_order(self):
         self.assertEqual(ai_eval.selected_follow_up_modes("baseline"), ("baseline",))

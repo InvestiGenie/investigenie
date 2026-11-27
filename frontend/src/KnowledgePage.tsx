@@ -7,7 +7,7 @@ import { ErrorAlert, StatusNotice } from './PageFeedback';
 import { errorMessage } from './format';
 import { initialTimeZone } from './time';
 
-const kinds: Record<KnowledgeKind, string> = { service_context: 'Service context', runbook: 'Runbook', resolved_incident: 'Resolved incident', investigation_playbook: 'Investigation playbook' };
+const kinds: Record<KnowledgeKind, string> = { service_context: 'Service context', runbook: 'Runbook', resolved_incident: 'Resolved incident', investigation_playbook: 'Investigation playbook', dashboard: 'Dashboard' };
 const statuses: Record<KnowledgeStatus, string> = { draft: 'Draft', published: 'Published', archived: 'Archived' };
 type KnowledgeForm = Omit<KnowledgeInput, 'services' | 'environments' | 'tags' | 'source_url' | 'steps'> & { services: string; environments: string; tags: string; source_url: string; steps: InvestigationPlaybookStep[] };
 

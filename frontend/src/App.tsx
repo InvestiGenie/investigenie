@@ -18,13 +18,14 @@ const TracesExplore = lazy(() => import('./MetricsExplore').then((module) => ({ 
 const InvestiGenieAIPage = lazy(() => import('./InvestiGenieAIPage'));
 const AIModelsPage = lazy(() => import('./AIModelsPage'));
 const KnowledgePage = lazy(() => import('./KnowledgePage'));
+const DashboardPage = lazy(() => import('./DashboardPage'));
 
 type Theme = 'light' | 'dark';
 type ExploreMode = 'logs' | 'metrics' | 'traces';
-type AppPage = 'discover' | 'investigenie-ai' | 'connections' | 'data-views' | 'ai-models' | 'knowledge';
+type AppPage = 'discover' | 'dashboard' | 'investigenie-ai' | 'connections' | 'data-views' | 'ai-models' | 'knowledge';
 
 const APP_PAGE_HISTORY_KEY = 'investigeniePage';
-const APP_PAGES = new Set<AppPage>(['discover', 'investigenie-ai', 'connections', 'data-views', 'ai-models', 'knowledge']);
+const APP_PAGES = new Set<AppPage>(['discover', 'dashboard', 'investigenie-ai', 'connections', 'data-views', 'ai-models', 'knowledge']);
 
 function appPageFromHistoryState(state: unknown): AppPage | null {
   if (typeof state !== 'object' || state === null || Array.isArray(state)) return null;
@@ -503,7 +504,7 @@ export default function App() {
         <nav className="rail-nav" aria-label="Main menu">
           <button className={`rail-button${activePage === 'investigenie-ai' ? ' active' : ''}`} aria-label="InvestiGenie AI" title="InvestiGenie AI" onClick={() => navigateTo('investigenie-ai')}><span className="rail-icon" aria-hidden="true"><BrainCircuit size={19} /></span><span className="nav-label">InvestiGenie AI</span></button>
           <button className={`rail-button${activePage === 'discover' ? ' active' : ''}`} aria-label="Explore" title="Explore" onClick={() => navigateTo('discover')}><span className="rail-icon" aria-hidden="true">⌕</span><span className="nav-label">Explore</span></button>
-          <button className="rail-button" aria-label="Dashboard" title="Dashboard" disabled><span className="rail-icon" aria-hidden="true">▦</span><span className="nav-label">Dashboard</span></button>
+          <button className={`rail-button${activePage === 'dashboard' ? ' active' : ''}`} aria-label="Dashboard" title="Dashboard" onClick={() => navigateTo('dashboard')}><span className="rail-icon" aria-hidden="true">▦</span><span className="nav-label">Dashboard</span></button>
           <div className="rail-nav-group" role="group" aria-label="Management">
             <span className="rail-group-label">Management</span>
             <button className={`rail-button${activePage === 'knowledge' ? ' active' : ''}`} aria-label="Knowledge" title="Knowledge" onClick={() => navigateTo('knowledge')}><span className="rail-icon" aria-hidden="true"><BookOpen size={18} /></span><span className="nav-label">Knowledge</span></button>
@@ -517,7 +518,7 @@ export default function App() {
 
       <div className="workspace">
         <header className="topbar">
-          <div className="breadcrumb"><h1 className="workspace-title">{activePage === 'knowledge' ? 'Knowledge' : activePage === 'connections' ? 'Connections' : activePage === 'data-views' ? 'Data Views' : activePage === 'ai-models' ? 'AI Models' : activePage === 'investigenie-ai' ? 'InvestiGenie AI' : 'Explore'}</h1></div>
+          <div className="breadcrumb"><h1 className="workspace-title">{activePage === 'dashboard' ? 'Dashboard' : activePage === 'knowledge' ? 'Knowledge' : activePage === 'connections' ? 'Connections' : activePage === 'data-views' ? 'Data Views' : activePage === 'ai-models' ? 'AI Models' : activePage === 'investigenie-ai' ? 'InvestiGenie AI' : 'Explore'}</h1></div>
           <div className="topbar-right"><button className="theme-toggle" type="button" aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`} aria-pressed={theme === 'dark'} title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`} onClick={() => setTheme((current) => current === 'light' ? 'dark' : 'light')}><span aria-hidden="true">{theme === 'light' ? '☾' : '☀'}</span></button></div>
         </header>
 
@@ -527,6 +528,8 @@ export default function App() {
             ? <Suspense fallback={<div className="loading-state"><span className="spinner dark" /> Loading AI models…</div>}><AIModelsPage /></Suspense>
           : activePage === 'knowledge'
             ? <Suspense fallback={<div className="loading-state" role="status">Loading knowledge...</div>}><KnowledgePage connections={connections} dataViews={dataViews} initialEntryId={knowledgeEntryId} onDirtyChange={(dirty) => { knowledgeDirty.current = dirty; }} /></Suspense>
+          : activePage === 'dashboard'
+            ? <Suspense fallback={<div className="loading-state">Loading dashboards...</div>}><DashboardPage connections={connections} dataViews={dataViews} /></Suspense>
           : activePage === 'connections'
           ? <ConnectionsPage connections={connections} onConnectionsChange={refreshConnections} />
           : activePage === 'data-views'

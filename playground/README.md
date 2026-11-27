@@ -59,6 +59,8 @@ After seeding, the seeder keeps writing live traffic, about 2 events per second,
 | `identity-credential-stuffing` | ~8 h ago, 35 min | easy | Is anything suspicious happening with customer logins? |
 | `catalog-eu-slow-queries` | ~3 h ago, 55 min | medium | Users say product pages are very slow. Why? |
 | `gateway-search-timeouts` | **ongoing** (live) | easy | Why are search requests failing right now? (default last-30-minutes range) |
+| `http-5xx-evidence` | ~14 h ago, 30 min | easy | Are there any 5xx HTTP errors in the selected logs? |
+| `http-5xx-grouped-count` | ~15 h ago, 30 min | easy | Count records grouped by service where status >= 500 |
 | `control-quiet-window` | ~30 h ago, 60 min | control | Were there any significant incidents or outages during this period? (normal traffic only; a good answer reports nothing serious) |
 
 `/scenarios` returns the exact time range for each scenario, the expected root cause and the scoring keywords. The setup log prints the time ranges in UTC. All times are relative to when the corpus was first seeded. Restarts keep the same corpus.
@@ -70,6 +72,8 @@ After seeding, the seeder keeps writing live traffic, about 2 events per second,
 - **identity-credential-stuffing:** `203.0.113.77` (`python-requests`) tried many accounts. Most attempts got 401, then 429 rate limiting, and some accounts were locked.
 - **catalog-eu-slow-queries:** only `eu-west-1` was affected. Read replica `catalog-db-eu-2` ran slow queries of 2-6 s, and some requests got 504 timeouts.
 - **gateway-search-timeouts:** `api-gateway` returns 504 for `/api/v1/search` because upstream `catalog-search` times out.
+- **http-5xx-evidence:** the retained checkout samples contain exactly one 503 and two 504 responses; a no-5xx conclusion is contradicted by the evidence.
+- **http-5xx-grouped-count:** a typed grouped-count query over `status >= 500` returns exactly three checkout rows; a broad or unfiltered query is wrong.
 - **control-quiet-window:** nothing. Only normal 4xx noise and isolated, unrelated 5xx responses.
 
 </details>
@@ -122,14 +126,14 @@ For each model and scenario, the harness does the following:
 1. Starts a background investigation through the public API, using the scenario's question and time range.
 2. Follows its progress.
 3. Answers check-in pauses with "continue", up to `--max-continues` times.
-4. Scores the final summary and findings against the scenario's keyword groups. A scenario passes when every group matches. The keywords are evidence only the data contains (the IP, the version, the replica name), never words from the question, so an answer that just restates the question scores zero. The `control-quiet-window` scenario passes only if no finding is rated high or critical, which catches models that invent incidents.
+4. Scores the final summary and findings against the scenario's keyword groups. A scenario passes when every group matches and its structured safety checks pass. Safety checks cover forbidden 5xx contradictions and exact response mode, grouped fields, filters, and rows. The keywords are evidence only the data contains (the IP, the version, the replica name), never words from the question, so an answer that just restates the question scores zero. The `control-quiet-window` scenario passes only if no finding is rated high or critical, which catches models that invent incidents.
 5. Deletes the investigation from the AI history. InvestiGenie keeps the 64 most recently updated conversations, so eval runs would otherwise push your own investigations out. Pass `--keep-history` to inspect runs in the UI.
 
 `--follow-up-mode baseline` is the current default bounded flow. `adaptive` opts into at most one metadata-validated follow-up query per investigation. `both` runs each selected model/scenario twice in a stable baseline-then-adaptive order and labels every JSON/Markdown report row; expect roughly twice the model calls and cost. Use the same seeded corpus, Data Views, models, and repeated runs when comparing modes.
 
 Each failure is classified as a `wrong-answer` (completed but missed the root cause), `incomplete` (stopped or partial) or `pipeline-error` (timeout, unparseable model output, provider error). This separates "the model reasoned badly" from "the model or the flow broke".
 
-`--fail-on pipeline-error` makes the exit code depend only on the flow breaking, not on wrong answers. The nightly `playground-eval.yml` workflow uses that with `qwen2.5:1.5b` as a CPU-friendly flow smoke test, not an answer-quality gate. The 0.5B model triggered Ollama HTTP 500 errors during structured generation in repeated runs; the 1.5B comparison completed without pipeline errors. In GitHub Actions the scorecard is also written to the job summary.
+`--fail-on pipeline-error` makes the exit code depend only on the flow breaking. `--fail-on any` includes wrong answers and safety failures. The nightly `playground-eval.yml` workflow uses `--repeat 2 --fail-on any` with `qwen2.5:1.5b` so repeated wrong answers and evidence contradictions fail instead of passing as a flow-only smoke test. In GitHub Actions the scorecard is also written to the job summary.
 
 The workflow uploads the JSON reports as the `playground-ai-evaluation` artifact. On failure, it also includes `services.log` with the last 200 log lines from each of InvestiGenie and Ollama, captured before teardown.
 

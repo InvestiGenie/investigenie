@@ -108,6 +108,61 @@ def score_quiet(result):
     return (0 if alarms else 1), 1, [{"no_high_severity_findings": not alarms, "flagged": alarms}]
 
 
+def evaluate_safety(result, scenario):
+    """Check response shapes and sample facts that keyword-only scoring cannot detect."""
+    safety = scenario.get("eval_safety") or {}
+    checks = []
+
+    required_mode = safety.get("response_mode")
+    if required_mode:
+        actual_mode = result.get("response_mode")
+        checks.append({"response_mode": actual_mode, "required": required_mode, "passed": actual_mode == required_mode})
+
+    text_parts = [result.get("summary", "")]
+    text_parts += [finding.get("title", "") + " " + finding.get("detail", "") for finding in result.get("findings", [])]
+    text_parts += result.get("caveats", [])
+    rendered_text = "\n".join(str(part) for part in text_parts).lower()
+    forbidden = []
+    for phrase in safety.get("forbid_phrases", []):
+        forbidden.append({"phrase": phrase, "present": phrase.lower() in rendered_text})
+    if forbidden:
+        checks.append({"forbidden_phrases": forbidden, "passed": not any(item["present"] for item in forbidden)})
+
+    query_result = result.get("query_result") or {}
+    required_groups = safety.get("required_group_by")
+    if required_groups:
+        actual_groups = query_result.get("group_by") or []
+        checks.append({"group_by": actual_groups, "required": required_groups, "passed": actual_groups == required_groups})
+
+    required_filter = safety.get("required_filter")
+    if required_filter:
+        query_text = str(query_result.get("query") or "").lower()
+        field = str(required_filter["field"]).lower()
+        operator = str(required_filter["operator"]).lower()
+        value = str(required_filter["value"]).lower()
+        filter_passed = field in query_text and operator in query_text and value in query_text
+        checks.append({"filter": required_filter, "query": query_text, "passed": filter_passed})
+
+    required_rows = safety.get("required_group_rows")
+    if required_rows:
+        rows = query_result.get("rows") or []
+        row_passed = True
+        normalized_rows = []
+        for required in required_rows:
+            count_field = required.get("count_field", "_ig_duplicate_count")
+            matching = [
+                row for row in rows
+                if all(row.get(field) == value for field, value in required.items() if field != "count_field" and field != "count")
+                and int(row.get(count_field, 0)) == int(required["count"])
+            ]
+            normalized_rows.append({"required": required, "matched": bool(matching)})
+            row_passed = row_passed and bool(matching)
+        checks.append({"rows": normalized_rows, "passed": row_passed})
+
+    passed = all(check["passed"] for check in checks)
+    return passed, checks
+
+
 def investigation_passed(status, result, matched, total):
     return status == "completed" and result.get("complete") is True and matched == total
 
@@ -201,7 +256,9 @@ def run_one(model, scenario, data_views, args, follow_up_mode="baseline"):
         matched, total, groups = score_quiet(result) if result else (0, 1, [])
     else:
         matched, total, groups = score(result, scenario["expected_keywords"]) if result else (0, len(scenario["expected_keywords"]), [])
-    passed = investigation_passed(job["status"], result, matched, total)
+    keyword_passed = investigation_passed(job["status"], result, matched, total)
+    safety_passed, safety_checks = evaluate_safety(result, scenario)
+    passed = keyword_passed and safety_passed
     tokens = sum((usage.get("total_tokens") or 0) for usage in result.get("token_usage", []))
     sources = result.get("sources", [])
     source_queries = sum(source.get("batches_processed") or 0 for source in sources)
@@ -231,6 +288,9 @@ def run_one(model, scenario, data_views, args, follow_up_mode="baseline"):
         "score": matched,
         "max_score": total,
         "passed": passed,
+        "keyword_passed": keyword_passed,
+        "safety_passed": safety_passed,
+        "safety_checks": safety_checks,
         "outcome": outcome_kind(job["status"], result, passed, provider_timeout_exhausted),
         "provider_timeout_exhausted": provider_timeout_exhausted,
         "keyword_groups": groups,
@@ -256,7 +316,7 @@ def write_markdown_summary(path, truth, models, results):
         "",
         "| model | mode | scenario | result | keywords | queries | adaptive | citations | seconds | tokens |",
     ]
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for row in results:
         verdict = "pass" if row["passed"] else row["outcome"]
         summary_cells = [
@@ -265,6 +325,7 @@ def write_markdown_summary(path, truth, models, results):
             row["scenario"],
             verdict,
             f"{row['score']}/{row['max_score']}",
+            "pass" if row.get("safety_passed", True) else "fail",
             row.get("total_queries") or 0,
             row.get("adaptive_followup_queries") or 0,
             row.get("sample_citations") or 0,

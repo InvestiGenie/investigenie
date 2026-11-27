@@ -11,6 +11,7 @@ React 19 + TypeScript + Vite in `frontend/`. No router and no state library: `Ap
 | `InvestiGenieAIPage.tsx` | Ask a question over 1–5 Data Views; playbook aggregation evidence; saved conversation history and retention; follow-ups; timeout/check-in settings; live progress and findings. |
 | `AIModelsPage.tsx` | Add, edit, and remove AI provider profiles. |
 | `KnowledgePage.tsx` | Search/filter, read, create, and manage knowledge entries, including editable Investigation Playbook steps. |
+| `DashboardPage.tsx` | Saved dashboard list/editor, Grafana/Kibana export import, Data View panel mapping, and bounded panel execution. |
 | `ConnectionsPage.tsx`, `ConnectionStatus.tsx` | Connection forms built from integration metadata; live status badges. |
 | `DataViewsPage.tsx` | Create and edit Data Views (searchable index/table picker, time field, persisted Explore mode). |
 | `HistogramChart.tsx`, `histogram.ts` | SVG histogram: intervals, ticks, breakdown stacks, tooltips, drag/click zoom. |
@@ -41,6 +42,10 @@ React 19 + TypeScript + Vite in `frontend/`. No router and no state library: `Ap
 - **Data Views:** choose Logs, Metrics, or a future Traces mode per view; the API accepts only modes advertised by that connection's descriptor. Metric-capable Prometheus and VictoriaMetrics views default to Metrics. The searchable index picker accepts wildcard/comma-separated Elasticsearch patterns and validates fields through the API. ClickHouse tables remain exact names. Connection controls come from integration metadata, including optional ClickHouse execution time; blank creation omits it, clearing on edit sends null.
 - **API address:** production builds call the same origin. The dev server calls `http://127.0.0.1:3000` (override with `VITE_API_BASE_URL`).
 - **Shared behavior:** `jsonMutation` in `api.ts` constructs JSON mutation bodies and quoted If-Match headers while routes remain explicit. Reuse `errorMessage`/`formatCount` from `format.ts` and `ErrorAlert`/`StatusNotice` from `PageFeedback.tsx`; keep specialized polling/decision flows separate.
+
+## Dashboard workflow
+
+The primary Dashboard page supports native dashboards and imports Grafana dashboard JSON plus Kibana saved-object NDJSON exports. Imports normalize panels to stat, time-series, table, and logs types. Each panel is mapped to an InvestiGenie Data View before execution; panels use existing bounded search APIs and keep source queries inspectable. Imported source expressions are preserved but are not sent directly to a datasource. Dashboards are stored as encrypted, revisioned `dashboard` Knowledge entries; updates require optimistic `If-Match` revisions.
 
 ## Knowledge workflow
 
