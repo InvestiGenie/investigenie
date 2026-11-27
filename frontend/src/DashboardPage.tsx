@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
-import { Grid2X2, Plus, RefreshCw, Save, Trash2, Upload } from 'lucide-react';
+import { ArrowLeft, BarChart3, Grid2X2, List, Pencil, Plus, RefreshCw, Save, Table2, Trash2, Upload } from 'lucide-react';
 import { api, type ConnectionSummary, type DataViewSummary, type KnowledgeEntry, type SearchResult } from './api';
 import { ErrorAlert, StatusNotice } from './PageFeedback';
 import { errorMessage } from './format';
+import HistogramChart from './HistogramChart';
 
 export type DashboardPanelType = 'stat' | 'timeseries' | 'table' | 'logs';
 export type DashboardPanel = {
@@ -124,6 +125,13 @@ export default function DashboardPage({ connections, dataViews }: Props) {
   const [notice, setNotice] = useState('');
   const [results, setResults] = useState<Record<string, SearchResult | null>>({});
   const [panelErrors, setPanelErrors] = useState<Record<string, string>>({});
+  const [panelLoading, setPanelLoading] = useState<Record<string, boolean>>({});
+  const panelRequests = useRef<Record<string, number>>({});
+  const [editing, setEditing] = useState<{ panel: DashboardPanel; isNew: boolean } | null>(null);
+  const [preview, setPreview] = useState<SearchResult | null>(null);
+  const [previewError, setPreviewError] = useState('');
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const previewVersion = useRef(0);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -139,9 +147,18 @@ export default function DashboardPage({ connections, dataViews }: Props) {
   }
 
   function chooseEntry(entry: KnowledgeEntry) {
+    const dashboard = dashboardFromEntry(entry);
     setSelected(entry);
-    setDraft(dashboardFromEntry(entry));
+    setDraft(dashboard);
+    resetPanelResults();
     setNotice(''); setError('');
+    dashboard.panels.forEach((panel) => { if (panel.data_view_id) void runPanel(panel); });
+  }
+
+  function resetPanelResults() {
+    previewVersion.current += 1;
+    panelRequests.current = {};
+    setEditing(null); setResults({}); setPanelErrors({}); setPanelLoading({});
   }
 
   async function importFile(event: ChangeEvent<HTMLInputElement>) {
@@ -151,6 +168,7 @@ export default function DashboardPage({ connections, dataViews }: Props) {
       const normalized = normalizeDashboardFile(await file.text());
       setSelected(null);
       setDraft(normalized.title ? normalized : { ...normalized, title: file.name.replace(/\.(json|ndjson)$/i, '') });
+      resetPanelResults();
       setNotice(`Imported ${normalized.panels.length} panel(s) from ${normalized.source}.`);
       setError('');
     } catch (reason) {
@@ -184,17 +202,31 @@ export default function DashboardPage({ connections, dataViews }: Props) {
       await api.removeKnowledge(selected.id, selected.revision);
       setSelected(null);
       setDraft({ title: '', source: 'native', panels: [] });
+      resetPanelResults();
       await refreshEntries();
       setNotice('Dashboard deleted.');
     } catch (reason) { setError(errorMessage(reason)); }
     finally { setBusy(false); }
   }
 
-  async function runPanel(panel: DashboardPanel) {
-    if (!panel.data_view_id) { setPanelErrors((current) => ({ ...current, [panel.id]: 'Choose a Data View.' })); return; }
+  async function runPanel(panel: DashboardPanel, isPreview = false) {
+    const version = isPreview ? ++previewVersion.current : 0;
+    const requests = panelRequests.current;
+    const requestVersion = isPreview ? 0 : (requests[panel.id] ?? 0) + 1;
+    if (!isPreview) requests[panel.id] = requestVersion;
+    const isCurrent = () => isPreview ? version === previewVersion.current : requests === panelRequests.current && requests[panel.id] === requestVersion;
+    const fail = (message: string) => {
+      if (!isCurrent()) return;
+      if (isPreview) { setPreviewError(message); setPreviewLoading(false); }
+      else { setPanelErrors((current) => ({ ...current, [panel.id]: message })); setPanelLoading((current) => ({ ...current, [panel.id]: false })); }
+    };
+    if (!panel.data_view_id) { fail('Choose a Data View.'); return; }
     const dataView = dataViews.find((view) => view.id === panel.data_view_id);
-    if (!dataView) { setPanelErrors((current) => ({ ...current, [panel.id]: 'The selected Data View is unavailable.' })); return; }
-    setPanelErrors((current) => ({ ...current, [panel.id]: '' }));
+    if (!dataView) { fail('The selected Data View is unavailable.'); return; }
+    const timeField = (panel.type === 'timeseries' ? panel.histogram_field?.trim() : '') || dataView.time_field?.trim();
+    if (!timeField) { fail('The selected Data View needs a time field to search the last 15 minutes.'); return; }
+    if (isPreview) { setPreviewError(''); setPreview(null); setPreviewLoading(true); }
+    else { setPanelErrors((current) => ({ ...current, [panel.id]: '' })); setPanelLoading((current) => ({ ...current, [panel.id]: true })); }
     const now = Date.now();
     const request = {
       index: dataView.index,
@@ -205,34 +237,76 @@ export default function DashboardPage({ connections, dataViews }: Props) {
       sort_order: 'desc' as const,
       time_range: { start: now - 15 * 60_000, end: now },
       include_histogram: panel.type === 'timeseries',
-      histogram_field: panel.type === 'timeseries' ? panel.histogram_field || dataView.time_field : undefined,
+      histogram_field: timeField,
     };
     const connection = connections.find((item) => item.id === dataView.connection_id);
-    if (!connection) { setPanelErrors((current) => ({ ...current, [panel.id]: 'The Data View connection is unavailable.' })); return; }
+    if (!connection) { fail('The Data View connection is unavailable.'); if (isPreview) setPreviewLoading(false); else setPanelLoading((current) => ({ ...current, [panel.id]: false })); return; }
     try {
-      setResults((current) => ({ ...current, [panel.id]: null }));
+      if (!isPreview) setResults((current) => ({ ...current, [panel.id]: null }));
       const result = await api.search(connection.id, request);
-      setResults((current) => ({ ...current, [panel.id]: result }));
+      if (isCurrent()) {
+        if (isPreview) setPreview(result);
+        else setResults((current) => ({ ...current, [panel.id]: result }));
+      }
     } catch (reason) {
-      setPanelErrors((current) => ({ ...current, [panel.id]: errorMessage(reason) }));
+      fail(errorMessage(reason));
+    } finally {
+      if (isCurrent()) {
+        if (isPreview) setPreviewLoading(false);
+        else setPanelLoading((current) => ({ ...current, [panel.id]: false }));
+      }
     }
   }
 
   const mappedCount = useMemo(() => draft.panels.filter((panel) => panel.data_view_id).length, [draft.panels]);
 
+  function openPanel(panel: DashboardPanel, isNew: boolean) {
+    previewVersion.current += 1;
+    setPreview(null); setPreviewError(''); setPreviewLoading(false);
+    setEditing({ panel: { ...panel }, isNew });
+  }
+
+  function updatePanel(changes: Partial<DashboardPanel>) {
+    previewVersion.current += 1;
+    setPreview(null); setPreviewError(''); setPreviewLoading(false);
+    setEditing((current) => current && { ...current, panel: { ...current.panel, ...changes } });
+  }
+
+  function addPanel() {
+    openPanel({ id: panelId('native', draft.panels.length), title: `Panel ${draft.panels.length + 1}`, type: 'timeseries', data_view_id: '', query: '' }, true);
+  }
+
+  function applyPanel() {
+    if (!editing) return;
+    const panel = { ...editing.panel, title: editing.panel.title.trim() || 'Untitled panel' };
+    panelRequests.current[panel.id] = (panelRequests.current[panel.id] ?? 0) + 1;
+    setDraft((current) => ({ ...current, panels: editing.isNew ? [...current.panels, panel] : current.panels.map((item) => item.id === panel.id ? panel : item) }));
+    setResults((current) => ({ ...current, [panel.id]: preview }));
+    setPanelErrors((current) => ({ ...current, [panel.id]: '' }));
+    setPanelLoading((current) => ({ ...current, [panel.id]: false }));
+    previewVersion.current += 1;
+    setEditing(null);
+  }
+
+  function panelResult(panel: DashboardPanel, result: SearchResult | null | undefined, panelError: string, loadingResult = false) {
+    if (panelError) return <p className="dashboard-panel-error" role="alert">{panelError}</p>;
+    if (loadingResult) return <p className="dashboard-panel-empty">Loading data...</p>;
+    if (!result) return <p className="dashboard-panel-empty">No data loaded</p>;
+    return <div className="dashboard-panel-result">{panel.type === 'stat' ? <strong>{result.total}{result.total_relation === 'gte' ? '+' : ''}</strong> : panel.type === 'timeseries' ? result.histogram?.length ? <div className="dashboard-chart"><HistogramChart data={result.histogram} /></div> : <p className="dashboard-panel-empty">No histogram available</p> : result.hits.length ? <table><tbody>{result.hits.slice(0, 10).map((hit) => <tr key={`${hit.index}:${hit.id}`}><td>{hit.index}</td><td>{JSON.stringify(hit.source)}</td></tr>)}</tbody></table> : <p className="dashboard-panel-empty">No results</p>}</div>;
+  }
+
   return <main className="connections-layout dashboard-layout">
-    <div className="connections-heading"><button className="search-button add-connection-button" onClick={() => { setSelected(null); setDraft({ title: '', source: 'native', panels: [] }); setNotice(''); setError(''); }}><Plus size={16} /> New dashboard</button><button className="quiet-button" onClick={() => fileRef.current?.click()}><Upload size={16} /> Import Grafana/Kibana</button><input ref={fileRef} type="file" accept=".json,.ndjson,application/json" hidden onChange={importFile} /></div>
+    <div className="connections-heading"><button className="search-button add-connection-button" onClick={() => { setSelected(null); setDraft({ title: '', source: 'native', panels: [] }); resetPanelResults(); setNotice(''); setError(''); }}><Plus size={16} /> New dashboard</button><button className="quiet-button" onClick={() => fileRef.current?.click()}><Upload size={16} /> Import Grafana/Kibana</button><input ref={fileRef} type="file" accept=".json,.ndjson,application/json" hidden onChange={importFile} /></div>
     {error && <ErrorAlert message={error} onDismiss={() => setError('')} />}{notice && <StatusNotice message={notice} />}
     <div className="dashboard-workspace">
       <aside className="dashboard-list"><h2>Dashboards</h2>{loading ? <p>Loading…</p> : entries.length === 0 ? <p className="connections-empty">No dashboards yet</p> : entries.map((entry) => <button key={entry.id} className={selected?.id === entry.id ? 'dashboard-list-item active' : 'dashboard-list-item'} onClick={() => chooseEntry(entry)}><Grid2X2 size={16} /><span>{entry.title}</span></button>)}</aside>
       <section className="dashboard-editor">
-        <div className="dashboard-toolbar"><input aria-label="Dashboard title" value={draft.title} placeholder="Dashboard title" onChange={(event) => setDraft((current) => ({ ...current, title: event.target.value }))} /><span>{draft.panels.length} panels · {mappedCount} mapped</span><span className="dashboard-toolbar-actions"><button className="quiet-button" onClick={saveDraft} disabled={busy}><Save size={16} /> Save</button>{selected && <button className="quiet-button" onClick={() => void removeDraft()} disabled={busy}><Trash2 size={16} /> Delete</button>}</span></div>
-        {draft.panels.length === 0 ? <div className="dashboard-empty"><Grid2X2 size={28} /><p>Import a Grafana or Kibana export, or add a native panel.</p><button className="search-button" onClick={() => setDraft((current) => ({ ...current, source: 'native', panels: [...current.panels, { id: panelId('native', current.panels.length), title: `Panel ${current.panels.length + 1}`, type: 'timeseries', data_view_id: '', query: '' }] }))}><Plus size={16} /> Add panel</button></div> : <div className="dashboard-grid">{draft.panels.map((panel) => {
-          const result = results[panel.id];
-          return <article className="dashboard-panel" key={panel.id}><header><input aria-label={`Panel title ${panel.id}`} value={panel.title} onChange={(event) => setDraft((current) => ({ ...current, panels: current.panels.map((item) => item.id === panel.id ? { ...item, title: event.target.value } : item) }))} /><button className="icon-button" title="Run panel" aria-label={`Run ${panel.title}`} onClick={() => void runPanel(panel)}><RefreshCw size={15} /></button><button className="icon-button" title="Remove panel" aria-label={`Remove ${panel.title}`} onClick={() => setDraft((current) => ({ ...current, panels: current.panels.filter((item) => item.id !== panel.id) }))}><Trash2 size={15} /></button></header>
-            <div className="dashboard-panel-controls"><select aria-label={`Panel ${panel.title} type`} value={panel.type} onChange={(event) => setDraft((current) => ({ ...current, panels: current.panels.map((item) => item.id === panel.id ? { ...item, type: event.target.value as DashboardPanelType } : item) }))}><option value="stat">Stat</option><option value="timeseries">Time series</option><option value="table">Table</option><option value="logs">Logs</option></select><select aria-label={`Panel ${panel.title} Data View`} value={panel.data_view_id} onChange={(event) => setDraft((current) => ({ ...current, panels: current.panels.map((item) => item.id === panel.id ? { ...item, data_view_id: event.target.value } : item) }))}><option value="">Select Data View</option>{dataViews.map((view) => <option key={view.id} value={view.id}>{view.name}</option>)}</select><input aria-label={`Panel ${panel.title} query`} value={panel.query} placeholder="Query" onChange={(event) => setDraft((current) => ({ ...current, panels: current.panels.map((item) => item.id === panel.id ? { ...item, query: event.target.value } : item) }))} /></div>
-            {panelErrors[panel.id] ? <p className="dashboard-panel-error">{panelErrors[panel.id]}</p> : result ? <div className="dashboard-panel-result">{panel.type === 'stat' ? <strong>{result.total}</strong> : panel.type === 'timeseries' ? <div className="dashboard-series">{result.histogram?.map((bucket) => <span key={bucket.timestamp} title={bucket.label ?? ''}>{bucket.count}</span>) ?? <span>No histogram</span>}</div> : <table><tbody>{result.hits.slice(0, 10).map((hit) => <tr key={`${hit.index}:${hit.id}`}><td>{hit.index}</td><td>{JSON.stringify(hit.source)}</td></tr>)}</tbody></table>}</div> : <p className="dashboard-panel-empty">Run panel to load data</p>}
-          </article>; })}</div>}
+        {editing ? <div className="dashboard-panel-editor">
+          <div className="dashboard-editor-heading"><button className="quiet-button" onClick={() => { previewVersion.current += 1; setEditing(null); }}><ArrowLeft size={16} /> Back to dashboard</button><strong>{editing.isNew ? 'Add panel' : 'Edit panel'}</strong><button className="search-button" onClick={applyPanel}>Apply panel</button></div>
+          <div className="dashboard-edit-layout"><div className="dashboard-preview"><div className="dashboard-section-heading"><h2>Preview</h2><button className="quiet-button" onClick={() => void runPanel(editing.panel, true)} disabled={previewLoading}><RefreshCw size={15} /> Run query</button></div><article className="dashboard-panel dashboard-preview-panel"><header><strong>{editing.panel.title || 'Untitled panel'}</strong></header>{panelResult(editing.panel, preview, previewError, previewLoading)}</article></div>
+            <div className="dashboard-options"><h2>Panel options</h2><label>Title<input aria-label="Panel title" value={editing.panel.title} onChange={(event) => updatePanel({ title: event.target.value })} /></label><fieldset><legend>Visualization</legend><div className="dashboard-visualizations">{([['timeseries', 'Time series', BarChart3], ['stat', 'Stat', Grid2X2], ['table', 'Table', Table2], ['logs', 'Logs', List]] as const).map(([type, label, Icon]) => <button key={type} type="button" className={editing.panel.type === type ? 'dashboard-visualization active' : 'dashboard-visualization'} aria-pressed={editing.panel.type === type} onClick={() => updatePanel({ type })}><Icon size={18} /><span>{label}</span></button>)}</div></fieldset><label>Data View<select aria-label="Panel Data View" value={editing.panel.data_view_id} onChange={(event) => updatePanel({ data_view_id: event.target.value })}><option value="">Select Data View</option>{dataViews.map((view) => <option key={view.id} value={view.id}>{view.name}</option>)}</select></label><label>Query<input aria-label="Panel query" value={editing.panel.query} placeholder="*" onChange={(event) => updatePanel({ query: event.target.value })} /></label></div></div>
+        </div> : <><div className="dashboard-toolbar"><input aria-label="Dashboard title" value={draft.title} placeholder="Dashboard title" onChange={(event) => setDraft((current) => ({ ...current, title: event.target.value }))} /><span>{draft.panels.length} panels · {mappedCount} mapped</span><span className="dashboard-toolbar-actions">{draft.panels.length > 0 && <button className="icon-button" title="Refresh dashboard" aria-label="Refresh dashboard" onClick={() => draft.panels.forEach((panel) => void runPanel(panel))}><RefreshCw size={16} /></button>}<button className="quiet-button" onClick={addPanel}><Plus size={16} /> Add panel</button><button className="search-button" onClick={saveDraft} disabled={busy}><Save size={16} /> Save</button>{selected && <button className="icon-button" title="Delete dashboard" aria-label="Delete dashboard" onClick={() => void removeDraft()} disabled={busy}><Trash2 size={16} /></button>}</span></div>
+          {draft.panels.length === 0 ? <div className="dashboard-empty"><Grid2X2 size={28} /><p>No panels yet</p><button className="search-button" onClick={addPanel}><Plus size={16} /> Add panel</button></div> : <div className="dashboard-grid">{draft.panels.map((panel) => <article className="dashboard-panel" key={panel.id}><header><strong>{panel.title}</strong><button className="icon-button" title="Run panel" aria-label={`Run ${panel.title}`} onClick={() => void runPanel(panel)}><RefreshCw size={15} /></button><button className="icon-button" title="Edit panel" aria-label={`Edit ${panel.title}`} onClick={() => openPanel(panel, false)}><Pencil size={15} /></button><button className="icon-button" title="Remove panel" aria-label={`Remove ${panel.title}`} onClick={() => setDraft((current) => ({ ...current, panels: current.panels.filter((item) => item.id !== panel.id) }))}><Trash2 size={15} /></button></header>{panelResult(panel, results[panel.id], panelErrors[panel.id], panelLoading[panel.id])}</article>)}</div>}</>}
       </section>
     </div>
   </main>;

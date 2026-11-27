@@ -45,7 +45,7 @@ React 19 + TypeScript + Vite in `frontend/`. No router and no state library: `Ap
 
 ## Dashboard workflow
 
-The primary Dashboard page supports native dashboards and imports Grafana dashboard JSON plus Kibana saved-object NDJSON exports. Imports normalize panels to stat, time-series, table, and logs types. Each panel is mapped to an InvestiGenie Data View before execution; panels use existing bounded search APIs and keep source queries inspectable. Imported source expressions are preserved but are not sent directly to a datasource. Dashboards are stored as encrypted, revisioned `dashboard` Knowledge entries; updates require optimistic `If-Match` revisions.
+The primary Dashboard page supports native dashboards and imports Grafana dashboard JSON plus Kibana saved-object NDJSON exports. Imports normalize panels to stat, time-series, table, and logs types. Add or edit a panel in the dedicated editor, select its visualization and Data View, and run a preview before applying it to the dashboard; applying a panel does not save the dashboard. Saved dashboards load mapped panels when opened and provide individual and dashboard-wide refresh controls. Panels execute their query through the selected Data View's existing bounded search API using the last 15 minutes; a time field is required for every panel type. Imported expressions may require editing for the selected datasource. Dashboards are stored as encrypted, revisioned `dashboard` Knowledge entries; updates require optimistic `If-Match` revisions.
 
 ## Knowledge workflow
 
