@@ -20,11 +20,16 @@ async fn dashboard_kind_round_trips_through_knowledge_storage() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
-    let bytes = axum::body::to_bytes(response.into_body(), 65_536).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 65_536)
+        .await
+        .unwrap();
     let created: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(created["entry"]["kind"], "dashboard");
     assert_eq!(created["entry"]["status"], "published");
-    assert!(created["entry"]["content"].as_str().unwrap().contains("grafana"));
+    assert!(created["entry"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("grafana"));
 }
 
 #[tokio::test]
