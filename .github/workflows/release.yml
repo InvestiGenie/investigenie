@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name to release (e.g. 0.6.8-rc)'
+        description: 'Tag name to release (e.g. 0.7.0-rc)'
         required: true
-        default: '0.6.8-rc'
+        default: '0.7.0-rc'
 
 permissions:
   contents: read
