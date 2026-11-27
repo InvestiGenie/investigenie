@@ -151,7 +151,8 @@ def evaluate_safety(result, scenario):
         for required in required_rows:
             count_field = required.get("count_field", "_ig_duplicate_count")
             matching = [
-                row for row in rows
+                row
+                for row in rows
                 if all(row.get(field) == value for field, value in required.items() if field != "count_field" and field != "count")
                 and int(row.get(count_field, 0)) == int(required["count"])
             ]
