@@ -1007,8 +1007,8 @@ async fn scoped_duplicate_query_clarification_executes_all_time_sql_and_returns_
     let source = MockServer::start().await;
     let provider = MockServer::start().await;
     let original_question = "Search all time for duplicate logins and give me the SQL query";
-    let question = "use the field login";
-    let expected_sql = "SELECT `login`, count() AS `_ig_duplicate_count` FROM `events` GROUP BY `login` HAVING count() >= 2 ORDER BY `_ig_duplicate_count` DESC LIMIT 50";
+    let question = "Group by login where status >= 500";
+    let expected_sql = "SELECT `login`, count() AS `_ig_duplicate_count` FROM `events` WHERE `status` >= 500 GROUP BY `login` HAVING count() >= 2 ORDER BY `_ig_duplicate_count` DESC LIMIT 50";
 
     Mock::given(matchers::method("POST"))
         .and(matchers::path("/"))
@@ -1020,9 +1020,10 @@ async fn scoped_duplicate_query_clarification_executes_all_time_sql_and_returns_
             "data": [
                 {"name":"created_at","type":"DateTime64(3)"},
                 {"name":"login","type":"String"},
-                {"name":"username","type":"String"}
+                {"name":"username","type":"String"},
+                {"name":"status","type":"UInt64"}
             ],
-            "rows":3
+            "rows":4
         })))
         .expect(2)
         .mount(&source)
@@ -1071,7 +1072,7 @@ async fn scoped_duplicate_query_clarification_executes_all_time_sql_and_returns_
                     .any(|field| field["name"] == "login")
         })
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": "{\"mode\":\"data_query\",\"data_query\":{\"data_view_id\":\"login-view\",\"group_by\":[\"login\"],\"filters\":[],\"minimum_count\":2,\"limit\":50}}"}}],
+            "choices": [{"message": {"content": "{\"mode\":\"data_query\",\"data_query\":{\"data_view_id\":\"login-view\",\"group_by\":[],\"filters\":[],\"minimum_count\":2,\"limit\":50}}"}}],
             "usage": {"prompt_tokens": 60, "completion_tokens": 35, "total_tokens": 95}
         })))
         .expect(1)

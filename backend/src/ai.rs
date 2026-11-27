@@ -912,6 +912,9 @@ pub async fn investigate_with_context(
             plan.mode = RawPlanMode::Investigation;
         }
     }
+    if data_query_requested {
+        apply_explicit_group_count_fallback(question, &selected, &view_fields, &mut plan);
+    }
     let plan_usage = plan_usage.unwrap_or_default();
     let planning_usage = ProviderCallUsage {
         stage: "planning".to_owned(),
@@ -2427,15 +2430,103 @@ fn truncate_utf8_bytes(text: &str, limit: usize) -> &str {
     &text[..end]
 }
 
+fn is_http_status_field(field: &str) -> bool {
+    let normalized = field
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "status"
+            | "statuscode"
+            | "httpstatus"
+            | "httpstatuscode"
+            | "responsestatus"
+            | "responsestatuscode"
+            | "httpresponsestatus"
+            | "httpresponsestatuscode"
+    )
+}
+
+fn sampled_http_5xx_exists(sources: &[SourceResult]) -> bool {
+    sources.iter().any(|source| {
+        source.examples.iter().any(|example| {
+            example
+                .get("record")
+                .and_then(Value::as_object)
+                .is_some_and(|record| {
+                    record.iter().any(|(field, value)| {
+                        if !is_http_status_field(field) {
+                            return false;
+                        }
+                        value
+                            .as_u64()
+                            .or_else(|| value.as_str()?.parse::<u64>().ok())
+                            .is_some_and(|status| (500..=599).contains(&status))
+                    })
+                })
+        })
+    })
+}
+
+fn denies_sampled_http_5xx(text: &str) -> bool {
+    text.to_ascii_lowercase()
+        .split(['.', ';', '\n'])
+        .any(|sentence| {
+            let mentions_errors = sentence.contains("5xx") || sentence.contains("server error");
+            let mentions_status_threshold = sentence.contains("status")
+                && (sentence.contains("500") || sentence.contains("5xx"));
+            let denies_presence = [
+                "no 5xx",
+                "zero 5xx",
+                "no server error",
+                "zero server error",
+                "did not contain any 5xx",
+                "didn't contain any 5xx",
+                "did not find any 5xx",
+                "didn't find any 5xx",
+                "no status code",
+                "zero status code",
+                "no status codes",
+                "zero status codes",
+            ]
+            .iter()
+            .any(|phrase| sentence.contains(phrase));
+            let qualified_other_window = ["baseline", "previous window", "prior window"]
+                .iter()
+                .any(|qualifier| sentence.contains(qualifier));
+            !qualified_other_window
+                && ((mentions_errors && denies_presence)
+                    || (mentions_status_threshold && denies_presence))
+        })
+}
+
 /// Bounds model output and removes evidence that was not supplied, returning how many references were dropped.
 fn sanitize_findings(output: ModelFindings, sources: &[SourceResult]) -> (ModelFindings, usize) {
+    let contradicts_sampled_http_5xx = sampled_http_5xx_exists(sources)
+        && (denies_sampled_http_5xx(&output.summary)
+            || output.findings.iter().any(|finding| {
+                denies_sampled_http_5xx(&finding.title) || denies_sampled_http_5xx(&finding.detail)
+            })
+            || output
+                .caveats
+                .iter()
+                .any(|caveat| denies_sampled_http_5xx(caveat)));
     let mut dropped = 0usize;
-    let findings = output
+    let mut findings = output
         .findings
         .into_iter()
         .filter(|finding| !finding.title.trim().is_empty())
         .take(MAX_FINDINGS)
         .filter_map(|finding| {
+            if contradicts_sampled_http_5xx
+                && (denies_sampled_http_5xx(&finding.title)
+                    || denies_sampled_http_5xx(&finding.detail))
+            {
+                dropped += 1;
+                return None;
+            }
             let mut evidence: Vec<FindingEvidence> = Vec::new();
             for item in finding.evidence {
                 let source = sources
@@ -2502,18 +2593,34 @@ fn sanitize_findings(output: ModelFindings, sources: &[SourceResult]) -> (ModelF
         })
         .collect::<Vec<_>>();
     let mut summary = sanitize_representativeness_claim(&truncate_chars(&output.summary, 4_000));
-    if findings.is_empty() {
+    if contradicts_sampled_http_5xx {
+        summary = "The sampled records include an HTTP status code of 500 or greater, which conflicts with the model's no-5xx conclusion. Review the cited records and query scope; this sample is not exhaustive.".to_owned();
+        findings.retain(|finding| {
+            let keep = !denies_sampled_http_5xx(&finding.title)
+                && !denies_sampled_http_5xx(&finding.detail);
+            if !keep {
+                dropped += 1;
+            }
+            keep
+        });
+    } else if findings.is_empty() {
         summary = "Insufficient sampled evidence to support an incident finding. This does not establish that the selected time range is incident-free.".to_owned();
     } else if summary.is_empty() {
         summary = "See the findings below.".to_owned();
     }
-    let caveats = output
+    let mut caveats = output
         .caveats
         .iter()
         .map(|caveat| sanitize_representativeness_claim(&truncate_chars(caveat, 1_000)))
         .filter(|caveat| !caveat.is_empty())
         .take(20)
-        .collect();
+        .collect::<Vec<_>>();
+    if contradicts_sampled_http_5xx {
+        if caveats.len() == 20 {
+            caveats.pop();
+        }
+        caveats.push("At least one retained sample has an HTTP status in the 500-599 range; a blanket claim that no 5xx occurred is contradicted by the sample.".to_owned());
+    }
     (
         ModelFindings {
             summary,
@@ -2544,6 +2651,240 @@ fn safe_field_name(field: &str) -> bool {
         && field
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_.@-".contains(&byte))
+}
+
+fn explicit_group_field(question: &str, metadata: &ViewFieldMetadata) -> Option<String> {
+    let question = question.to_ascii_lowercase();
+    let prefixes = [
+        "grouped by ",
+        "group by ",
+        "count records by ",
+        "count events by ",
+        "count logs by ",
+        "count by ",
+    ];
+    let (position, prefix) = prefixes
+        .iter()
+        .filter_map(|prefix| question.find(prefix).map(|position| (position, *prefix)))
+        .min_by_key(|(position, _)| *position)?;
+    let tail = question[position + prefix.len()..].trim_start();
+    let field = tail
+        .split(|character: char| !(character.is_ascii_alphanumeric() || "_.@-".contains(character)))
+        .next()?
+        .trim_end_matches('.');
+    let after_field = tail.strip_prefix(field)?.trim_start();
+    if after_field.starts_with(',') || after_field.starts_with("and ") {
+        return None;
+    }
+    metadata
+        .aggregation_fields
+        .iter()
+        .find(|candidate| candidate.eq_ignore_ascii_case(field))
+        .cloned()
+        .or_else(|| {
+            metadata
+                .aggregation_fields
+                .iter()
+                .find(|candidate| {
+                    candidate
+                        .strip_suffix(".keyword")
+                        .is_some_and(|base| base.eq_ignore_ascii_case(field))
+                })
+                .cloned()
+        })
+}
+
+fn explicit_field_tail<'a>(question: &'a str, field: &str) -> Option<&'a str> {
+    let lowered_question = question.to_ascii_lowercase();
+    let field = field.to_ascii_lowercase();
+    lowered_question
+        .match_indices(&field)
+        .find_map(|(start, _)| {
+            let end = start + field.len();
+            let boundary = |character: Option<char>| {
+                character.is_none_or(|character| {
+                    !(character.is_ascii_alphanumeric() || "_.@-".contains(character))
+                })
+            };
+            if boundary(lowered_question[..start].chars().next_back())
+                && boundary(lowered_question[end..].chars().next())
+            {
+                Some(&question[end..])
+            } else {
+                None
+            }
+        })
+}
+
+fn explicit_filter(question: &str, metadata: &ViewFieldMetadata) -> Option<Vec<RawPlannedFilter>> {
+    let lower = question.to_ascii_lowercase();
+    let has_where = lower.contains(" where ");
+    let clause = lower
+        .split_once(" where ")
+        .map_or(lower.as_str(), |(_, clause)| clause);
+    let clause_without_comparison_phrases = clause
+        .replace("greater than or equal to", "gte")
+        .replace("less than or equal to", "lte");
+    if clause_without_comparison_phrases.contains(" and ")
+        || clause_without_comparison_phrases.contains(" or ")
+    {
+        return None;
+    }
+    let mut fields = metadata.field_types.keys().cloned().collect::<Vec<_>>();
+    fields.sort_by_key(|field| std::cmp::Reverse(field.len()));
+    for field in fields {
+        let Some(mut tail) = explicit_field_tail(clause, &field) else {
+            continue;
+        };
+        tail = tail.trim_start();
+        for prefix in ["with ", "is ", ":"] {
+            if let Some(rest) = tail.strip_prefix(prefix) {
+                tail = rest.trim_start();
+                break;
+            }
+        }
+        let operators = [
+            ("greater than or equal to", "gte"),
+            ("less than or equal to", "lte"),
+            ("at least", "gte"),
+            ("at most", "lte"),
+            (">=", "gte"),
+            ("<=", "lte"),
+            ("greater than", "gt"),
+            ("less than", "lt"),
+            ("gte", "gte"),
+            ("lte", "lte"),
+            ("gt", "gt"),
+            ("lt", "lt"),
+            ("contains", "contains"),
+            ("includes", "contains"),
+            ("equals", "eq"),
+            ("equal to", "eq"),
+            ("eq", "eq"),
+            ("=", "eq"),
+            (">", "gt"),
+            ("<", "lt"),
+        ];
+        let Some((operator, rest)) = operators.iter().find_map(|(phrase, operator)| {
+            tail.strip_prefix(phrase)
+                .map(|rest| (*operator, rest.trim_start()))
+        }) else {
+            continue;
+        };
+        let rest = rest.strip_prefix("value ").unwrap_or(rest).trim_start();
+        let token = if let Some(quote) = rest
+            .chars()
+            .next()
+            .filter(|quote| *quote == '\'' || *quote == '"')
+        {
+            let unquoted = &rest[quote.len_utf8()..];
+            let end = unquoted.find(quote)?;
+            Value::String(unquoted[..end].to_owned())
+        } else {
+            let token = rest
+                .split(|character: char| character.is_whitespace() || ",;)".contains(character))
+                .next()?
+                .trim_end_matches('.');
+            if token.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<Value>(token).unwrap_or_else(|_| Value::String(token.to_owned()))
+        };
+        let supported = metadata
+            .filter_operators
+            .get(&field)
+            .is_some_and(|operators| {
+                InvestigationFilterOperator::from_label(operator)
+                    .is_some_and(|operator| operators.contains(&operator))
+            });
+        if !supported || !scalar(&token) {
+            return None;
+        }
+        return Some(vec![RawPlannedFilter {
+            field,
+            operator: operator.to_owned(),
+            value: token,
+        }]);
+    }
+    if has_where
+        || clause.contains(['>', '<', '='])
+        || [
+            " greater than ",
+            " less than ",
+            " at least ",
+            " at most ",
+            " gte ",
+            " gt ",
+            " lte ",
+            " lt ",
+        ]
+        .iter()
+        .any(|operator| clause.contains(operator))
+    {
+        None
+    } else {
+        Some(Vec::new())
+    }
+}
+
+fn parse_explicit_group_count_request(
+    question: &str,
+    selected: &[DataView],
+    view_fields: &HashMap<String, ViewFieldMetadata>,
+) -> Option<RawDataQuery> {
+    let mut candidates = selected.iter().filter(|view| {
+        view_fields
+            .get(&view.id)
+            .is_some_and(|metadata| metadata.supports_group_count)
+    });
+    let view = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    let metadata = view_fields.get(&view.id)?;
+    let group_by = explicit_group_field(question, metadata)?;
+    let filters = explicit_filter(question, metadata)?;
+    let minimum_count = match question.to_ascii_lowercase().split_once("minimum count ") {
+        Some((_, tail)) => tail
+            .split_whitespace()
+            .next()?
+            .trim_end_matches('.')
+            .parse::<u64>()
+            .ok()?,
+        None => default_duplicate_minimum(),
+    };
+    if !(2..=1_000_000_000).contains(&minimum_count) {
+        return None;
+    }
+    Some(RawDataQuery {
+        data_view_id: view.id.clone(),
+        group_by: vec![group_by],
+        filters,
+        minimum_count,
+        limit: default_data_query_limit(),
+    })
+}
+
+fn apply_explicit_group_count_fallback(
+    question: &str,
+    selected: &[DataView],
+    view_fields: &HashMap<String, ViewFieldMetadata>,
+    plan: &mut RawPlan,
+) -> bool {
+    if plan
+        .data_query
+        .as_ref()
+        .is_some_and(|data_query| !data_query.group_by.is_empty())
+    {
+        return false;
+    }
+    let Some(data_query) = parse_explicit_group_count_request(question, selected, view_fields)
+    else {
+        return false;
+    };
+    plan.mode = RawPlanMode::DataQuery;
+    plan.data_query = Some(data_query);
+    true
 }
 
 async fn execute_duplicate_group_query(
@@ -3312,6 +3653,123 @@ mod tests {
     }
 
     #[test]
+    fn explicit_group_count_request_builds_only_metadata_validated_typed_filters() {
+        let selected = vec![view("logs", "Logs")];
+        let metadata = ViewFieldMetadata {
+            query_language: "Lucene".to_owned(),
+            field_types: BTreeMap::from([
+                ("service".to_owned(), "text".to_owned()),
+                ("service.keyword".to_owned(), "keyword".to_owned()),
+                ("status".to_owned(), "integer".to_owned()),
+            ]),
+            time_fields: BTreeSet::from(["@timestamp".to_owned()]),
+            filter_operators: BTreeMap::from([
+                ("service".to_owned(), vec![Operator::Eq]),
+                ("service.keyword".to_owned(), vec![Operator::Eq]),
+                ("status".to_owned(), vec![Operator::Eq, Operator::Gte]),
+            ]),
+            aggregation_fields: BTreeSet::from(["service.keyword".to_owned()]),
+            supports_group_count: true,
+        };
+        let fields = HashMap::from([("logs".to_owned(), metadata)]);
+        assert_eq!(explicit_group_field(
+            "Count records grouped by service where status is greater than or equal to 500, minimum count 2",
+            &fields["logs"],
+        ).as_deref(), Some("service.keyword"));
+        assert_eq!(explicit_filter(
+            "Count records grouped by service where status is greater than or equal to 500, minimum count 2",
+            &fields["logs"],
+        ).as_ref().map(|filters| filters.len()), Some(1));
+        let query = parse_explicit_group_count_request(
+            "Count records grouped by service where status is greater than or equal to 500, minimum count 2",
+            &selected,
+            &fields,
+        )
+        .unwrap();
+        assert_eq!(query.data_view_id, "logs");
+        assert_eq!(query.group_by, vec!["service.keyword"]);
+        assert_eq!(query.minimum_count, 2);
+        assert_eq!(query.filters.len(), 1);
+        assert_eq!(query.filters[0].field, "status");
+        assert_eq!(query.filters[0].operator, "gte");
+        assert_eq!(query.filters[0].value, json!(500));
+
+        let mut incomplete_plan = RawPlan::default();
+        assert!(apply_explicit_group_count_fallback(
+            "Count records grouped by service where status is greater than or equal to 500, minimum count 2",
+            &selected,
+            &fields,
+            &mut incomplete_plan,
+        ));
+        assert_eq!(incomplete_plan.mode, RawPlanMode::DataQuery);
+        assert_eq!(
+            incomplete_plan.data_query.unwrap().group_by,
+            vec!["service.keyword"]
+        );
+
+        assert_eq!(
+            explicit_group_field(
+                "Filter field status with gte value 500. Group by service. Minimum count 2.",
+                &fields["logs"],
+            )
+            .as_deref(),
+            Some("service.keyword")
+        );
+        assert_eq!(
+            explicit_filter(
+                "Filter field status with gte value 500. Group by service. Minimum count 2.",
+                &fields["logs"],
+            )
+            .as_ref()
+            .map(Vec::len),
+            Some(1)
+        );
+        let clarification = parse_explicit_group_count_request(
+            "Filter field status with gte value 500. Group by service. Minimum count 2.",
+            &selected,
+            &fields,
+        )
+        .unwrap();
+        assert_eq!(clarification.group_by, vec!["service.keyword"]);
+        assert_eq!(clarification.filters[0].value, json!(500));
+
+        assert!(parse_explicit_group_count_request(
+            "Count records grouped by an unknown field where status gte 500",
+            &selected,
+            &fields,
+        )
+        .is_none());
+        assert!(parse_explicit_group_count_request(
+            "Count records grouped by service where latency > 100",
+            &selected,
+            &fields,
+        )
+        .is_none());
+        assert!(parse_explicit_group_count_request(
+            "Count records grouped by service and level where status gte 500",
+            &selected,
+            &fields,
+        )
+        .is_none());
+        assert!(parse_explicit_group_count_request(
+            "Count records grouped by service where status gte 500, minimum count unknown",
+            &selected,
+            &fields,
+        )
+        .is_none());
+        let malformed_where = "Count records grouped by service where status is 5xx";
+        assert!(parse_explicit_group_count_request(malformed_where, &selected, &fields,).is_none());
+        let mut unchanged_plan = RawPlan::default();
+        assert!(!apply_explicit_group_count_fallback(
+            malformed_where,
+            &selected,
+            &fields,
+            &mut unchanged_plan,
+        ));
+        assert!(unchanged_plan.data_query.is_none());
+    }
+
+    #[test]
     fn targeted_searches_only_request_aggregates_when_explicit() {
         assert!(!requests_aggregates(
             "Search duplicate logins at the request timestamp"
@@ -3464,6 +3922,59 @@ mod tests {
             ),
             "The sample is not statistically representative and not exhaustive."
         );
+    }
+
+    #[test]
+    fn no_5xx_claim_is_rejected_when_retained_samples_contain_http_5xx() {
+        let mut source = source(view("logs", "Logs"), &["e1", "e2"], 2);
+        source.examples = vec![
+            json!({"record_id":"e1","record":{"http.response.status_code":504}}),
+            json!({"record_id":"e2","record":{"status":200}}),
+        ];
+        let output = serde_json::from_value(json!({
+            "summary":"No 5xx errors were observed in the sample.",
+            "findings":[{
+                "title":"No 5xx Errors Found",
+                "detail":"The records contain no status codes of 500 or higher.",
+                "evidence":[{"data_view_id":"logs","record_ids":["e1"],"count":1}]
+            }],
+            "caveats":[]
+        }))
+        .unwrap();
+
+        let (clean, dropped) = sanitize_findings(output, &[source]);
+
+        assert!(clean
+            .summary
+            .contains("sampled records include an HTTP status code of 500 or greater"));
+        assert!(clean.findings.is_empty());
+        assert!(clean
+            .caveats
+            .iter()
+            .any(|caveat| caveat.contains("contradicted by the sample")));
+        assert_eq!(dropped, 1);
+    }
+
+    #[test]
+    fn no_5xx_claim_is_kept_when_retained_samples_only_have_success_statuses() {
+        let mut source = source(view("logs", "Logs"), &["e1"], 1);
+        source.examples = vec![json!({"record_id":"e1","record":{"status":200}})];
+        let output = serde_json::from_value(json!({
+            "summary":"No 5xx errors were observed in the sample.",
+            "findings":[{
+                "title":"No 5xx Errors Found",
+                "detail":"No status codes of 500 or higher appeared in the sampled records.",
+                "evidence":[{"data_view_id":"logs","record_ids":["e1"],"count":1}]
+            }],
+            "caveats":[]
+        }))
+        .unwrap();
+
+        let (clean, dropped) = sanitize_findings(output, &[source]);
+
+        assert_eq!(clean.summary, "No 5xx errors were observed in the sample.");
+        assert_eq!(clean.findings.len(), 1);
+        assert_eq!(dropped, 0);
     }
 
     #[test]
